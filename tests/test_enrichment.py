@@ -455,3 +455,48 @@ def test_sec_ticker_collision_uses_unique_latest_filer(
         "0000000002-26-000001"
     ]
     assert cik_mapping == {"0000000002": "XNAS:AAPL"}
+
+
+def test_ownership_schedule_attaches_to_subject_not_filer(
+    enrichment_module, tmp_path: Path
+) -> None:
+    accession = "0000000001-26-000199"
+
+    def document(cik: int, ticker: str) -> dict[str, object]:
+        return {
+            "cik": cik,
+            "name": f"Registrant {cik}",
+            "sic": "2834",
+            "tickers": [ticker],
+            "filings": {
+                "recent": {
+                    "accessionNumber": [accession],
+                    "filingDate": ["2026-05-12"],
+                    "reportDate": [""],
+                    "acceptanceDateTime": ["2026-05-12T13:17:28Z"],
+                    "form": ["SCHEDULE 13G/A"],
+                    "primaryDocument": ["primary_doc.xml"],
+                    "items": [""],
+                    "fileNumber": [""],
+                    "filmNumber": [""],
+                }
+            },
+        }
+
+    archive = tmp_path / "submissions.zip"
+    with zipfile.ZipFile(archive, "w") as output:
+        output.writestr("CIK0000000001.json", json.dumps(document(1, "JPM")))
+        output.writestr("CIK0000000002.json", json.dumps(document(2, "AAPL")))
+    _, filings, all_filings, _ = enrichment_module.parse_submissions(
+        archive,
+        {"JPM": "XNYS:JPM", "AAPL": "XNAS:AAPL"},
+        {
+            "XNYS:JPM": {"ticker": "JPM", "exchange_mic": "XNYS"},
+            "XNAS:AAPL": {"ticker": "AAPL", "exchange_mic": "XNAS"},
+        },
+        date(2026, 7, 17),
+        datetime(2026, 7, 17, 12, 0),
+    )
+    assert all_filings[accession]["cik"] == "0000000002"
+    assert all_filings[accession]["security_id"] == "XNAS:AAPL"
+    assert [row["form"] for row in filings] == ["SCHEDULE 13G/A"]

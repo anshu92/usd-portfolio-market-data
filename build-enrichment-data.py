@@ -57,6 +57,10 @@ SEC_FORMS = {
     "SC 13D/A",
     "SC 13G",
     "SC 13G/A",
+    "SCHEDULE 13D",
+    "SCHEDULE 13D/A",
+    "SCHEDULE 13G",
+    "SCHEDULE 13G/A",
     "SC TO",
     "SC TO-I",
     "SC TO-T",
@@ -310,6 +314,17 @@ def recent_rows(document: Mapping[str, object]) -> Iterator[dict[str, object]]:
         }
 
 
+def filing_record_priority(row: Mapping[str, object]) -> int:
+    accession = str(row["accession_number"])
+    filer_cik = accession[:10]
+    form = str(row["form"])
+    ownership_schedule = "13D" in form or "13G" in form
+    is_filer = str(row["cik"]) == filer_cik
+    if ownership_schedule:
+        return 2 if not is_filer else 1
+    return 2 if is_filer else 1
+
+
 def parse_submissions(
     path: Path,
     ticker_to_id: Mapping[str, str],
@@ -452,10 +467,17 @@ def parse_submissions(
             }
             previous = all_filings.get(accession)
             if previous is not None and previous != filing_record:
-                raise EnrichmentError(
-                    f"SEC accession {accession} maps to multiple registrants"
-                )
-            all_filings[accession] = filing_record
+                previous_priority = filing_record_priority(previous)
+                current_priority = filing_record_priority(filing_record)
+                if previous_priority == current_priority:
+                    raise EnrichmentError(
+                        f"SEC accession {accession} has ambiguous registrant records: "
+                        f"{previous['cik']} and {cik}"
+                    )
+                if current_priority > previous_priority:
+                    all_filings[accession] = filing_record
+            else:
+                all_filings[accession] = filing_record
     for security_id, identity in universe.items():
         if security_id in master_by_id:
             continue
@@ -1179,6 +1201,10 @@ def build_events(
         "SC 13D/A": ("ACTIVIST_13D", "AMENDMENT", "HIGH", 0.8),
         "SC 13G": ("PASSIVE_13G", "INITIAL", "HIGH", 0.7),
         "SC 13G/A": ("PASSIVE_13G", "AMENDMENT", "HIGH", 0.6),
+        "SCHEDULE 13D": ("ACTIVIST_13D", "INITIAL", "HIGH", 0.9),
+        "SCHEDULE 13D/A": ("ACTIVIST_13D", "AMENDMENT", "HIGH", 0.8),
+        "SCHEDULE 13G": ("PASSIVE_13G", "INITIAL", "HIGH", 0.7),
+        "SCHEDULE 13G/A": ("PASSIVE_13G", "AMENDMENT", "HIGH", 0.6),
         "SC TO": ("TENDER_OFFER", "SCHEDULE_TO", "HIGH", 0.9),
         "SC TO-I": ("TENDER_OFFER", "ISSUER_TENDER", "HIGH", 0.9),
         "SC TO-T": ("TENDER_OFFER", "THIRD_PARTY_TENDER", "HIGH", 0.9),
