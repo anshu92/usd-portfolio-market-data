@@ -37,6 +37,8 @@ on:
   schedule:
     - cron: "17 20 * * 1-5"
       timezone: "America/New_York"
+    - cron: "17 8 * * 6"
+      timezone: "America/New_York"
 
 concurrency:
   group: portfolio-market-data-build
@@ -45,9 +47,9 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    # Scheduled build + publish job budgets total 29 minutes. Manual source refreshes
+    # Only the weekday reuse path is bounded to 24 minutes. Saturday source refreshes
     # retain the larger budget because SEC normalization is intentionally off-path.
-    timeout-minutes: ${{ github.event_name == 'schedule' && 24 || 360 }}
+    timeout-minutes: ${{ github.event_name == 'schedule' && github.event.schedule == '17 20 * * 1-5' && 24 || 360 }}
     permissions:
       contents: read
     outputs:
@@ -78,6 +80,7 @@ jobs:
         shell: bash
         env:
           EVENT_NAME: ${{ github.event_name }}
+          EVENT_SCHEDULE: ${{ github.event.schedule }}
           INPUT_MODE: ${{ inputs.mode }}
           INPUT_SESSIONS: ${{ inputs.sessions }}
           INPUT_CUTOFF: ${{ inputs.cutoff_date }}
@@ -103,7 +106,11 @@ jobs:
             cutoff="$market_today"
             requested_publish="${RELEASES_ENABLED:-false}"
             allow_drift="false"
-            refresh_enrichment="false"
+            if [[ "$EVENT_SCHEDULE" == "17 8 * * 6" ]]; then
+              refresh_enrichment="true"
+            else
+              refresh_enrichment="false"
+            fi
           elif [[ "$mode" == "smoke" ]]; then
             if [[ "$refresh_enrichment" == "true" ]]; then
               echo "Enrichment refresh is only valid in full mode" >&2
@@ -362,7 +369,7 @@ jobs:
     needs: build
     if: needs.build.outputs.publish == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: ${{ github.event_name == 'schedule' && 5 || 15 }}
+    timeout-minutes: ${{ github.event_name == 'schedule' && github.event.schedule == '17 20 * * 1-5' && 5 || 15 }}
     permissions:
       actions: write
       contents: write

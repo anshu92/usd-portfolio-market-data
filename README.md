@@ -141,7 +141,9 @@ while bounding full-universe memory use; the floor year is disclosed in the mani
 ## Automation and publication
 
 Pull requests run only offline fixtures with read-only permissions. The production
-workflow runs at 20:17 America/New_York on weekdays and can also be dispatched:
+workflow runs the bounded market path at 20:17 America/New_York on weekdays, refreshes
+official enrichment sources at 08:17 America/New_York each Saturday, and can also be
+dispatched:
 
 - `smoke` is fixed to AAPL, MSFT, BRK.B, NVDA, and TSM with 30 sessions and never
   publishes;
@@ -151,18 +153,21 @@ workflow runs at 20:17 America/New_York on weekdays and can also be dispatched:
 - scheduled builds publish only when the same variable is true;
 - weekday scheduled builds reuse the latest fully validated immutable enrichment
   snapshot and have a 24-minute build budget plus a 5-minute publish budget;
-- `refresh_enrichment=true` is manual-only and performs the slower official SEC/FINRA
-  rebuild with a six-hour ceiling. Use it to bootstrap the first expanded release and
-  whenever an enrichment source refresh is required.
+- Saturday scheduled builds set `refresh_enrichment=true` and perform the slower
+  official SEC/FINRA rebuild with a six-hour ceiling; this weekly cadence captures SEC
+  filing/fundamental changes and FINRA's semi-monthly updates without paying the
+  roughly one-hour cost every day;
+- a manual `refresh_enrichment=true` run remains available for bootstrapping, recovery,
+  or an out-of-cycle source update.
 
 The normal daily path therefore has at most 29 minutes of job execution. It downloads
 the previous release by its immutable tag, verifies GitHub asset digests and the full
 production contract, copies the enrichment assets without changing their source
 clocks, and then verifies the newly assembled release again. If the fresh symbol
 directory contains a new admission, `security-master.parquet` adds an explicit
-`UNMAPPED_DAILY_ADMISSION` row; the next manual enrichment refresh resolves its SEC
-mapping. Historical master rows are retained so older point-in-time enrichment rows
-remain referentially valid.
+`UNMAPPED_DAILY_ADMISSION` row; the next Saturday or manual enrichment refresh resolves
+its SEC mapping. Historical master rows are retained so older point-in-time enrichment
+rows remain referentially valid.
 
 Before enabling scheduled publication, run one manual `full` workflow with
 `refresh_enrichment=true`, validate its artifact, and publish it as the immutable

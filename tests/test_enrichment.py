@@ -409,8 +409,11 @@ def test_official_archive_registry_and_workflow_headers() -> None:
     assert "Accept-Encoding: gzip, deflate" in workflow
     assert "--compressed" in workflow
     assert "refresh_enrichment" in workflow
-    assert "github.event_name == 'schedule' && 24 || 360" in workflow
-    assert "github.event_name == 'schedule' && 5 || 15" in workflow
+    assert 'cron: "17 8 * * 6"' in workflow
+    assert 'EVENT_SCHEDULE: ${{ github.event.schedule }}' in workflow
+    assert 'if [[ "$EVENT_SCHEDULE" == "17 8 * * 6" ]]' in workflow
+    assert "github.event.schedule == '17 20 * * 1-5' && 24 || 360" in workflow
+    assert "github.event.schedule == '17 20 * * 1-5' && 5 || 15" in workflow
     assert "reuse-enrichment-snapshot.py" in workflow
     assert (
         "steps.inputs.outputs.mode == 'full' && "
