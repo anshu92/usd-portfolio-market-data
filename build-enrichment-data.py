@@ -314,17 +314,6 @@ def recent_rows(document: Mapping[str, object]) -> Iterator[dict[str, object]]:
         }
 
 
-def filing_record_priority(row: Mapping[str, object]) -> int:
-    accession = str(row["accession_number"])
-    filer_cik = accession[:10]
-    form = str(row["form"])
-    ownership_schedule = "13D" in form or "13G" in form
-    is_filer = str(row["cik"]) == filer_cik
-    if ownership_schedule:
-        return 2 if not is_filer else 1
-    return 2 if is_filer else 1
-
-
 def parse_submissions(
     path: Path,
     ticker_to_id: Mapping[str, str],
@@ -334,11 +323,11 @@ def parse_submissions(
 ) -> tuple[
     list[dict[str, object]],
     list[dict[str, object]],
-    dict[str, dict[str, object]],
+    dict[tuple[str, str], dict[str, object]],
     dict[str, str],
 ]:
     master_by_id: dict[str, dict[str, object]] = {}
-    all_filings: dict[str, dict[str, object]] = {}
+    all_filings: dict[tuple[str, str], dict[str, object]] = {}
     cik_to_security: dict[str, str] = {}
     revision = sha256_file(path)
     candidates: dict[str, tuple[dict[str, object], list[str], date]] = {}
@@ -423,6 +412,16 @@ def parse_submissions(
             if filing_date is None or filing_date > cutoff:
                 continue
             form = str(row.get("form") or "").strip()
+            subject_indexed_form = (
+                "13D" in form
+                or "13G" in form
+                or form.removesuffix("/A") in {"3", "4", "5"}
+            )
+            is_accession_filer = cik == accession[:10]
+            if (subject_indexed_form and is_accession_filer) or (
+                not subject_indexed_form and not is_accession_filer
+            ):
+                continue
             report_date = parse_date(row.get("reportDate"))
             periodic_form = form.removesuffix("/A") in {
                 "10-K",
@@ -465,19 +464,14 @@ def parse_submissions(
                     retrieved_at=retrieved_at,
                 ),
             }
-            previous = all_filings.get(accession)
+            filing_key = (cik, accession)
+            previous = all_filings.get(filing_key)
             if previous is not None and previous != filing_record:
-                previous_priority = filing_record_priority(previous)
-                current_priority = filing_record_priority(filing_record)
-                if previous_priority == current_priority:
-                    raise EnrichmentError(
-                        f"SEC accession {accession} has ambiguous registrant records: "
-                        f"{previous['cik']} and {cik}"
-                    )
-                if current_priority > previous_priority:
-                    all_filings[accession] = filing_record
+                raise EnrichmentError(
+                    f"SEC filing key {filing_key} has conflicting metadata"
+                )
             else:
-                all_filings[accession] = filing_record
+                all_filings[filing_key] = filing_record
     for security_id, identity in universe.items():
         if security_id in master_by_id:
             continue
@@ -510,7 +504,7 @@ def parse_submissions(
 def iter_company_facts(
     path: Path,
     cik_to_security: Mapping[str, str],
-    filings: Mapping[str, Mapping[str, object]],
+    filings: Mapping[tuple[str, str], Mapping[str, object]],
     cutoff: date,
     retrieved_at: datetime,
 ) -> Iterator[dict[str, object]]:
@@ -554,7 +548,7 @@ def iter_company_facts(
                         fiscal_year = observation.get("fy")
                         fiscal_period = str(observation.get("fp") or "").strip() or None
                         value = finite_number(observation.get("val"))
-                        filing = filings.get(accession, {})
+                        filing = filings.get((cik, accession), {})
                         acceptance = filing.get("acceptance_datetime_utc")
                         if acceptance is not None and not isinstance(acceptance, datetime):
                             acceptance = None
@@ -594,7 +588,7 @@ def build_company_facts_asset(
     source_path: Path,
     output_path: Path,
     cik_to_security: Mapping[str, str],
-    filings: Mapping[str, Mapping[str, object]],
+    filings: Mapping[tuple[str, str], Mapping[str, object]],
     cutoff: date,
     retrieved_at: datetime,
     concept_map: Mapping[str, object],
@@ -1323,7 +1317,7 @@ def parse_insider_archives(
     paths: list[Path],
     cik_to_security: Mapping[str, str],
     ticker_to_id: Mapping[str, str],
-    filings: Mapping[str, Mapping[str, object]],
+    filings: Mapping[tuple[str, str], Mapping[str, object]],
     cutoff: date,
     retrieved_at: datetime,
 ) -> list[dict[str, object]]:
@@ -1350,7 +1344,7 @@ def parse_insider_archives(
                 )
                 if security_id is None:
                     continue
-                filing = filings.get(accession, {})
+                filing = filings.get((issuer_cik, accession), {})
                 acceptance = filing.get("acceptance_datetime_utc")
                 if not isinstance(acceptance, datetime):
                     acceptance = None

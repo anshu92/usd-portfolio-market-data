@@ -487,16 +487,30 @@ def test_ownership_schedule_attaches_to_subject_not_filer(
     with zipfile.ZipFile(archive, "w") as output:
         output.writestr("CIK0000000001.json", json.dumps(document(1, "JPM")))
         output.writestr("CIK0000000002.json", json.dumps(document(2, "AAPL")))
+        output.writestr("CIK0000000003.json", json.dumps(document(3, "MSFT")))
     _, filings, all_filings, _ = enrichment_module.parse_submissions(
         archive,
-        {"JPM": "XNYS:JPM", "AAPL": "XNAS:AAPL"},
+        {
+            "JPM": "XNYS:JPM",
+            "AAPL": "XNAS:AAPL",
+            "MSFT": "XNAS:MSFT",
+        },
         {
             "XNYS:JPM": {"ticker": "JPM", "exchange_mic": "XNYS"},
             "XNAS:AAPL": {"ticker": "AAPL", "exchange_mic": "XNAS"},
+            "XNAS:MSFT": {"ticker": "MSFT", "exchange_mic": "XNAS"},
         },
         date(2026, 7, 17),
         datetime(2026, 7, 17, 12, 0),
     )
-    assert all_filings[accession]["cik"] == "0000000002"
-    assert all_filings[accession]["security_id"] == "XNAS:AAPL"
-    assert [row["form"] for row in filings] == ["SCHEDULE 13G/A"]
+    assert set(all_filings) == {
+        ("0000000002", accession),
+        ("0000000003", accession),
+    }
+    assert {
+        row["security_id"] for row in all_filings.values()
+    } == {"XNAS:AAPL", "XNAS:MSFT"}
+    assert [row["form"] for row in filings] == [
+        "SCHEDULE 13G/A",
+        "SCHEDULE 13G/A",
+    ]
