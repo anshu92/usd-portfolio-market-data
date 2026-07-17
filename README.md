@@ -145,6 +145,8 @@ enrichment fixture with phase logging:
 PYTHONPATH=. uv run --python 3.13 --with-requirements requirements-dev.txt \
   python benchmarks/benchmark_company_facts.py --rows 1000000
 PYTHONPATH=. uv run --python 3.13 --with-requirements requirements-dev.txt \
+  python benchmarks/benchmark_submissions.py --documents 1000 --filings-per-document 100
+PYTHONPATH=. uv run --python 3.13 --with-requirements requirements-dev.txt \
   pytest -q -s tests/test_enrichment.py::test_offline_enrichment_build_is_point_in_time_safe
 ```
 
