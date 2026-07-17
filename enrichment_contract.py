@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import csv
 import hashlib
 import math
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Mapping
@@ -20,6 +22,7 @@ POINT_IN_TIME_COLUMNS = (
     ("source_publication_date", "DATE"),
     ("source_retrieved_at_utc", "TIMESTAMP"),
 )
+CSV_NULL_MARKER = "__USD_PORTFOLIO_MARKET_DATA_NULL_7F3E9A2C__"
 
 
 @dataclass(frozen=True)
@@ -432,6 +435,10 @@ def _quoted(identifier: str) -> str:
     return '"' + identifier.replace('"', '""') + '"'
 
 
+def _literal(value: object) -> str:
+    return "'" + str(value).replace("'", "''") + "'"
+
+
 def write_parquet(
     path: Path,
     contract: DatasetContract,
@@ -441,72 +448,116 @@ def write_parquet(
     allowed = set(column_names)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    database = path.with_suffix(path.suffix + ".duckdb.tmp")
+    spool = path.with_suffix(path.suffix + ".csv.tmp")
     if tmp.exists():
         tmp.unlink()
-    if database.exists():
-        database.unlink()
-    con = duckdb.connect(str(database))
+    if spool.exists():
+        spool.unlink()
     row_count = 0
+    started_at = time.monotonic()
     try:
-        definitions = ", ".join(
-            f"{_quoted(name)} {sql_type}" for name, sql_type in contract.columns
-        )
-        con.execute(f"CREATE TABLE output ({definitions})")
-        placeholders = ", ".join("?" for _ in column_names)
-        batch: list[tuple[object, ...]] = []
-        for index, row in enumerate(rows):
-            extra = set(row) - allowed
-            if extra:
-                raise ContractError(
-                    f"{contract.filename} row {index} has extra columns: {sorted(extra)}"
-                )
-            for name, sql_type in contract.columns:
-                value = row.get(name)
-                if sql_type == "DOUBLE" and value is not None:
-                    try:
-                        finite = math.isfinite(float(value))
-                    except (TypeError, ValueError) as exc:
+        with spool.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.writer(handle, lineterminator="\n")
+            for index, row in enumerate(rows):
+                extra = set(row) - allowed
+                if extra:
+                    raise ContractError(
+                        f"{contract.filename} row {index} has extra columns: "
+                        f"{sorted(extra)}"
+                    )
+                values: list[object] = []
+                for name, sql_type in contract.columns:
+                    value = row.get(name)
+                    if value is not None and str(value) == CSV_NULL_MARKER:
                         raise ContractError(
-                            f"{contract.filename} row {index} has invalid {name}"
-                        ) from exc
-                    if not finite:
-                        raise ContractError(
-                            f"{contract.filename} row {index} has non-finite {name}"
+                            f"{contract.filename} row {index} collides with null marker"
                         )
-            batch.append(tuple(row.get(name) for name in column_names))
-            row_count += 1
-            if len(batch) == 10_000:
-                con.executemany(f"INSERT INTO output VALUES ({placeholders})", batch)
-                batch.clear()
-        if batch:
-            con.executemany(f"INSERT INTO output VALUES ({placeholders})", batch)
-        key_sql = ", ".join(_quoted(name) for name in contract.primary_key)
-        duplicate_count = con.execute(
-            f"SELECT count(*) - count(DISTINCT ({key_sql})) FROM output"
-        ).fetchone()[0]
-        if duplicate_count:
-            raise ContractError(
-                f"{contract.filename} has {int(duplicate_count)} duplicate primary keys"
+                    if sql_type == "DOUBLE" and value is not None:
+                        try:
+                            finite = math.isfinite(float(value))
+                        except (TypeError, ValueError) as exc:
+                            raise ContractError(
+                                f"{contract.filename} row {index} has invalid {name}"
+                            ) from exc
+                        if not finite:
+                            raise ContractError(
+                                f"{contract.filename} row {index} has non-finite {name}"
+                            )
+                    values.append(CSV_NULL_MARKER if value is None else value)
+                writer.writerow(values)
+                row_count += 1
+                if row_count % 1_000_000 == 0:
+                    print(
+                        f"parquet_writer file={contract.filename} phase=spool "
+                        f"rows={row_count} elapsed_seconds="
+                        f"{time.monotonic() - started_at:.1f}",
+                        flush=True,
+                    )
+
+        if row_count >= 100_000:
+            print(
+                f"parquet_writer file={contract.filename} phase=load "
+                f"rows={row_count} elapsed_seconds="
+                f"{time.monotonic() - started_at:.1f}",
+                flush=True,
             )
-        null_key = " OR ".join(
-            f"{_quoted(name)} IS NULL" for name in contract.primary_key
-        )
-        if (
-            not contract.allow_null_primary_key
-            and con.execute(f"SELECT count(*) FROM output WHERE {null_key}").fetchone()[0]
-        ):
-            raise ContractError(f"{contract.filename} has a null primary-key value")
-        order_sql = ", ".join(_quoted(name) for name in contract.primary_key)
-        con.execute(
-            f"COPY (SELECT * FROM output ORDER BY {order_sql}) TO ? "
-            "(FORMAT PARQUET, COMPRESSION ZSTD)",
-            [str(tmp)],
-        )
+
+        con = duckdb.connect()
+        try:
+            if row_count:
+                csv_columns = ", ".join(
+                    f"{_literal(name)}: {_literal(sql_type)}"
+                    for name, sql_type in contract.columns
+                )
+                con.execute(
+                    f"CREATE VIEW output AS SELECT * FROM read_csv({_literal(spool)}, "
+                    f"auto_detect = false, header = false, parallel = true, "
+                    f"nullstr = '{CSV_NULL_MARKER}', columns = {{{csv_columns}}})",
+                )
+            else:
+                definitions = ", ".join(
+                    f"{_quoted(name)} {sql_type}"
+                    for name, sql_type in contract.columns
+                )
+                con.execute(f"CREATE TABLE output ({definitions})")
+            key_sql = ", ".join(_quoted(name) for name in contract.primary_key)
+            duplicate_count = con.execute(
+                f"SELECT count(*) - count(DISTINCT ({key_sql})) FROM output"
+            ).fetchone()[0]
+            if duplicate_count:
+                raise ContractError(
+                    f"{contract.filename} has {int(duplicate_count)} duplicate primary keys"
+                )
+            null_key = " OR ".join(
+                f"{_quoted(name)} IS NULL" for name in contract.primary_key
+            )
+            if (
+                not contract.allow_null_primary_key
+                and con.execute(
+                    f"SELECT count(*) FROM output WHERE {null_key}"
+                ).fetchone()[0]
+            ):
+                raise ContractError(
+                    f"{contract.filename} has a null primary-key value"
+                )
+            order_sql = ", ".join(_quoted(name) for name in contract.primary_key)
+            con.execute(
+                f"COPY (SELECT * FROM output ORDER BY {order_sql}) TO ? "
+                "(FORMAT PARQUET, COMPRESSION ZSTD)",
+                [str(tmp)],
+            )
+            if row_count >= 100_000:
+                print(
+                    f"parquet_writer file={contract.filename} phase=complete "
+                    f"rows={row_count} elapsed_seconds="
+                    f"{time.monotonic() - started_at:.1f}",
+                    flush=True,
+                )
+        finally:
+            con.close()
     finally:
-        con.close()
-        if database.exists():
-            database.unlink()
+        if spool.exists():
+            spool.unlink()
     os.replace(tmp, path)
     return row_count
 
