@@ -161,12 +161,23 @@ def sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
-def combined_revision(paths: Iterable[Path]) -> str:
+def combined_revision(
+    paths: Iterable[Path], known_revisions: Mapping[Path, str] | None = None
+) -> str:
     digest = hashlib.sha256()
     for path in sorted(paths, key=lambda item: item.name):
         digest.update(path.name.encode())
-        digest.update(bytes.fromhex(sha256_file(path)))
+        revision = (known_revisions or {}).get(path)
+        digest.update(bytes.fromhex(revision or sha256_file(path)))
     return digest.hexdigest()
+
+
+def log_stage(stage: str, phase: str, started_at: float) -> None:
+    print(
+        f"enrichment_stage stage={stage} phase={phase} "
+        f"elapsed_seconds={time.monotonic() - started_at:.1f}",
+        flush=True,
+    )
 
 
 def normalize_name(value: object) -> str:
@@ -320,6 +331,7 @@ def parse_submissions(
     universe: Mapping[str, Mapping[str, str]],
     cutoff: date,
     retrieved_at: datetime,
+    source_revision: str | None = None,
 ) -> tuple[
     list[dict[str, object]],
     list[dict[str, object]],
@@ -329,7 +341,7 @@ def parse_submissions(
     master_by_id: dict[str, dict[str, object]] = {}
     all_filings: dict[tuple[str, str], dict[str, object]] = {}
     cik_to_security: dict[str, str] = {}
-    revision = sha256_file(path)
+    revision = source_revision or sha256_file(path)
     candidates: dict[str, tuple[dict[str, object], list[str], date]] = {}
     security_candidates: dict[str, list[tuple[date, str]]] = defaultdict(list)
     for _, document in iter_json_documents(path):
@@ -507,8 +519,9 @@ def iter_company_facts(
     filings: Mapping[tuple[str, str], Mapping[str, object]],
     cutoff: date,
     retrieved_at: datetime,
+    source_revision: str | None = None,
 ) -> Iterator[dict[str, object]]:
-    revision = sha256_file(path)
+    revision = source_revision or sha256_file(path)
     for _, document in iter_json_documents(path):
         try:
             cik = cik10(document.get("cik"))
@@ -592,6 +605,7 @@ def build_company_facts_asset(
     cutoff: date,
     retrieved_at: datetime,
     concept_map: Mapping[str, object],
+    source_revision: str | None = None,
 ) -> tuple[list[dict[str, object]], dict[str, object]]:
     raw_concepts = concept_map.get("concepts")
     if not isinstance(raw_concepts, dict):
@@ -611,7 +625,12 @@ def build_company_facts_asset(
     def rows() -> Iterator[dict[str, object]]:
         nonlocal minimum_event_date, maximum_event_date, has_ifrs
         for row in iter_company_facts(
-            source_path, cik_to_security, filings, cutoff, retrieved_at
+            source_path,
+            cik_to_security,
+            filings,
+            cutoff,
+            retrieved_at,
+            source_revision,
         ):
             event_date = row.get("period_end")
             if isinstance(event_date, date):
@@ -2075,13 +2094,28 @@ def main(argv: list[str] | None = None) -> int:
     insider_paths = [Path(value).resolve() for value in args.insider_archive]
     form13f_paths = [Path(value).resolve() for value in args.form13f_archive]
     try:
+        source_hash_started = time.monotonic()
+        log_stage("source_hashes", "start", source_hash_started)
+        source_paths = [companyfacts_path, submissions_path, *insider_paths, *form13f_paths]
+        known_revisions = {path: sha256_file(path) for path in source_paths}
+        log_stage("source_hashes", "complete", source_hash_started)
         universe, ticker_to_id = load_universe(universe_path)
+        submissions_started = time.monotonic()
+        log_stage("submissions", "start", submissions_started)
         masters, filing_rows, all_filings, cik_to_security = parse_submissions(
-            submissions_path, ticker_to_id, universe, cutoff, retrieved_at
+            submissions_path,
+            ticker_to_id,
+            universe,
+            cutoff,
+            retrieved_at,
+            known_revisions[submissions_path],
         )
+        log_stage("submissions", "complete", submissions_started)
         concept_map = load_json(Path(args.concept_map).resolve())
         if not isinstance(concept_map, dict):
             raise EnrichmentError("SEC concept map root is not an object")
+        companyfacts_started = time.monotonic()
+        log_stage("company_facts", "start", companyfacts_started)
         normalization_facts, fact_stats = build_company_facts_asset(
             companyfacts_path,
             out_dir / "sec-company-facts.parquet",
@@ -2090,7 +2124,9 @@ def main(argv: list[str] | None = None) -> int:
             cutoff,
             retrieved_at,
             concept_map,
+            known_revisions[companyfacts_path],
         )
+        log_stage("company_facts", "complete", companyfacts_started)
         normalized = normalize_fundamentals(normalization_facts, concept_map)
         factors = build_factors(
             normalized,
@@ -2167,19 +2203,19 @@ def main(argv: list[str] | None = None) -> int:
         if notice_source != notice_target:
             shutil.copyfile(notice_source, notice_target)
         revisions = {
-            "security-master.parquet": sha256_file(submissions_path),
-            "sec-company-facts.parquet": sha256_file(companyfacts_path),
-            "normalized-fundamentals-quarterly.parquet": sha256_file(companyfacts_path),
+            "security-master.parquet": known_revisions[submissions_path],
+            "sec-company-facts.parquet": known_revisions[companyfacts_path],
+            "normalized-fundamentals-quarterly.parquet": known_revisions[companyfacts_path],
             "fundamental-factors.parquet": combined_revision(
-                [companyfacts_path, Path(args.prices).resolve()]
+                [companyfacts_path, Path(args.prices).resolve()], known_revisions
             ),
-            "sec-filings.parquet": sha256_file(submissions_path),
-            "corporate-events.parquet": sha256_file(submissions_path),
-            "earnings-and-guidance-events.parquet": sha256_file(submissions_path),
-            "insider-transactions.parquet": combined_revision(insider_paths) if insider_paths else "",
-            "insider-signals.parquet": combined_revision(insider_paths) if insider_paths else "",
-            "institutional-holdings-13f.parquet": combined_revision(form13f_paths) if form13f_paths else "",
-            "institutional-ownership-signals.parquet": combined_revision(form13f_paths) if form13f_paths else "",
+            "sec-filings.parquet": known_revisions[submissions_path],
+            "corporate-events.parquet": known_revisions[submissions_path],
+            "earnings-and-guidance-events.parquet": known_revisions[submissions_path],
+            "insider-transactions.parquet": combined_revision(insider_paths, known_revisions) if insider_paths else "",
+            "insider-signals.parquet": combined_revision(insider_paths, known_revisions) if insider_paths else "",
+            "institutional-holdings-13f.parquet": combined_revision(form13f_paths, known_revisions) if form13f_paths else "",
+            "institutional-ownership-signals.parquet": combined_revision(form13f_paths, known_revisions) if form13f_paths else "",
             "finra-short-interest.parquet": (
                 sha256_file(Path(args.finra_file).resolve()) if args.finra_file else sha256_bytes(json.dumps(finra_raw, sort_keys=True).encode())
             ),
