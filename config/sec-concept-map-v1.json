@@ -1,0 +1,30 @@
+{
+  "version": "1.0.0",
+  "taxonomy_precedence": ["us-gaap", "ifrs-full"],
+  "concepts": {
+    "revenue": ["RevenueFromContractWithCustomerExcludingAssessedTax", "Revenues", "SalesRevenueNet"],
+    "gross_profit": ["GrossProfit"],
+    "operating_income": ["OperatingIncomeLoss"],
+    "pretax_income": ["IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest", "IncomeLossFromContinuingOperationsBeforeIncomeTaxesMinorityInterestAndIncomeLossFromEquityMethodInvestments"],
+    "net_income": ["NetIncomeLoss", "ProfitLoss"],
+    "operating_cash_flow": ["NetCashProvidedByUsedInOperatingActivities"],
+    "capital_expenditure": ["PaymentsToAcquirePropertyPlantAndEquipment", "PaymentsForAdditionsToPropertyPlantAndEquipment"],
+    "cash_and_equivalents": ["CashAndCashEquivalentsAtCarryingValue", "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents"],
+    "current_assets": ["AssetsCurrent"],
+    "current_liabilities": ["LiabilitiesCurrent"],
+    "total_assets": ["Assets"],
+    "total_liabilities": ["Liabilities"],
+    "short_term_debt": ["ShortTermBorrowings", "LongTermDebtCurrent", "ShortTermDebtCurrent"],
+    "long_term_debt": ["LongTermDebtNoncurrent", "LongTermDebt"],
+    "total_debt": ["LongTermDebtAndFinanceLeaseObligations", "LongTermDebtAndCapitalLeaseObligations"],
+    "stockholders_equity": ["StockholdersEquity", "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"],
+    "goodwill": ["Goodwill"],
+    "intangible_assets": ["FiniteLivedIntangibleAssetsNet", "IndefiniteLivedIntangibleAssetsExcludingGoodwill"],
+    "shares_basic": ["WeightedAverageNumberOfSharesOutstandingBasic"],
+    "shares_diluted": ["WeightedAverageNumberOfDilutedSharesOutstanding"],
+    "stock_based_compensation": ["ShareBasedCompensation"],
+    "interest_expense": ["InterestExpenseNonOperating", "InterestExpense"],
+    "accounts_receivable": ["AccountsReceivableNetCurrent", "AccountsNotesAndLoansReceivableNetCurrent"],
+    "inventory": ["InventoryNet"]
+  }
+}

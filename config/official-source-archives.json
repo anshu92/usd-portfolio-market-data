@@ -1,0 +1,11 @@
+{
+  "schema_version": "1.0.0",
+  "insider_archives": [
+    "https://www.sec.gov/files/datastandardsinnovation/data/insider-transactions-data-sets/2026q2_form345.zip",
+    "https://www.sec.gov/files/structureddata/data/insider-transactions-data-sets/2026q1_form345.zip"
+  ],
+  "form13f_archives": [
+    "https://www.sec.gov/files/structureddata/data/form-13f-data-sets/01mar2026-31may2026_form13f.zip",
+    "https://www.sec.gov/files/structureddata/data/form-13f-data-sets/01dec2025-28feb2026_form13f.zip"
+  ]
+}

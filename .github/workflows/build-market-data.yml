@@ -40,7 +40,7 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 75
+    timeout-minutes: 360
     permissions:
       contents: read
     outputs:
@@ -107,6 +107,10 @@ jobs:
 
           if ! [[ "$sessions" =~ ^[0-9]+$ ]] || (( sessions < minimum_history )); then
             echo "sessions must be an integer >= minimum history" >&2
+            exit 2
+          fi
+          if [[ "$mode" == "full" && "$sessions" != "320" ]]; then
+            echo "Full enrichment builds require exactly 320 market sessions" >&2
             exit 2
           fi
           if [[ "$requested_publish" == "true" ]]; then
@@ -194,10 +198,65 @@ jobs:
             --minimum-adequate-history-coverage 0.50 \
             --cutoff-date "${{ steps.inputs.outputs.cutoff }}"
 
+      - name: Download official SEC bulk sources
+        if: steps.inputs.outputs.mode == 'full'
+        shell: bash
+        env:
+          SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$SEC_USER_AGENT" ]]; then
+            echo "SEC_USER_AGENT is required for full enrichment builds" >&2
+            exit 2
+          fi
+          mkdir -p sources/insider sources/form13f
+          sec_curl=(
+            curl --fail --silent --show-error --location --retry 4
+            --compressed
+            --user-agent "$SEC_USER_AGENT"
+            --header 'Accept-Encoding: gzip, deflate'
+          )
+          "${sec_curl[@]}" \
+            https://www.sec.gov/Archives/edgar/daily-index/xbrl/companyfacts.zip \
+            --output sources/companyfacts.zip
+          "${sec_curl[@]}" \
+            https://www.sec.gov/Archives/edgar/daily-index/bulkdata/submissions.zip \
+            --output sources/submissions.zip
+          while IFS= read -r url; do
+            "${sec_curl[@]}" "$url" --output "sources/insider/${url##*/}"
+          done < <(jq -r '.insider_archives[]' config/official-source-archives.json)
+          while IFS= read -r url; do
+            "${sec_curl[@]}" "$url" --output "sources/form13f/${url##*/}"
+          done < <(jq -r '.form13f_archives[]' config/official-source-archives.json)
+
+      - name: Build official-source enrichment assets
+        if: steps.inputs.outputs.mode == 'full'
+        shell: bash
+        run: |
+          set -euo pipefail
+          insider_args=()
+          for archive in sources/insider/*.zip; do
+            insider_args+=(--insider-archive "$archive")
+          done
+          form13f_args=()
+          for archive in sources/form13f/*.zip; do
+            form13f_args+=(--form13f-archive "$archive")
+          done
+          python build-enrichment-data.py \
+            --universe dist/security-universe.csv \
+            --prices dist/yahoo-ohlcv-320.parquet \
+            --manifest dist/manifest.json \
+            --companyfacts sources/companyfacts.zip \
+            --submissions sources/submissions.zip \
+            "${insider_args[@]}" \
+            "${form13f_args[@]}" \
+            --out-dir dist \
+            --cutoff-date "${{ steps.inputs.outputs.cutoff }}"
+
       - name: Verify build output
         run: |
           args=(--dist dist --require-ready)
-          if [[ "${{ steps.inputs.outputs.publish }}" == "true" ]]; then
+          if [[ "${{ steps.inputs.outputs.mode }}" == "full" ]]; then
             args+=(--require-production)
           fi
           python verify-release.py "${args[@]}"
@@ -239,11 +298,11 @@ jobs:
         with:
           name: ${{ steps.inputs.outputs.artifact_name }}
           path: |
-            dist/yahoo-ohlcv-*.parquet
-            dist/yahoo-splits.parquet
+            dist/*.parquet
             dist/security-universe.csv
             dist/manifest.json
             dist/unmatched-tickers.csv
+            dist/NOTICE.md
             dist/release-notes.md
           if-no-files-found: warn
           retention-days: 7
@@ -291,11 +350,24 @@ jobs:
         run: |
           set -euo pipefail
           gh release create "$TAG" \
+            dist/NOTICE.md \
+            dist/corporate-events.parquet \
+            dist/earnings-and-guidance-events.parquet \
+            dist/finra-short-interest.parquet \
+            dist/fundamental-factors.parquet \
+            dist/insider-signals.parquet \
+            dist/insider-transactions.parquet \
+            dist/institutional-holdings-13f.parquet \
+            dist/institutional-ownership-signals.parquet \
+            dist/manifest.json \
+            dist/normalized-fundamentals-quarterly.parquet \
+            dist/sec-company-facts.parquet \
+            dist/sec-filings.parquet \
+            dist/security-master.parquet \
+            dist/security-universe.csv \
+            dist/unmatched-tickers.csv \
             dist/yahoo-ohlcv-320.parquet \
             dist/yahoo-splits.parquet \
-            dist/security-universe.csv \
-            dist/manifest.json \
-            dist/unmatched-tickers.csv \
             --draft \
             --title "Portfolio market data $TAG" \
             --notes-file dist/release-notes.md

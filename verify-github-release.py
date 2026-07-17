@@ -10,14 +10,17 @@ import re
 import sys
 from pathlib import Path
 
+from enrichment_contract import CONTRACTS
 
-EXPECTED_ASSETS = (
+
+EXPECTED_ASSETS = tuple(sorted({
     "manifest.json",
+    "NOTICE.md",
     "security-universe.csv",
     "unmatched-tickers.csv",
     "yahoo-ohlcv-320.parquet",
     "yahoo-splits.parquet",
-)
+} | set(CONTRACTS)))
 EXPORT_METADATA_FILES = {"github-release.json", "resolved-tag.txt"}
 TAG_PATTERN = re.compile(r"market-data-[0-9]{8}T[0-9]{6}Z")
 DIGEST_PATTERN = re.compile(r"sha256:([0-9a-f]{64})")

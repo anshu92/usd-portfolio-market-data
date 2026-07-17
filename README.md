@@ -1,9 +1,9 @@
 # USD Portfolio Market Data
 
-This repository builds a compact, validated historical OHLCV and split-event dataset
-for normal-status Nasdaq- and NYSE-listed equities. It contains public reference data
-and producer code only—never portfolio holdings, cash, transactions, credentials, or
-other private state.
+This repository builds a compact, validated historical market, SEC, ownership, event,
+and FINRA short-interest package for normal-status Nasdaq- and NYSE-listed equities. It
+contains public reference data and producer code only—never portfolio holdings, cash,
+transactions, credentials, or other private state.
 
 The output is historical research data, not a quote feed. Raw `close` is deliberately
 not described as adjusted close.
@@ -12,11 +12,24 @@ not described as adjusted close.
 
 A production release contains:
 
+- `NOTICE.md`
+- `corporate-events.parquet`
+- `earnings-and-guidance-events.parquet`
+- `finra-short-interest.parquet`
+- `fundamental-factors.parquet`
+- `insider-signals.parquet`
+- `insider-transactions.parquet`
+- `institutional-holdings-13f.parquet`
+- `institutional-ownership-signals.parquet`
+- `manifest.json`
+- `normalized-fundamentals-quarterly.parquet`
+- `sec-company-facts.parquet`
+- `sec-filings.parquet`
+- `security-master.parquet`
+- `security-universe.csv`
+- `unmatched-tickers.csv`
 - `yahoo-ohlcv-320.parquet`
 - `yahoo-splits.parquet`
-- `security-universe.csv`
-- `manifest.json`
-- `unmatched-tickers.csv`
 
 Consumers must download `manifest.json` first, require schema `1.0.0` and status
 `READY`, then validate every file's SHA-256, size, row count, and schema before use.
@@ -25,7 +38,7 @@ coverage, history eligibility, XNYS-session freshness, and all warnings.
 
 Consumers without direct GitHub Release download access can dispatch
 `export-release-for-consumer.yml`. The read-only workflow resolves the immutable latest
-tag, verifies GitHub's SHA-256 digest for all five assets, runs the production manifest
+tag, verifies GitHub's SHA-256 digest for every asset, runs the production manifest
 verifier, and uploads `validated-market-data-{tag}` as a 30-day workflow artifact. The
 artifact also contains `github-release.json` and `resolved-tag.txt` so the receiving
 consumer can independently revalidate the pinned release before atomic promotion.
@@ -35,6 +48,12 @@ producer-commit, expiry, size, and digest values. Consumers must compare that po
 against the Actions artifact API and then revalidate the downloaded contents; the
 pointer is discovery metadata, not a substitute for validation. Successful production
 publication automatically dispatches a fresh consumer export.
+
+The manifest reports each enrichment domain independently. Analyst estimates remain
+absent until a licensed provider is configured and are explicitly reported as
+`NOT_CONFIGURED`; this disables estimate-only components, not unrelated archetypes.
+See [consumer/README.md](consumer/README.md) for the import, freshness, point-in-time,
+and factor-disable contract.
 
 ## Universe policy
 
@@ -89,6 +108,33 @@ python verify-release.py --dist dist --require-ready
 Without local overrides, the producer downloads the resolved Hugging Face dataset
 revision into `.hf-cache` and records the exact revision and input hashes.
 
+Build enrichment files from local official-source snapshots:
+
+```bash
+python build-enrichment-data.py \
+  --universe dist/security-universe.csv \
+  --prices dist/yahoo-ohlcv-320.parquet \
+  --manifest dist/manifest.json \
+  --companyfacts /path/to/companyfacts.zip \
+  --submissions /path/to/submissions.zip \
+  --insider-archive /path/to/2026q2_form345.zip \
+  --form13f-archive /path/to/01mar2026-31may2026_form13f.zip \
+  --finra-file /path/to/finra-short-interest.json \
+  --cutoff-date 2026-07-17 \
+  --out-dir dist
+python verify-release.py --dist dist --require-ready --require-production
+```
+
+SEC inputs use the nightly company-facts and submissions bulk archives plus the
+version-controlled quarterly archive list in
+`config/official-source-archives.json`. FINRA observations are queried only from its
+official Equity API and receive the publication date from the reviewed official
+schedule. Every output schema is defined in `enrichment_contract.py`; the optional
+analyst-estimates schema exists there but is not a release requirement.
+Raw company facts retain all eligible observations. Quarterly normalization retains a
+rolling six-fiscal-year window, which covers the three-year stability/growth factors
+while bounding full-universe memory use; the floor year is disclosed in the manifest.
+
 ## Automation and publication
 
 Pull requests run only offline fixtures with read-only permissions. The production
@@ -105,6 +151,11 @@ The build job has read-only repository access. A separate publish job receives
 `contents: write`, verifies the transferred artifact again, creates a draft release
 with every asset attached, then publishes it as latest. Enable GitHub release
 immutability before the first production release.
+
+Full builds require the `SEC_USER_AGENT` GitHub secret. Every SEC request sends that
+identification plus `Accept-Encoding: gzip, deflate`; bulk downloads are sequential and
+remain below the SEC's ten-requests-per-second ceiling. Update the reviewed quarterly
+archive configuration when the SEC publishes a new insider or 13F archive.
 
 ## Failure policy
 

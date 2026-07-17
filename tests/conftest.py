@@ -33,6 +33,11 @@ def aggregate_module():
 
 
 @pytest.fixture(scope="session")
+def enrichment_module():
+    return load_script("build_enrichment_data", "build-enrichment-data.py")
+
+
+@pytest.fixture(scope="session")
 def verify_module():
     return load_script("verify_release", "verify-release.py")
 

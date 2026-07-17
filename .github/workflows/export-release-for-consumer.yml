@@ -64,7 +64,20 @@ jobs:
           set -euo pipefail
           mkdir -p staging/release
           for asset in \
+            NOTICE.md \
+            corporate-events.parquet \
+            earnings-and-guidance-events.parquet \
+            finra-short-interest.parquet \
+            fundamental-factors.parquet \
+            insider-signals.parquet \
+            insider-transactions.parquet \
+            institutional-holdings-13f.parquet \
+            institutional-ownership-signals.parquet \
             manifest.json \
+            normalized-fundamentals-quarterly.parquet \
+            sec-company-facts.parquet \
+            sec-filings.parquet \
+            security-master.parquet \
             security-universe.csv \
             unmatched-tickers.csv \
             yahoo-ohlcv-320.parquet \
