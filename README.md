@@ -100,4 +100,15 @@ failure stops publication. A previous release remains latest. Identical source r
 collapsed and disclosed; conflicting rows fail. Unmatched securities remain in the
 universe but are excluded from price-dependent analysis and listed diagnostically.
 
+Validation applies to rows eligible for the requested per-security history window;
+legacy source rows that cannot enter an output do not fail a build. Source-symbol
+histories more than five eligible XNYS sessions stale are treated as unmatched to limit
+recycled-ticker contamination. Histories are also truncated at gaps longer than 14
+calendar days or an invalid row with a fourfold price discontinuity, preventing
+pre-boundary rows from a recycled symbol from being attached to a current listing. A
+broad source session with invalid OHLC bounds is
+quarantined only when at least 100 securities are present and more than 1% are invalid.
+Every quarantine is recorded in the manifest, and the normal market-freshness gate then
+evaluates the resulting maximum date. Individual invalid output rows still fail.
+
 See [NOTICE.md](NOTICE.md) for attribution and upstream-rights caveats.

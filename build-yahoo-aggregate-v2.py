@@ -48,6 +48,12 @@ SPLIT_SCHEMA = (
     "source_revision",
     "observed_at_utc",
 )
+PRICE_INVALID_SQL = """
+    open IS NULL OR high IS NULL OR low IS NULL OR close IS NULL OR volume IS NULL
+    OR NOT isfinite(open) OR NOT isfinite(high) OR NOT isfinite(low) OR NOT isfinite(close)
+    OR open <= 0 OR high <= 0 OR low <= 0 OR close <= 0 OR volume < 0
+    OR low > high OR low > least(open, close) OR high < greatest(open, close)
+"""
 
 
 class AggregateError(RuntimeError):
@@ -262,20 +268,6 @@ def prepare_price_source(
         """,
         [str(path), cutoff.isoformat()],
     )
-    invalid = int(
-        con.execute(
-            """
-            SELECT count(*) FROM price_source
-            WHERE source_symbol IS NULL OR source_symbol = '' OR session_date IS NULL
-               OR open IS NULL OR high IS NULL OR low IS NULL OR close IS NULL OR volume IS NULL
-               OR NOT isfinite(open) OR NOT isfinite(high) OR NOT isfinite(low) OR NOT isfinite(close)
-               OR open <= 0 OR high <= 0 OR low <= 0 OR close <= 0 OR volume < 0
-               OR low > high OR low > least(open, close) OR high < greatest(open, close)
-            """
-        ).fetchone()[0]
-    )
-    if invalid:
-        raise AggregateError(f"Price source contains {invalid} invalid matched rows")
     conflicts = int(
         con.execute(
             """
@@ -308,6 +300,195 @@ def prepare_price_source(
     )
     con.execute("CREATE TEMP TABLE price_dedup AS SELECT DISTINCT * FROM price_source")
     return identical_duplicates
+
+
+def prepare_price_candidates(
+    con: duckdb.DuckDBPyConnection,
+    *,
+    sessions: int,
+    expected_session: date,
+    maximum_security_staleness_sessions: int,
+    maximum_source_gap_days: int,
+    source_reuse_price_ratio: float,
+    systemic_invalid_session_rate: float,
+    minimum_systemic_session_securities: int,
+) -> tuple[
+    date,
+    list[tuple[str, date]],
+    list[tuple[str, date, date, str]],
+    list[tuple[date, int, int, float]],
+]:
+    """Select releasable history and isolate systemic upstream session failures.
+
+    Invalid rows outside the requested per-security history cannot enter an output and
+    therefore do not invalidate a build. A recent source symbol must have observations
+    within the configured XNYS-session window; this prevents histories from a recycled
+    ticker from being attached to a current listing. If a sufficiently broad source
+    session has a systemic invalid-OHLC rate, the entire session is quarantined and the
+    normal market-freshness gate evaluates the resulting output date.
+    """
+    con.execute(
+        f"""
+        CREATE TEMP TABLE price_candidate AS
+        WITH matched AS (
+          SELECT a.security_id, a.ticker, p.source_symbol, p.session_date,
+                 p.open, p.high, p.low, p.close, p.volume,
+                 row_number() OVER (
+                   PARTITION BY a.security_id, p.session_date
+                   ORDER BY a.priority, p.source_symbol
+                 ) AS alias_rank
+          FROM price_dedup p
+          JOIN aliases a ON p.source_symbol = a.source_symbol
+        ), best_alias AS (
+          SELECT * EXCLUDE(alias_rank) FROM matched WHERE alias_rank = 1
+        ), with_previous AS (
+          SELECT *,
+                 lag(session_date) OVER (
+                   PARTITION BY security_id ORDER BY session_date
+                 ) AS previous_session,
+                 lag(close) OVER (
+                   PARTITION BY security_id ORDER BY session_date
+                 ) AS previous_close
+          FROM best_alias
+        ), with_break AS (
+          SELECT *,
+                 CASE
+                   WHEN previous_session IS NOT NULL
+                        AND datediff('day', previous_session, session_date) > ?
+                     THEN 'SESSION_GAP'
+                   WHEN previous_close > 0 AND close > 0
+                        AND ({PRICE_INVALID_SQL})
+                        AND greatest(close / previous_close, previous_close / close) >= ?
+                     THEN 'INVALID_PRICE_DISCONTINUITY'
+                   ELSE NULL
+                 END AS segment_break_reason
+          FROM with_previous
+        ), segmented AS (
+          SELECT *, sum(
+                   CASE WHEN segment_break_reason IS NOT NULL THEN 1 ELSE 0 END
+                 ) OVER (
+                   PARTITION BY security_id ORDER BY session_date
+                   ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                 ) AS segment_id
+          FROM with_break
+        ), annotated AS (
+          SELECT *, max(segment_id) OVER (
+                   PARTITION BY security_id
+                 ) AS latest_segment_id,
+                 min(CASE WHEN NOT ({PRICE_INVALID_SQL}) THEN session_date END) OVER (
+                   PARTITION BY security_id, segment_id
+                 ) AS valid_segment_start_date,
+                 max(
+                   CASE WHEN segment_break_reason IS NOT NULL
+                        THEN previous_session END
+                 ) OVER (
+                   PARTITION BY security_id, segment_id
+                 ) AS previous_segment_latest_date,
+                 max(segment_break_reason) OVER (
+                   PARTITION BY security_id, segment_id
+                 ) AS latest_segment_break_reason
+          FROM segmented
+        ), latest_segment AS (
+          SELECT * FROM annotated
+          WHERE segment_id = latest_segment_id
+            AND valid_segment_start_date IS NOT NULL
+            AND session_date >= valid_segment_start_date
+        ), ranked AS (
+          SELECT *,
+                 row_number() OVER (
+                   PARTITION BY security_id ORDER BY session_date DESC
+                 ) AS history_rank
+          FROM latest_segment
+        )
+        SELECT * FROM ranked WHERE history_rank <= ?
+        """,
+        [maximum_source_gap_days, source_reuse_price_ratio, sessions],
+    )
+
+    calendar = xcals.get_calendar("XNYS")
+    expected_label = calendar.date_to_session(
+        expected_session.isoformat(), direction="previous"
+    )
+    oldest_active_session = calendar.session_offset(
+        expected_label, -maximum_security_staleness_sessions
+    ).date()
+    con.execute(
+        """
+        CREATE TEMP TABLE security_source_latest AS
+        SELECT security_id, max(session_date) AS latest_session
+        FROM price_candidate GROUP BY security_id
+        """
+    )
+    stale_rows = [
+        (str(security_id), latest_session)
+        for security_id, latest_session in con.execute(
+            """
+            SELECT security_id, latest_session FROM security_source_latest
+            WHERE latest_session < cast(? AS DATE)
+            ORDER BY security_id
+            """,
+            [oldest_active_session.isoformat()],
+        ).fetchall()
+    ]
+    con.execute(
+        """
+        CREATE TEMP TABLE active_security_ids AS
+        SELECT security_id FROM security_source_latest
+        WHERE latest_session >= cast(? AS DATE)
+        """,
+        [oldest_active_session.isoformat()],
+    )
+
+    history_truncation_rows = [
+        (str(security_id), previous_latest, segment_start, str(reason))
+        for security_id, previous_latest, segment_start, reason in con.execute(
+            """
+            SELECT security_id,
+                   max(previous_segment_latest_date) AS previous_latest,
+                   min(valid_segment_start_date) AS segment_start,
+                   max(latest_segment_break_reason) AS reason
+            FROM price_candidate
+            WHERE previous_segment_latest_date IS NOT NULL
+            GROUP BY security_id
+            ORDER BY security_id
+            """
+        ).fetchall()
+    ]
+
+    con.execute(
+        f"""
+        CREATE TEMP TABLE quarantined_price_sessions AS
+        WITH quality AS (
+          SELECT session_date,
+                 count(*) AS total_rows,
+                 count(*) FILTER (WHERE {PRICE_INVALID_SQL}) AS invalid_rows
+          FROM price_candidate
+          JOIN active_security_ids USING (security_id)
+          GROUP BY session_date
+        )
+        SELECT session_date, invalid_rows, total_rows,
+               cast(invalid_rows AS DOUBLE) / total_rows AS invalid_rate
+        FROM quality
+        WHERE total_rows >= ?
+          AND cast(invalid_rows AS DOUBLE) / total_rows > ?
+        """,
+        [minimum_systemic_session_securities, systemic_invalid_session_rate],
+    )
+    quarantined_rows = [
+        (session_date, int(invalid_rows), int(total_rows), float(invalid_rate))
+        for session_date, invalid_rows, total_rows, invalid_rate in con.execute(
+            """
+            SELECT session_date, invalid_rows, total_rows, invalid_rate
+            FROM quarantined_price_sessions ORDER BY session_date
+            """
+        ).fetchall()
+    ]
+    return (
+        oldest_active_session,
+        stale_rows,
+        history_truncation_rows,
+        quarantined_rows,
+    )
 
 
 def prepare_split_source(
@@ -376,8 +557,12 @@ def prepare_split_source(
 
 
 def write_unmatched(
-    path: Path, securities: list[Security], matched_ids: set[str]
+    path: Path,
+    securities: list[Security],
+    matched_ids: set[str],
+    reasons: dict[str, str] | None = None,
 ) -> None:
+    reasons = reasons or {}
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle, lineterminator="\n")
         writer.writerow(["security_id", "ticker", "aliases_tried", "reason"])
@@ -388,7 +573,7 @@ def write_unmatched(
                         security.security_id,
                         security.ticker,
                         ";".join(yahoo_aliases(security.ticker)),
-                        "NO_SOURCE_SYMBOL_MATCH",
+                        reasons.get(security.security_id, "NO_SOURCE_SYMBOL_MATCH"),
                     ]
                 )
 
@@ -471,32 +656,38 @@ def build(args: argparse.Namespace) -> tuple[dict[str, object], int]:
         build_alias_table(con, securities)
         price_duplicate_count = prepare_price_source(con, prices_path, cutoff)
         split_duplicate_count = prepare_split_source(con, splits_path, cutoff)
+        expected_session = expected_latest_session(cutoff)
+        (
+            oldest_active_session,
+            stale_source_rows,
+            source_history_truncation_rows,
+            quarantined_session_rows,
+        ) = prepare_price_candidates(
+            con,
+            sessions=args.sessions,
+            expected_session=expected_session,
+            maximum_security_staleness_sessions=(
+                args.maximum_security_staleness_sessions
+            ),
+            maximum_source_gap_days=args.maximum_source_gap_days,
+            source_reuse_price_ratio=args.source_reuse_price_ratio,
+            systemic_invalid_session_rate=args.systemic_invalid_session_rate,
+            minimum_systemic_session_securities=(
+                args.minimum_systemic_session_securities
+            ),
+        )
 
         aggregate_query = """
-          WITH matched AS (
-            SELECT a.security_id, a.ticker, p.source_symbol, p.session_date,
-                   p.open, p.high, p.low, p.close, p.volume,
-                   row_number() OVER (
-                     PARTITION BY a.security_id, p.session_date
-                     ORDER BY a.priority, p.source_symbol
-                   ) AS alias_rank
-            FROM price_dedup p
-            JOIN aliases a ON p.source_symbol = a.source_symbol
-          ), ranked AS (
-            SELECT * EXCLUDE(alias_rank),
-                   row_number() OVER (
-                     PARTITION BY security_id ORDER BY session_date DESC
-                   ) AS history_rank
-            FROM matched WHERE alias_rank = 1
-          )
-          SELECT security_id, ticker, source_symbol, session_date,
-                 open, high, low, close, volume,
+          SELECT p.security_id, p.ticker, p.source_symbol, p.session_date,
+                 p.open, p.high, p.low, p.close, p.volume,
                  cast(? AS VARCHAR) AS source_dataset,
                  cast(? AS VARCHAR) AS source_revision,
                  cast(? AS VARCHAR) AS observed_at_utc
-          FROM ranked
-          WHERE history_rank <= ?
-          ORDER BY ticker, session_date
+          FROM price_candidate p
+          JOIN active_security_ids a USING (security_id)
+          LEFT JOIN quarantined_price_sessions q USING (session_date)
+          WHERE q.session_date IS NULL
+          ORDER BY p.ticker, p.session_date
         """
         atomic_copy_to_parquet(
             con,
@@ -505,7 +696,6 @@ def build(args: argparse.Namespace) -> tuple[dict[str, object], int]:
                 args.source_repo,
                 prices_revision,
                 format_utc(observed_at),
-                args.sessions,
             ],
             aggregate_path,
         )
@@ -520,6 +710,7 @@ def build(args: argparse.Namespace) -> tuple[dict[str, object], int]:
                    ) AS alias_rank
             FROM split_dedup s
             JOIN aliases a ON s.source_symbol = a.source_symbol
+            JOIN active_security_ids active ON a.security_id = active.security_id
           )
           SELECT security_id, ticker, source_symbol, event_date, split_factor,
                  cast(? AS VARCHAR) AS source_dataset,
@@ -541,7 +732,7 @@ def build(args: argparse.Namespace) -> tuple[dict[str, object], int]:
             raise AggregateError("Generated split schema does not match contract")
 
         stats = con.execute(
-            """
+            f"""
             SELECT count(*) AS rows,
                    count(DISTINCT security_id) AS securities,
                    min(session_date) AS min_date,
@@ -551,10 +742,7 @@ def build(args: argparse.Namespace) -> tuple[dict[str, object], int]:
                         OR session_date IS NULL OR open IS NULL OR high IS NULL OR low IS NULL
                         OR close IS NULL OR volume IS NULL OR source_dataset IS NULL
                         OR source_revision IS NULL OR observed_at_utc IS NULL
-                        OR NOT isfinite(open) OR NOT isfinite(high)
-                        OR NOT isfinite(low) OR NOT isfinite(close)
-                        OR open <= 0 OR high <= 0 OR low <= 0 OR close <= 0 OR volume < 0
-                        OR low > high OR low > least(open, close) OR high < greatest(open, close)
+                        OR {PRICE_INVALID_SQL}
                    ) AS invalid_rows,
                    count(*) - count(DISTINCT (security_id, session_date)) AS duplicate_rows,
                    count(*) FILTER (WHERE session_date > cast(? AS DATE)) AS after_cutoff
@@ -585,7 +773,16 @@ def build(args: argparse.Namespace) -> tuple[dict[str, object], int]:
         ).fetchone()
 
         matched_ids = {str(row[0]) for row in history_rows}
-        write_unmatched(unmatched_path, securities, matched_ids)
+        stale_reasons = {
+            security_id: f"SOURCE_HISTORY_STALE:latest_session={latest_session}"
+            for security_id, latest_session in stale_source_rows
+        }
+        write_unmatched(
+            unmatched_path,
+            securities,
+            matched_ids,
+            reasons=stale_reasons,
+        )
         admitted_count = len(securities)
         matched_count = len(matched_ids)
         coverage = matched_count / admitted_count
@@ -620,6 +817,23 @@ def build(args: argparse.Namespace) -> tuple[dict[str, object], int]:
             warnings.append(
                 f"Collapsed {split_duplicate_count} byte-identical split rows"
             )
+        if stale_source_rows:
+            warnings.append(
+                f"Excluded {len(stale_source_rows)} source-symbol histories older than "
+                f"{oldest_active_session}"
+            )
+        if source_history_truncation_rows:
+            warnings.append(
+                f"Truncated {len(source_history_truncation_rows)} source-symbol "
+                "histories at gap or invalid-discontinuity boundaries"
+            )
+        for session_date, invalid_rows, total_rows, invalid_rate in (
+            quarantined_session_rows
+        ):
+            warnings.append(
+                f"Quarantined systemic invalid OHLC session {session_date}: "
+                f"{invalid_rows}/{total_rows} rows ({invalid_rate:.2%})"
+            )
         if coverage < args.minimum_coverage:
             errors.append(
                 f"Matched coverage {coverage:.2%} is below {args.minimum_coverage:.2%}"
@@ -645,7 +859,6 @@ def build(args: argparse.Namespace) -> tuple[dict[str, object], int]:
         if too_long:
             errors.append("One or more securities exceed the requested session limit")
 
-        expected_session = expected_latest_session(cutoff)
         observed_max = stats[3]
         missing_sessions: int | None = None
         if observed_max is None:
@@ -699,6 +912,15 @@ def build(args: argparse.Namespace) -> tuple[dict[str, object], int]:
                 "minimum_history_sessions": args.minimum_history,
                 "minimum_matched_coverage": args.minimum_coverage,
                 "minimum_adequate_history_coverage": args.minimum_adequate_history_coverage,
+                "maximum_security_staleness_sessions": (
+                    args.maximum_security_staleness_sessions
+                ),
+                "maximum_source_gap_days": args.maximum_source_gap_days,
+                "source_reuse_price_ratio": args.source_reuse_price_ratio,
+                "systemic_invalid_session_rate": args.systemic_invalid_session_rate,
+                "minimum_systemic_session_securities": (
+                    args.minimum_systemic_session_securities
+                ),
                 "ready_maximum_stale_sessions": 2,
                 "warning_maximum_stale_sessions": 5,
             },
@@ -737,6 +959,41 @@ def build(args: argparse.Namespace) -> tuple[dict[str, object], int]:
                 "splits_sha256": sha256_file(splits_path),
                 "license": "ODC-By-1.0 (per dataset card); preserve attribution",
                 "usage": "historical research only; raw close is not adjusted close or a live quote",
+                "quality": {
+                    "oldest_active_source_session": oldest_active_session.isoformat(),
+                    "stale_source_symbols": [
+                        {
+                            "security_id": security_id,
+                            "latest_session": latest_session.isoformat(),
+                            "missing_eligible_sessions": stale_sessions(
+                                latest_session, expected_session
+                            ),
+                        }
+                        for security_id, latest_session in stale_source_rows
+                    ],
+                    "source_history_truncations": [
+                        {
+                            "security_id": security_id,
+                            "previous_segment_latest_date": previous_latest.isoformat(),
+                            "latest_segment_start_date": segment_start.isoformat(),
+                            "reason": reason,
+                        }
+                        for security_id, previous_latest, segment_start, reason in (
+                            source_history_truncation_rows
+                        )
+                    ],
+                    "quarantined_sessions": [
+                        {
+                            "session_date": session_date.isoformat(),
+                            "invalid_rows": invalid_rows,
+                            "total_rows": total_rows,
+                            "invalid_rate": invalid_rate,
+                        }
+                        for session_date, invalid_rows, total_rows, invalid_rate in (
+                            quarantined_session_rows
+                        )
+                    ],
+                },
             },
         }
         atomic_json(manifest_path, manifest)
@@ -755,6 +1012,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--minimum-history", type=int, default=252)
     parser.add_argument("--minimum-coverage", type=float, default=0.80)
     parser.add_argument("--minimum-adequate-history-coverage", type=float, default=0.50)
+    parser.add_argument("--maximum-security-staleness-sessions", type=int, default=5)
+    parser.add_argument("--maximum-source-gap-days", type=int, default=14)
+    parser.add_argument("--source-reuse-price-ratio", type=float, default=4.0)
+    parser.add_argument("--systemic-invalid-session-rate", type=float, default=0.01)
+    parser.add_argument("--minimum-systemic-session-securities", type=int, default=100)
     parser.add_argument("--cutoff-date", default=date.today().isoformat())
     parser.add_argument("--source-repo", default=DEFAULT_REPO)
     parser.add_argument("--source-revision", default="main")
@@ -768,6 +1030,16 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--sessions must be positive")
     if args.minimum_history <= 0 or args.sessions < args.minimum_history:
         parser.error("--sessions must be >= --minimum-history > 0")
+    if args.maximum_security_staleness_sessions < 0:
+        parser.error("--maximum-security-staleness-sessions must be nonnegative")
+    if args.maximum_source_gap_days <= 0:
+        parser.error("--maximum-source-gap-days must be positive")
+    if args.source_reuse_price_ratio <= 1:
+        parser.error("--source-reuse-price-ratio must be greater than 1")
+    if args.minimum_systemic_session_securities <= 0:
+        parser.error("--minimum-systemic-session-securities must be positive")
+    if not (0 < args.systemic_invalid_session_rate <= 1):
+        parser.error("--systemic-invalid-session-rate must be in (0, 1]")
     for name in ("minimum_coverage", "minimum_adequate_history_coverage"):
         value = float(getattr(args, name))
         if not (0 < value <= 1):

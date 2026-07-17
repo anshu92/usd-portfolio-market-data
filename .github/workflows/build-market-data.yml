@@ -15,7 +15,7 @@ on:
         default: "320"
         type: string
       cutoff_date:
-        description: "Inclusive YYYY-MM-DD cutoff; blank uses the runner UTC date"
+        description: "Inclusive YYYY-MM-DD cutoff; blank uses the New York market date"
         required: false
         default: ""
         type: string
@@ -79,9 +79,9 @@ jobs:
           RELEASES_ENABLED: ${{ vars.PRODUCTION_RELEASES_ENABLED }}
         run: |
           set -euo pipefail
-          today="$(date -u +%F)"
+          market_today="$(TZ=America/New_York date +%F)"
           mode="${INPUT_MODE:-full}"
-          cutoff="${INPUT_CUTOFF:-$today}"
+          cutoff="${INPUT_CUTOFF:-$market_today}"
           sessions="${INPUT_SESSIONS:-320}"
           minimum_history="252"
           only_tickers=""
@@ -91,7 +91,7 @@ jobs:
           if [[ "$EVENT_NAME" == "schedule" ]]; then
             mode="full"
             sessions="320"
-            cutoff="$today"
+            cutoff="$market_today"
             requested_publish="${RELEASES_ENABLED:-false}"
             allow_drift="false"
           elif [[ "$mode" == "smoke" ]]; then
@@ -110,8 +110,8 @@ jobs:
             exit 2
           fi
           if [[ "$requested_publish" == "true" ]]; then
-            if [[ "$mode" != "full" || "$sessions" != "320" || "$cutoff" != "$today" ]]; then
-              echo "Publication requires full mode, 320 sessions, and today's UTC cutoff" >&2
+            if [[ "$mode" != "full" || "$sessions" != "320" || "$cutoff" != "$market_today" ]]; then
+              echo "Publication requires full mode, 320 sessions, and today's New York market cutoff" >&2
               exit 2
             fi
             if [[ "${RELEASES_ENABLED:-false}" != "true" ]]; then

@@ -156,6 +156,139 @@ def test_invalid_matched_ohlcv_fails(aggregate_module, aggregate_inputs, tmp_pat
     )
 
 
+def test_systemic_invalid_session_is_quarantined(
+    aggregate_module, aggregate_inputs, tmp_path
+):
+    con = duckdb.connect()
+    systemic = tmp_path / "systemic.parquet"
+    try:
+        con.execute(
+            "CREATE TABLE systemic AS SELECT * FROM read_parquet(?)",
+            [str(aggregate_inputs["prices"])],
+        )
+        con.execute(
+            "UPDATE systemic SET high = low - 1 WHERE report_date = '2024-01-10'"
+        )
+        con.execute("COPY systemic TO ? (FORMAT PARQUET)", [str(systemic)])
+    finally:
+        con.close()
+    aggregate_inputs["prices"] = systemic
+    out_dir = tmp_path / "dist-systemic"
+    exit_code = aggregate_module.main(
+        build_args(
+            aggregate_inputs,
+            out_dir,
+            "--minimum-systemic-session-securities",
+            "2",
+        )
+    )
+    assert exit_code == 0
+    manifest = json.loads((out_dir / "manifest.json").read_text())
+    assert manifest["status"] == "READY"
+    assert manifest["aggregate"]["rows"] == 4
+    assert manifest["aggregate"]["max_date"] == "2024-01-09"
+    assert manifest["source"]["quality"]["quarantined_sessions"] == [
+        {
+            "session_date": "2024-01-10",
+            "invalid_rows": 2,
+            "total_rows": 2,
+            "invalid_rate": 1.0,
+        }
+    ]
+
+
+def test_stale_source_history_is_unmatched(
+    aggregate_module, aggregate_inputs, tmp_path
+):
+    universe = aggregate_inputs["universe"]
+    universe.write_text(
+        universe.read_text() + "XNAS:MSFT,MSFT,ADMITTED\n", encoding="utf-8"
+    )
+    metadata = json.loads(aggregate_inputs["metadata"].read_text())
+    metadata["rows"] = 3
+    metadata["sha256"] = aggregate_module.sha256_file(universe)
+    aggregate_inputs["metadata"].write_text(json.dumps(metadata) + "\n")
+
+    con = duckdb.connect()
+    stale = tmp_path / "stale-symbol.parquet"
+    try:
+        con.execute(
+            "CREATE TABLE stale_symbol AS SELECT * FROM read_parquet(?)",
+            [str(aggregate_inputs["prices"])],
+        )
+        con.execute(
+            "INSERT INTO stale_symbol VALUES "
+            "('MSFT','2023-12-01',100,101,99,100.5,1000)"
+        )
+        con.execute("COPY stale_symbol TO ? (FORMAT PARQUET)", [str(stale)])
+    finally:
+        con.close()
+    aggregate_inputs["prices"] = stale
+    out_dir = tmp_path / "dist-stale-symbol"
+    exit_code = aggregate_module.main(
+        build_args(
+            aggregate_inputs,
+            out_dir,
+            "--minimum-coverage",
+            "0.60",
+        )
+    )
+    assert exit_code == 0
+    manifest = json.loads((out_dir / "manifest.json").read_text())
+    assert manifest["source"]["quality"]["stale_source_symbols"][0][
+        "security_id"
+    ] == "XNAS:MSFT"
+    with (out_dir / "unmatched-tickers.csv").open(newline="") as handle:
+        unmatched = list(csv.DictReader(handle))
+    assert unmatched[0]["reason"].startswith("SOURCE_HISTORY_STALE:")
+
+
+def test_invalid_price_discontinuity_truncates_reused_symbol_history(
+    aggregate_module, aggregate_inputs, tmp_path
+):
+    universe = aggregate_inputs["universe"]
+    universe.write_text(
+        universe.read_text() + "XNAS:SPCX,SPCX,ADMITTED\n", encoding="utf-8"
+    )
+    metadata = json.loads(aggregate_inputs["metadata"].read_text())
+    metadata["rows"] = 3
+    metadata["sha256"] = aggregate_module.sha256_file(universe)
+    aggregate_inputs["metadata"].write_text(json.dumps(metadata) + "\n")
+
+    con = duckdb.connect()
+    reused = tmp_path / "reused-symbol.parquet"
+    try:
+        con.execute(
+            "CREATE TABLE reused AS SELECT * FROM read_parquet(?)",
+            [str(aggregate_inputs["prices"])],
+        )
+        con.execute(
+            "INSERT INTO reused VALUES "
+            "('SPCX','2024-01-07',20,21,19,20,1000),"
+            "('SPCX','2024-01-08',0,100,100,100,0),"
+            "('SPCX','2024-01-09',100,102,99,101,2000),"
+            "('SPCX','2024-01-10',101,103,100,102,2100)"
+        )
+        con.execute("COPY reused TO ? (FORMAT PARQUET)", [str(reused)])
+    finally:
+        con.close()
+    aggregate_inputs["prices"] = reused
+    out_dir = tmp_path / "dist-reused-symbol"
+    assert aggregate_module.main(build_args(aggregate_inputs, out_dir)) == 0
+    manifest = json.loads((out_dir / "manifest.json").read_text())
+    spcx = next(
+        item
+        for item in manifest["source"]["quality"]["source_history_truncations"]
+        if item["security_id"] == "XNAS:SPCX"
+    )
+    assert spcx == {
+        "security_id": "XNAS:SPCX",
+        "previous_segment_latest_date": "2024-01-07",
+        "latest_segment_start_date": "2024-01-09",
+        "reason": "INVALID_PRICE_DISCONTINUITY",
+    }
+
+
 def test_unmatched_ticker_is_reported(aggregate_module, aggregate_inputs, tmp_path):
     universe = aggregate_inputs["universe"]
     universe.write_text(
