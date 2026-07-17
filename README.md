@@ -138,6 +138,20 @@ Raw company facts retain all eligible observations. Quarterly normalization reta
 rolling six-fiscal-year window, which covers the three-year stability/growth factors
 while bounding full-universe memory use; the floor year is disclosed in the manifest.
 
+Before a full GitHub Actions refresh, run the local writer benchmark and offline
+enrichment fixture with phase logging:
+
+```bash
+PYTHONPATH=. uv run --python 3.13 --with-requirements requirements-dev.txt \
+  python benchmarks/benchmark_company_facts.py --rows 1000000
+PYTHONPATH=. uv run --python 3.13 --with-requirements requirements-dev.txt \
+  pytest -q -s tests/test_enrichment.py::test_offline_enrichment_build_is_point_in_time_safe
+```
+
+The benchmark uses the exact `sec-company-facts.parquet` schema. The fixture prints
+`enrichment_stage` records for source hashes, submissions, company facts, derived
+datasets, and manifest generation; large writes also emit million-row progress records.
+
 ## Automation and publication
 
 Pull requests run only offline fixtures with read-only permissions. The production

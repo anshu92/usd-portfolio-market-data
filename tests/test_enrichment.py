@@ -379,6 +379,11 @@ def test_conservative_availability_rolls_after_close(enrichment_module) -> None:
     ) == date(2026, 6, 11)
 
 
+def test_sec_date_parser_fast_path_preserves_legacy_formats(enrichment_module) -> None:
+    assert enrichment_module.parse_date("2026-07-17") == date(2026, 7, 17)
+    assert enrichment_module.parse_date("17-Jul-2026") == date(2026, 7, 17)
+
+
 def test_optional_analyst_schema_exists_but_is_not_required() -> None:
     assert ANALYST_ESTIMATES_CONTRACT.filename == "analyst-estimates.parquet"
     assert ANALYST_ESTIMATES_CONTRACT.filename not in CONTRACTS

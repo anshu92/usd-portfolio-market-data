@@ -103,6 +103,18 @@ def parse_date(value: object) -> date | None:
     text = str(value or "").strip()
     if not text:
         return None
+    if (
+        len(text) == 10
+        and text[4] == "-"
+        and text[7] == "-"
+        and text[:4].isdigit()
+        and text[5:7].isdigit()
+        and text[8:].isdigit()
+    ):
+        try:
+            return date.fromisoformat(text)
+        except ValueError:
+            pass
     for pattern in ("%Y-%m-%d", "%d-%b-%Y", "%d-%B-%Y"):
         try:
             return datetime.strptime(text.upper(), pattern).date()
@@ -356,10 +368,12 @@ def parse_submissions(
         if not resolved_ids:
             continue
         cik = cik10(document.get("cik"))
+        filings = document.get("filings")
+        recent = filings.get("recent") if isinstance(filings, dict) else None
+        filing_dates = recent.get("filingDate") if isinstance(recent, dict) else None
         activity_dates = [
-            filing_date
-            for row in recent_rows(document)
-            if (filing_date := parse_date(row.get("filingDate"))) is not None
+            filing_date for value in filing_dates or []
+            if (filing_date := parse_date(value)) is not None
             and filing_date <= cutoff
         ]
         latest_activity = max(activity_dates, default=date.min)
@@ -522,6 +536,8 @@ def iter_company_facts(
     source_revision: str | None = None,
 ) -> Iterator[dict[str, object]]:
     revision = source_revision or sha256_file(path)
+    availability_cache: dict[tuple[date, datetime | None], date | None] = {}
+    source_urls: dict[str, str] = {}
     for _, document in iter_json_documents(path):
         try:
             cik = cik10(document.get("cik"))
@@ -565,7 +581,13 @@ def iter_company_facts(
                         acceptance = filing.get("acceptance_datetime_utc")
                         if acceptance is not None and not isinstance(acceptance, datetime):
                             acceptance = None
-                        publication = conservative_available_date(filed_date, acceptance)
+                        availability_key = (filed_date, acceptance)
+                        publication = availability_cache.get(availability_key)
+                        if availability_key not in availability_cache:
+                            publication = conservative_available_date(
+                                filed_date, acceptance
+                            )
+                            availability_cache[availability_key] = publication
                         row = {
                             "security_id": security_id,
                             "cik": cik,
@@ -584,7 +606,11 @@ def iter_company_facts(
                             "period_end": period_end,
                             "frame": str(observation.get("frame") or "").strip() or None,
                             "accession_number": accession,
-                            "source_url": f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json",
+                            "source_url": source_urls.setdefault(
+                                cik,
+                                "https://data.sec.gov/api/xbrl/companyfacts/"
+                                f"CIK{cik}.json",
+                            ),
                             "source_revision": revision,
                             **pit_fields(
                                 event_date=period_end,
@@ -2127,6 +2153,8 @@ def main(argv: list[str] | None = None) -> int:
             known_revisions[companyfacts_path],
         )
         log_stage("company_facts", "complete", companyfacts_started)
+        normalization_started = time.monotonic()
+        log_stage("normalization_and_factors", "start", normalization_started)
         normalized = normalize_fundamentals(normalization_facts, concept_map)
         factors = build_factors(
             normalized,
@@ -2134,7 +2162,13 @@ def main(argv: list[str] | None = None) -> int:
             cutoff,
             retrieved_at,
         )
+        log_stage("normalization_and_factors", "complete", normalization_started)
+        events_started = time.monotonic()
+        log_stage("events", "start", events_started)
         events, earnings = build_events(filing_rows, retrieved_at)
+        log_stage("events", "complete", events_started)
+        insiders_started = time.monotonic()
+        log_stage("insiders", "start", insiders_started)
         insiders = parse_insider_archives(
             insider_paths,
             cik_to_security,
@@ -2144,6 +2178,9 @@ def main(argv: list[str] | None = None) -> int:
             retrieved_at,
         )
         insider_signals = build_insider_signals(insiders, cutoff, retrieved_at)
+        log_stage("insiders", "complete", insiders_started)
+        institutional_started = time.monotonic()
+        log_stage("institutional", "start", institutional_started)
         cusip_overrides = load_cusip_overrides(
             Path(args.cusip_overrides).resolve(), set(universe)
         )
@@ -2155,6 +2192,9 @@ def main(argv: list[str] | None = None) -> int:
             retrieved_at,
         )
         institutional_signals = build_institutional_signals(holdings, retrieved_at)
+        log_stage("institutional", "complete", institutional_started)
+        finra_started = time.monotonic()
+        log_stage("finra", "start", finra_started)
         schedule = load_finra_schedule(
             Path(args.finra_publication_dates).resolve(), cutoff
         )
@@ -2168,6 +2208,7 @@ def main(argv: list[str] | None = None) -> int:
         short_interest = parse_finra(
             finra_raw, schedule, ticker_to_id, retrieved_at
         )
+        log_stage("finra", "complete", finra_started)
         datasets = {
             "security-master.parquet": masters,
             "sec-company-facts.parquet": [],
@@ -2194,10 +2235,13 @@ def main(argv: list[str] | None = None) -> int:
             )
             if empty:
                 raise EnrichmentError(f"Required enrichment datasets are empty: {empty}")
+        derived_write_started = time.monotonic()
+        log_stage("derived_parquet", "start", derived_write_started)
         for filename, rows in datasets.items():
             if filename == "sec-company-facts.parquet":
                 continue
             write_parquet(out_dir / filename, CONTRACTS[filename], rows)
+        log_stage("derived_parquet", "complete", derived_write_started)
         notice_source = Path(args.notice).resolve()
         notice_target = out_dir / "NOTICE.md"
         if notice_source != notice_target:
@@ -2220,6 +2264,8 @@ def main(argv: list[str] | None = None) -> int:
                 sha256_file(Path(args.finra_file).resolve()) if args.finra_file else sha256_bytes(json.dumps(finra_raw, sort_keys=True).encode())
             ),
         }
+        manifest_started = time.monotonic()
+        log_stage("manifest", "start", manifest_started)
         merge_manifest(
             Path(args.manifest).resolve(),
             out_dir,
@@ -2230,6 +2276,7 @@ def main(argv: list[str] | None = None) -> int:
             notice_target,
             fact_stats,
         )
+        log_stage("manifest", "complete", manifest_started)
     except (ContractError, EnrichmentError, OSError, ValueError, duckdb.Error, zipfile.BadZipFile) as exc:
         print(f"error: {exc}", file=os.sys.stderr)
         return 2
