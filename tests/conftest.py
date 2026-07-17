@@ -38,6 +38,11 @@ def enrichment_module():
 
 
 @pytest.fixture(scope="session")
+def reuse_module():
+    return load_script("reuse_enrichment_snapshot", "reuse-enrichment-snapshot.py")
+
+
+@pytest.fixture(scope="session")
 def verify_module():
     return load_script("verify_release", "verify-release.py")
 

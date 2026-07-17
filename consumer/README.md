@@ -21,6 +21,14 @@ row count, digest, and coverage status. Do not assign one package-wide freshness
 market history, fundamentals, filings/events, insiders, 13F ownership, and FINRA short
 interest each have independent clocks.
 
+When `enrichment_snapshot.mode` is `REUSED_VALIDATED_IMMUTABLE_RELEASE`, retain the
+source release tag and manifest digest in import metadata. The current package time
+applies to the market/universe build only; enrichment freshness still comes from each
+dataset and row. `security-master.parquet` may include historical securities that are
+not in the current admitted universe so older point-in-time rows preserve valid foreign
+keys. A current admission with `mapping_status=UNMAPPED_DAILY_ADMISSION` has no SEC
+mapping yet and must not be ticker-guessed by the consumer.
+
 Apply availability using the five `source_*` columns on every enrichment row:
 
 - SEC filings and insider transactions: acceptance time when present; otherwise the

@@ -135,9 +135,9 @@ def verify_enrichment(
             for row in csv.DictReader(handle)
             if str(row.get("universe_admission_status") or "").upper() == "ADMITTED"
         }
-    if master_ids != admitted_ids:
+    if not admitted_ids <= master_ids:
         raise VerificationError(
-            "Security master does not exactly cover the admitted universe"
+            "Security master does not cover every admitted universe security"
         )
 
     for filename, contract in CONTRACTS.items():

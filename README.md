@@ -52,6 +52,9 @@ publication automatically dispatches a fresh consumer export.
 The manifest reports each enrichment domain independently. Analyst estimates remain
 absent until a licensed provider is configured and are explicitly reported as
 `NOT_CONFIGURED`; this disables estimate-only components, not unrelated archetypes.
+Daily releases retain each enrichment dataset's original retrieval timestamp and name
+the immutable source release in `enrichment_snapshot`; consumers must never interpret
+the package creation time as SEC or FINRA freshness.
 See [consumer/README.md](consumer/README.md) for the import, freshness, point-in-time,
 and factor-disable contract.
 
@@ -145,17 +148,37 @@ workflow runs at 20:17 America/New_York on weekdays and can also be dispatched:
 - `full` defaults to 320 sessions and may publish only with current cutoff, explicit
   `publish=true`, a `READY` manifest, and repository variable
   `PRODUCTION_RELEASES_ENABLED=true`;
-- scheduled builds publish only when the same variable is true.
+- scheduled builds publish only when the same variable is true;
+- weekday scheduled builds reuse the latest fully validated immutable enrichment
+  snapshot and have a 24-minute build budget plus a 5-minute publish budget;
+- `refresh_enrichment=true` is manual-only and performs the slower official SEC/FINRA
+  rebuild with a six-hour ceiling. Use it to bootstrap the first expanded release and
+  whenever an enrichment source refresh is required.
+
+The normal daily path therefore has at most 29 minutes of job execution. It downloads
+the previous release by its immutable tag, verifies GitHub asset digests and the full
+production contract, copies the enrichment assets without changing their source
+clocks, and then verifies the newly assembled release again. If the fresh symbol
+directory contains a new admission, `security-master.parquet` adds an explicit
+`UNMAPPED_DAILY_ADMISSION` row; the next manual enrichment refresh resolves its SEC
+mapping. Historical master rows are retained so older point-in-time enrichment rows
+remain referentially valid.
+
+Before enabling scheduled publication, run one manual `full` workflow with
+`refresh_enrichment=true`, validate its artifact, and publish it as the immutable
+baseline. Until that baseline exists, snapshot reuse fails closed because the prior
+five-asset release does not satisfy the expanded contract.
 
 The build job has read-only repository access. A separate publish job receives
 `contents: write`, verifies the transferred artifact again, creates a draft release
 with every asset attached, then publishes it as latest. Enable GitHub release
 immutability before the first production release.
 
-Full builds require the `SEC_USER_AGENT` GitHub secret. Every SEC request sends that
-identification plus `Accept-Encoding: gzip, deflate`; bulk downloads are sequential and
-remain below the SEC's ten-requests-per-second ceiling. Update the reviewed quarterly
-archive configuration when the SEC publishes a new insider or 13F archive.
+Full refresh builds require the `SEC_USER_AGENT` GitHub secret. Every SEC request sends
+that identification plus `Accept-Encoding: gzip, deflate`; bulk downloads are
+sequential and remain below the SEC's ten-requests-per-second ceiling. Daily snapshot
+reuse does not contact SEC or FINRA. Update the reviewed quarterly archive configuration
+when the SEC publishes a new insider or 13F archive.
 
 ## Failure policy
 

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import json
+import shutil
 import zipfile
 from datetime import date, datetime
 from pathlib import Path
@@ -406,6 +408,122 @@ def test_official_archive_registry_and_workflow_headers() -> None:
     assert "--user-agent \"$SEC_USER_AGENT\"" in workflow
     assert "Accept-Encoding: gzip, deflate" in workflow
     assert "--compressed" in workflow
+    assert "refresh_enrichment" in workflow
+    assert "github.event_name == 'schedule' && 24 || 360" in workflow
+    assert "github.event_name == 'schedule' && 5 || 15" in workflow
+    assert "reuse-enrichment-snapshot.py" in workflow
+    assert (
+        "steps.inputs.outputs.mode == 'full' && "
+        "steps.inputs.outputs.refresh_enrichment == 'true'"
+    ) in workflow
+
+
+def test_daily_build_reuses_validated_snapshot_and_adds_new_admissions(
+    enrichment_module,
+    reuse_module,
+    enrichment_inputs: dict[str, Path],
+) -> None:
+    previous = enrichment_inputs["root"]
+    args = [
+        "--universe", str(enrichment_inputs["universe"]),
+        "--prices", str(enrichment_inputs["prices"]),
+        "--manifest", str(enrichment_inputs["manifest"]),
+        "--companyfacts", str(enrichment_inputs["companyfacts"]),
+        "--submissions", str(enrichment_inputs["submissions"]),
+        "--insider-archive", str(enrichment_inputs["insider"]),
+        "--form13f-archive", str(enrichment_inputs["form13f"]),
+        "--finra-file", str(enrichment_inputs["finra"]),
+        "--out-dir", str(previous),
+        "--cutoff-date", "2026-07-17",
+        "--retrieved-at", "2026-07-17T12:00:00Z",
+    ]
+    assert enrichment_module.main(args) == 0
+
+    daily = previous / "daily"
+    daily.mkdir()
+    universe = daily / "security-universe.csv"
+    universe.write_text(
+        "security_id,ticker,exchange_mic,universe_admission_status\n"
+        "XNYS:NEW,NEW,XNYS,ADMITTED\n",
+        encoding="utf-8",
+    )
+    unmatched = daily / "unmatched-tickers.csv"
+    unmatched.write_text("ticker,reason\nNEW,NO_SOURCE_SYMBOL\n", encoding="utf-8")
+    prices = daily / "yahoo-ohlcv-320.parquet"
+    splits = daily / "yahoo-splits.parquet"
+    shutil.copyfile(enrichment_inputs["prices"], prices)
+    shutil.copyfile(enrichment_inputs["prices"], splits)
+
+    def release_record(path: Path, rows: int) -> dict[str, object]:
+        return {
+            "file": path.name,
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "bytes": path.stat().st_size,
+            "rows": rows,
+        }
+
+    daily_manifest = {
+        "schema_version": "1.0.0",
+        "status": "READY",
+        "created_at_utc": "2026-07-18T00:30:00Z",
+        "aggregate": {"min_date": "2025-01-01", "max_date": "2026-07-17"},
+        "source": {"revision": "fixture-market-revision"},
+        "validation": {"warnings": [], "errors": []},
+        "release_files": [
+            release_record(prices, 1),
+            release_record(splits, 0),
+            release_record(universe, 1),
+            release_record(unmatched, 1),
+        ],
+    }
+    current_manifest = daily / "manifest.json"
+    current_manifest.write_text(json.dumps(daily_manifest), encoding="utf-8")
+
+    assert reuse_module.main(
+        [
+            "--current-manifest", str(current_manifest),
+            "--previous-release", str(previous),
+            "--out-dir", str(daily),
+            "--source-tag", "market-data-20260717T120000Z",
+        ]
+    ) == 0
+    result = json.loads(current_manifest.read_text())
+    assert result["enrichment_snapshot"]["source_release_tag"] == (
+        "market-data-20260717T120000Z"
+    )
+    assert result["enrichment_snapshot"]["new_unmapped_admissions_count"] == 1
+    assert {record["file"] for record in result["release_files"]} == (
+        {"NOTICE.md", *CONTRACTS}
+        | {
+            "security-universe.csv",
+            "unmatched-tickers.csv",
+            "yahoo-ohlcv-320.parquet",
+            "yahoo-splits.parquet",
+        }
+    )
+    assert len(result["datasets"]) == len(CONTRACTS) + 4
+    assert result["coverage"]["security_master"] == {
+        "status": "READY",
+        "security_count": 2,
+        "sec_cik_mapped_count": 1,
+        "current_admitted_count": 1,
+        "historical_security_count": 1,
+        "new_unmapped_admissions_count": 1,
+        "unmapped_daily_admission_count": 1,
+    }
+    con = duckdb.connect()
+    try:
+        new_master = con.execute(
+            "SELECT cik, mapping_status FROM read_parquet(?) WHERE security_id = ?",
+            [str(daily / "security-master.parquet"), "XNYS:NEW"],
+        ).fetchone()
+    finally:
+        con.close()
+    assert new_master == (None, "UNMAPPED_DAILY_ADMISSION")
+    assert (
+        hashlib.sha256((daily / "sec-filings.parquet").read_bytes()).hexdigest()
+        == hashlib.sha256((previous / "sec-filings.parquet").read_bytes()).hexdigest()
+    )
 
 
 def test_sec_ticker_collision_uses_unique_latest_filer(

@@ -29,6 +29,11 @@ on:
         required: true
         default: false
         type: boolean
+      refresh_enrichment:
+        description: "Download and rebuild SEC/FINRA enrichment instead of reusing the latest validated release"
+        required: true
+        default: false
+        type: boolean
   schedule:
     - cron: "17 20 * * 1-5"
       timezone: "America/New_York"
@@ -40,7 +45,9 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    # Scheduled build + publish job budgets total 29 minutes. Manual source refreshes
+    # retain the larger budget because SEC normalization is intentionally off-path.
+    timeout-minutes: ${{ github.event_name == 'schedule' && 24 || 360 }}
     permissions:
       contents: read
     outputs:
@@ -76,6 +83,7 @@ jobs:
           INPUT_CUTOFF: ${{ inputs.cutoff_date }}
           INPUT_PUBLISH: ${{ inputs.publish }}
           INPUT_ALLOW_DRIFT: ${{ inputs.allow_universe_drift }}
+          INPUT_REFRESH_ENRICHMENT: ${{ inputs.refresh_enrichment }}
           RELEASES_ENABLED: ${{ vars.PRODUCTION_RELEASES_ENABLED }}
         run: |
           set -euo pipefail
@@ -87,6 +95,7 @@ jobs:
           only_tickers=""
           requested_publish="${INPUT_PUBLISH:-false}"
           allow_drift="${INPUT_ALLOW_DRIFT:-false}"
+          refresh_enrichment="${INPUT_REFRESH_ENRICHMENT:-false}"
 
           if [[ "$EVENT_NAME" == "schedule" ]]; then
             mode="full"
@@ -94,7 +103,12 @@ jobs:
             cutoff="$market_today"
             requested_publish="${RELEASES_ENABLED:-false}"
             allow_drift="false"
+            refresh_enrichment="false"
           elif [[ "$mode" == "smoke" ]]; then
+            if [[ "$refresh_enrichment" == "true" ]]; then
+              echo "Enrichment refresh is only valid in full mode" >&2
+              exit 2
+            fi
             sessions="30"
             minimum_history="30"
             only_tickers="AAPL,MSFT,BRK.B,NVDA,TSM"
@@ -131,6 +145,7 @@ jobs:
           echo "only_tickers=$only_tickers" >> "$GITHUB_OUTPUT"
           echo "publish=$requested_publish" >> "$GITHUB_OUTPUT"
           echo "allow_drift=$allow_drift" >> "$GITHUB_OUTPUT"
+          echo "refresh_enrichment=$refresh_enrichment" >> "$GITHUB_OUTPUT"
           echo "artifact_name=market-data-${GITHUB_RUN_ID}" >> "$GITHUB_OUTPUT"
           echo "tag=market-data-$(date -u +%Y%m%dT%H%M%SZ)" >> "$GITHUB_OUTPUT"
 
@@ -199,7 +214,7 @@ jobs:
             --cutoff-date "${{ steps.inputs.outputs.cutoff }}"
 
       - name: Download official SEC bulk sources
-        if: steps.inputs.outputs.mode == 'full'
+        if: steps.inputs.outputs.mode == 'full' && steps.inputs.outputs.refresh_enrichment == 'true'
         shell: bash
         env:
           SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
@@ -230,7 +245,7 @@ jobs:
           done < <(jq -r '.form13f_archives[]' config/official-source-archives.json)
 
       - name: Build official-source enrichment assets
-        if: steps.inputs.outputs.mode == 'full'
+        if: steps.inputs.outputs.mode == 'full' && steps.inputs.outputs.refresh_enrichment == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -252,6 +267,41 @@ jobs:
             "${form13f_args[@]}" \
             --out-dir dist \
             --cutoff-date "${{ steps.inputs.outputs.cutoff }}"
+
+      - name: Download and validate previous enrichment snapshot
+        id: previous_enrichment
+        if: steps.inputs.outputs.mode == 'full' && steps.inputs.outputs.refresh_enrichment != 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          release_dir="$RUNNER_TEMP/previous-release"
+          metadata="$RUNNER_TEMP/previous-release.json"
+          mkdir -p "$release_dir"
+          gh api \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/${GITHUB_REPOSITORY}/releases/latest" \
+            > "$metadata"
+          python verify-github-release.py --metadata "$metadata"
+          tag="$(jq -r '.tag_name' "$metadata")"
+          gh release download "$tag" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir "$release_dir"
+          python verify-github-release.py \
+            --metadata "$metadata" \
+            --dist "$release_dir"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Reuse validated enrichment snapshot
+        if: steps.inputs.outputs.mode == 'full' && steps.inputs.outputs.refresh_enrichment != 'true'
+        run: |
+          python reuse-enrichment-snapshot.py \
+            --current-manifest dist/manifest.json \
+            --previous-release "$RUNNER_TEMP/previous-release" \
+            --out-dir dist \
+            --source-tag "${{ steps.previous_enrichment.outputs.tag }}"
 
       - name: Verify build output
         run: |
@@ -312,7 +362,7 @@ jobs:
     needs: build
     if: needs.build.outputs.publish == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: ${{ github.event_name == 'schedule' && 5 || 15 }}
     permissions:
       actions: write
       contents: write
