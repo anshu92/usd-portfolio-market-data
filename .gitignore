@@ -1,0 +1,11 @@
+.DS_Store
+.hf-cache/
+.pytest_cache/
+.venv/
+uv.lock
+__pycache__/
+*.py[cod]
+dist/
+*.parquet
+security-universe.csv
+security-universe.metadata.json

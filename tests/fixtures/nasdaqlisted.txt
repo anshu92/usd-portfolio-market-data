@@ -1,0 +1,19 @@
+Symbol|Security Name|Market Category|Test Issue|Financial Status|Round Lot Size|ETF|NextShares
+AAPL|Apple Inc. - Common Stock|Q|N|N|100|N|N
+ADRX|Example SA - American Depositary Shares|G|N|N|100|N|N
+BADF|Bad Filing Corp. - Common Stock|S|N|D|100|N|N
+DEBT|Example Holdings - 5.00% Senior Notes due 2030|G|N|N|100|N|N
+ETFQ|Example Equity ETF|G|N|N|100|Y|N
+LPCO|Example Partners - Common Units|G|N|N|100|N|N
+NEXT|Example NextShares Fund|G|N|N|100|N|Y
+ORDY|Example PLC - Ordinary Shares|Q|N|N|100|N|N
+PADS|Example Bank - American Depositary Shares representing Preferred Stock|G|N|N|100|N|N
+PREF|Example Inc. - Series A Preferred Stock|G|N|N|100|N|N
+REIT|Example Trust - Shares of Beneficial Interest|Q|N|N|100|N|N
+RIGHTR|Example Acquisition Corp. - Rights|G|N|N|100|N|N
+TEST|Nasdaq Test Issue - Common Stock|Q|Y|N|100|N|N
+UNITU|Example Acquisition Corp. - Units|G|N|N|100|N|N
+UNKN|Example Structured Instrument|S|N|N|100|N|N
+WARRW|Example Acquisition Corp. - Warrants|G|N|N|100|N|N
+WCUW|Example Partners - Warrants to purchase Common Units|G|N|N|100|N|N
+File Creation Time: 0716202621:31|||||||

@@ -1,0 +1,6 @@
+ACT Symbol|Security Name|Exchange|CQS Symbol|ETF|Round Lot Size|Test Issue|NASDAQ Symbol
+AMEX|Ignored American Exchange - Common Stock|A|AMEX|N|100|N|AMEX
+BRK.B|Berkshire Hathaway Inc. Class B - Common Stock|N|BRK.B|N|100|N|BRK-B
+NYETF|Example NYSE ETF|N|NYETF|Y|100|N|NYETF
+TSM|Taiwan Semiconductor Manufacturing Company Limited - American Depositary Shares|N|TSM|N|100|N|TSM
+File Creation Time: 0716202621:31||||||

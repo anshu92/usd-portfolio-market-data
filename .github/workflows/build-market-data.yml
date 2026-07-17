@@ -1,0 +1,302 @@
+name: Build portfolio market-data release
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Smoke builds five tickers and never publishes; full builds the complete universe"
+        required: true
+        default: smoke
+        type: choice
+        options: [smoke, full]
+      sessions:
+        description: "Sessions for full mode; production publication requires exactly 320"
+        required: true
+        default: "320"
+        type: string
+      cutoff_date:
+        description: "Inclusive YYYY-MM-DD cutoff; blank uses the runner UTC date"
+        required: false
+        default: ""
+        type: string
+      publish:
+        description: "Request publication for a qualifying full build"
+        required: true
+        default: false
+        type: boolean
+      allow_universe_drift:
+        description: "Record and allow admitted-count drift above 5% for this manual full build"
+        required: true
+        default: false
+        type: boolean
+  schedule:
+    - cron: "17 20 * * 1-5"
+      timezone: "America/New_York"
+
+concurrency:
+  group: portfolio-market-data-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    permissions:
+      contents: read
+    outputs:
+      artifact_name: ${{ steps.inputs.outputs.artifact_name }}
+      publish: ${{ steps.inputs.outputs.publish }}
+      tag: ${{ steps.inputs.outputs.tag }}
+    env:
+      HF_HOME: ${{ github.workspace }}/.hf-cache
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.13.14"
+          cache: pip
+          cache-dependency-path: requirements-market-data.txt
+
+      - name: Install reviewed dependencies
+        run: python -m pip install --disable-pip-version-check --require-hashes -r requirements-market-data.txt
+
+      - name: Resolve and validate workflow inputs
+        id: inputs
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_MODE: ${{ inputs.mode }}
+          INPUT_SESSIONS: ${{ inputs.sessions }}
+          INPUT_CUTOFF: ${{ inputs.cutoff_date }}
+          INPUT_PUBLISH: ${{ inputs.publish }}
+          INPUT_ALLOW_DRIFT: ${{ inputs.allow_universe_drift }}
+          RELEASES_ENABLED: ${{ vars.PRODUCTION_RELEASES_ENABLED }}
+        run: |
+          set -euo pipefail
+          today="$(date -u +%F)"
+          mode="${INPUT_MODE:-full}"
+          cutoff="${INPUT_CUTOFF:-$today}"
+          sessions="${INPUT_SESSIONS:-320}"
+          minimum_history="252"
+          only_tickers=""
+          requested_publish="${INPUT_PUBLISH:-false}"
+          allow_drift="${INPUT_ALLOW_DRIFT:-false}"
+
+          if [[ "$EVENT_NAME" == "schedule" ]]; then
+            mode="full"
+            sessions="320"
+            cutoff="$today"
+            requested_publish="${RELEASES_ENABLED:-false}"
+            allow_drift="false"
+          elif [[ "$mode" == "smoke" ]]; then
+            sessions="30"
+            minimum_history="30"
+            only_tickers="AAPL,MSFT,BRK.B,NVDA,TSM"
+            requested_publish="false"
+            allow_drift="false"
+          elif [[ "$mode" != "full" ]]; then
+            echo "Unsupported mode: $mode" >&2
+            exit 2
+          fi
+
+          if ! [[ "$sessions" =~ ^[0-9]+$ ]] || (( sessions < minimum_history )); then
+            echo "sessions must be an integer >= minimum history" >&2
+            exit 2
+          fi
+          if [[ "$requested_publish" == "true" ]]; then
+            if [[ "$mode" != "full" || "$sessions" != "320" || "$cutoff" != "$today" ]]; then
+              echo "Publication requires full mode, 320 sessions, and today's UTC cutoff" >&2
+              exit 2
+            fi
+            if [[ "${RELEASES_ENABLED:-false}" != "true" ]]; then
+              echo "Set PRODUCTION_RELEASES_ENABLED=true before publication" >&2
+              exit 2
+            fi
+          fi
+
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "sessions=$sessions" >> "$GITHUB_OUTPUT"
+          echo "minimum_history=$minimum_history" >> "$GITHUB_OUTPUT"
+          echo "cutoff=$cutoff" >> "$GITHUB_OUTPUT"
+          echo "only_tickers=$only_tickers" >> "$GITHUB_OUTPUT"
+          echo "publish=$requested_publish" >> "$GITHUB_OUTPUT"
+          echo "allow_drift=$allow_drift" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=market-data-${GITHUB_RUN_ID}" >> "$GITHUB_OUTPUT"
+          echo "tag=market-data-$(date -u +%Y%m%dT%H%M%SZ)" >> "$GITHUB_OUTPUT"
+
+      - name: Retrieve previous released universe for drift comparison
+        id: previous
+        if: steps.inputs.outputs.mode == 'full'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          api="https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/latest"
+          status="$(curl -sS -L -o "$RUNNER_TEMP/latest-release.json" -w '%{http_code}' \
+            -H 'Accept: application/vnd.github+json' \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "$api")"
+          if [[ "$status" == "200" ]]; then
+            curl -fsSL \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              "https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/security-universe.csv" \
+              -o "$RUNNER_TEMP/previous-security-universe.csv"
+            echo "path=$RUNNER_TEMP/previous-security-universe.csv" >> "$GITHUB_OUTPUT"
+          elif [[ "$status" == "404" ]]; then
+            echo "No previous release exists; first-build drift comparison is skipped."
+            echo "path=" >> "$GITHUB_OUTPUT"
+          else
+            echo "GitHub releases API returned HTTP $status" >&2
+            exit 2
+          fi
+
+      - name: Build security universe
+        shell: bash
+        env:
+          PREVIOUS_UNIVERSE: ${{ steps.previous.outputs.path }}
+          ONLY_TICKERS: ${{ steps.inputs.outputs.only_tickers }}
+          ALLOW_DRIFT: ${{ steps.inputs.outputs.allow_drift }}
+        run: |
+          set -euo pipefail
+          args=(
+            --out dist/security-universe.csv
+            --metadata-out dist/security-universe.metadata.json
+            --overrides config/universe-overrides.csv
+          )
+          if [[ -n "$PREVIOUS_UNIVERSE" ]]; then
+            args+=(--previous-universe "$PREVIOUS_UNIVERSE")
+          fi
+          if [[ -n "$ONLY_TICKERS" ]]; then
+            args+=(--only-tickers "$ONLY_TICKERS")
+          fi
+          if [[ "$ALLOW_DRIFT" == "true" ]]; then
+            args+=(--allow-universe-drift)
+          fi
+          python build-security-universe.py "${args[@]}"
+
+      - name: Build compact aggregate
+        run: |
+          python build-yahoo-aggregate-v2.py \
+            --universe dist/security-universe.csv \
+            --universe-metadata dist/security-universe.metadata.json \
+            --out-dir dist \
+            --sessions "${{ steps.inputs.outputs.sessions }}" \
+            --minimum-history "${{ steps.inputs.outputs.minimum_history }}" \
+            --minimum-coverage 0.80 \
+            --minimum-adequate-history-coverage 0.50 \
+            --cutoff-date "${{ steps.inputs.outputs.cutoff }}"
+
+      - name: Verify build output
+        run: |
+          args=(--dist dist --require-ready)
+          if [[ "${{ steps.inputs.outputs.publish }}" == "true" ]]; then
+            args+=(--require-production)
+          fi
+          python verify-release.py "${args[@]}"
+
+      - name: Write release notes
+        if: success()
+        shell: bash
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+
+          manifest_path = Path("dist/manifest.json")
+          manifest = json.loads(manifest_path.read_text())
+          aggregate = manifest["aggregate"]
+          universe = manifest["universe"]
+          source = manifest["source"]
+          manifest_sha = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+          Path("dist/release-notes.md").write_text(
+              "Automated historical research-data aggregate.\n\n"
+              f"- Cutoff: {manifest['cutoff_date']}\n"
+              f"- Rows: {aggregate['rows']:,}\n"
+              f"- Matched securities: {universe['matched_count']:,}/"
+              f"{universe['admitted_count']:,} ({universe['matched_coverage']:.1%})\n"
+              f"- Maximum session: {aggregate['max_date']}\n"
+              f"- Aggregate SHA-256: `{aggregate['sha256']}`\n"
+              f"- Manifest SHA-256: `{manifest_sha}`\n"
+              f"- Source revision: `{source['revision']}`\n\n"
+              "Historical research only; not an executable quote feed. Raw close is not "
+              "represented as adjusted close. See NOTICE.md for attribution.\n",
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Upload seven-day diagnostic artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.inputs.outputs.artifact_name }}
+          path: |
+            dist/yahoo-ohlcv-*.parquet
+            dist/yahoo-splits.parquet
+            dist/security-universe.csv
+            dist/manifest.json
+            dist/unmatched-tickers.csv
+            dist/release-notes.md
+          if-no-files-found: warn
+          retention-days: 7
+          compression-level: 0
+
+  publish:
+    needs: build
+    if: needs.build.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Check out verifier
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.13.14"
+          cache: pip
+          cache-dependency-path: requirements-market-data.txt
+
+      - name: Install reviewed dependencies
+        run: python -m pip install --disable-pip-version-check --require-hashes -r requirements-market-data.txt
+
+      - name: Download same-run build artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ needs.build.outputs.artifact_name }}
+          path: dist
+          digest-mismatch: error
+
+      - name: Reverify production release
+        run: python verify-release.py --dist dist --require-ready --require-production
+
+      - name: Publish immutable-ready draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.build.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" \
+            dist/yahoo-ohlcv-320.parquet \
+            dist/yahoo-splits.parquet \
+            dist/security-universe.csv \
+            dist/manifest.json \
+            dist/unmatched-tickers.csv \
+            --draft \
+            --title "Portfolio market data $TAG" \
+            --notes-file dist/release-notes.md
+          gh release edit "$TAG" --draft=false --latest
