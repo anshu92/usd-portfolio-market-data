@@ -23,6 +23,13 @@ Consumers must download `manifest.json` first, require schema `1.0.0` and status
 The manifest records source revisions and hashes, universe provenance and drift,
 coverage, history eligibility, XNYS-session freshness, and all warnings.
 
+Consumers without direct GitHub Release download access can dispatch
+`export-release-for-consumer.yml`. The read-only workflow resolves the immutable latest
+tag, verifies GitHub's SHA-256 digest for all five assets, runs the production manifest
+verifier, and uploads `validated-market-data-{tag}` as a 30-day workflow artifact. The
+artifact also contains `github-release.json` and `resolved-tag.txt` so the receiving
+consumer can independently revalidate the pinned release before atomic promotion.
+
 ## Universe policy
 
 `build-security-universe.py` reads the Nasdaq Trader symbol directories and admits:

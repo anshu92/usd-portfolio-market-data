@@ -37,6 +37,11 @@ def verify_module():
     return load_script("verify_release", "verify-release.py")
 
 
+@pytest.fixture(scope="session")
+def github_release_module():
+    return load_script("verify_github_release", "verify-github-release.py")
+
+
 def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 

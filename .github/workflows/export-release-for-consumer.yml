@@ -1,0 +1,96 @@
+name: Export validated market-data release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: export-validated-market-data-release
+  cancel-in-progress: false
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out validators
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.13.14"
+          cache: pip
+          cache-dependency-path: requirements-market-data.txt
+
+      - name: Install reviewed dependencies
+        run: python -m pip install --disable-pip-version-check --require-hashes -r requirements-market-data.txt
+
+      - name: Resolve immutable latest release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p staging
+          gh api \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/${GITHUB_REPOSITORY}/releases/latest" \
+            > staging/github-release.json
+          python verify-github-release.py \
+            --metadata staging/github-release.json
+          tag="$(jq -r '.tag_name' staging/github-release.json)"
+          echo "TAG=$tag" >> "$GITHUB_ENV"
+
+      - name: Download pinned release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p staging/release
+          for asset in \
+            manifest.json \
+            security-universe.csv \
+            unmatched-tickers.csv \
+            yahoo-ohlcv-320.parquet \
+            yahoo-splits.parquet
+          do
+            gh release download "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --pattern "$asset" \
+              --dir staging/release
+          done
+
+      - name: Validate GitHub asset digests
+        run: |
+          python verify-github-release.py \
+            --metadata staging/github-release.json \
+            --dist staging/release
+
+      - name: Validate production data contract
+        run: |
+          python verify-release.py \
+            --dist staging/release \
+            --require-ready \
+            --require-production
+
+      - name: Preserve pinned release metadata
+        shell: bash
+        run: |
+          cp staging/github-release.json staging/release/github-release.json
+          printf '%s\n' "$TAG" > staging/release/resolved-tag.txt
+
+      - name: Upload validated consumer artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: validated-market-data-${{ env.TAG }}
+          path: staging/release
+          compression-level: 0
+          retention-days: 30
+          if-no-files-found: error
