@@ -326,6 +326,8 @@ def parse_submissions(
     all_filings: dict[str, dict[str, object]] = {}
     cik_to_security: dict[str, str] = {}
     revision = sha256_file(path)
+    candidates: dict[str, tuple[dict[str, object], list[str], date]] = {}
+    security_candidates: dict[str, list[tuple[date, str]]] = defaultdict(list)
     for _, document in iter_json_documents(path):
         raw_tickers = document.get("tickers")
         if not isinstance(raw_tickers, list):
@@ -335,21 +337,43 @@ def parse_submissions(
             for ticker in raw_tickers
             if (security_id := resolve_ticker(str(ticker), ticker_to_id)) is not None
         ]
-        security_ids = set(resolved_ids)
-        if not security_ids:
+        if not resolved_ids:
             continue
-        security_id = resolved_ids[0]
         cik = cik10(document.get("cik"))
-        previous = cik_to_security.get(cik)
-        if previous and previous != security_id:
-            raise EnrichmentError(f"CIK {cik} maps to multiple security IDs")
+        activity_dates = [
+            filing_date
+            for row in recent_rows(document)
+            if (filing_date := parse_date(row.get("filingDate"))) is not None
+            and filing_date <= cutoff
+        ]
+        latest_activity = max(activity_dates, default=date.min)
+        ordered_ids = list(dict.fromkeys(resolved_ids))
+        candidates[cik] = (document, ordered_ids, latest_activity)
+        for security_id in ordered_ids:
+            security_candidates[security_id].append((latest_activity, cik))
+
+    selected_ciks_by_security: dict[str, str] = {}
+    for security_id, choices in security_candidates.items():
+        ordered = sorted(choices, reverse=True)
+        if len(ordered) > 1 and ordered[0][0] == ordered[1][0]:
+            raise EnrichmentError(
+                f"Security {security_id} has an ambiguous SEC registrant tie at "
+                f"{ordered[0][0]}: {ordered[0][1]} and {ordered[1][1]}"
+            )
+        selected_ciks_by_security[security_id] = ordered[0][1]
+
+    securities_by_cik: dict[str, list[str]] = defaultdict(list)
+    for security_id, cik in selected_ciks_by_security.items():
+        securities_by_cik[cik].append(security_id)
+
+    for cik, security_ids in securities_by_cik.items():
+        document, ticker_order, _ = candidates[cik]
+        ordered_ids = [value for value in ticker_order if value in security_ids]
+        ordered_ids.extend(sorted(set(security_ids) - set(ordered_ids)))
+        security_id = ordered_ids[0]
         cik_to_security[cik] = security_id
-        for mapped_id in security_ids:
-            prior_master = master_by_id.get(mapped_id)
-            if prior_master is not None and prior_master["cik"] != cik:
-                raise EnrichmentError(
-                    f"Security {mapped_id} maps to multiple SEC registrants"
-                )
+        for mapped_id in ordered_ids:
+            collision_resolved = len(security_candidates[mapped_id]) > 1
             master_by_id[mapped_id] = {
                 "security_id": mapped_id,
                 "ticker": universe[mapped_id]["ticker"],
@@ -358,7 +382,9 @@ def parse_submissions(
                 "registrant_name": str(document.get("name") or "").strip(),
                 "sic": str(document.get("sic") or "").strip() or None,
                 "mapping_status": (
-                    "EXACT_SEC_PRIMARY_TICKER"
+                    "LATEST_SEC_FILING_TICKER_COLLISION"
+                    if collision_resolved
+                    else "EXACT_SEC_PRIMARY_TICKER"
                     if mapped_id == security_id
                     else "EXACT_SEC_ADDITIONAL_CLASS"
                 ),
@@ -372,6 +398,7 @@ def parse_submissions(
                     retrieved_at=retrieved_at,
                 ),
             }
+
         for row in recent_rows(document):
             accession = str(row.get("accessionNumber") or "").strip()
             if not ACCESSION_PATTERN.fullmatch(accession):
@@ -390,7 +417,8 @@ def parse_submissions(
             }
             if periodic_form and report_date and filing_date < report_date:
                 raise EnrichmentError(
-                    f"Filing {accession} precedes its report period: {filing_date} < {report_date}"
+                    f"Filing {accession} precedes its report period: "
+                    f"{filing_date} < {report_date}"
                 )
             primary_document = str(row.get("primaryDocument") or "").strip()
             document_url = (
@@ -398,7 +426,7 @@ def parse_submissions(
                 if primary_document
                 else f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession.replace('-', '')}/"
             )
-            all_filings[accession] = {
+            filing_record = {
                 "security_id": security_id,
                 "cik": cik,
                 "accession_number": accession,
@@ -416,10 +444,18 @@ def parse_submissions(
                     event_date=report_date or filing_date,
                     filing_date=filing_date,
                     acceptance=acceptance,
-                    publication_date=conservative_available_date(filing_date, acceptance),
+                    publication_date=conservative_available_date(
+                        filing_date, acceptance
+                    ),
                     retrieved_at=retrieved_at,
                 ),
             }
+            previous = all_filings.get(accession)
+            if previous is not None and previous != filing_record:
+                raise EnrichmentError(
+                    f"SEC accession {accession} maps to multiple registrants"
+                )
+            all_filings[accession] = filing_record
     for security_id, identity in universe.items():
         if security_id in master_by_id:
             continue
@@ -1930,6 +1966,14 @@ def merge_manifest(
     if unmapped_ciks:
         enrichment_warnings.append(
             f"{unmapped_ciks} admitted securities have no exact SEC CIK mapping"
+        )
+    ticker_collisions = sum(
+        row.get("mapping_status") == "LATEST_SEC_FILING_TICKER_COLLISION"
+        for row in datasets["security-master.parquet"]
+    )
+    if ticker_collisions:
+        enrichment_warnings.append(
+            f"{ticker_collisions} SEC ticker collisions selected the unique latest filer"
         )
     partial_fundamentals = sum(
         row.get("normalization_status") != "COMPLETE" for row in normalized

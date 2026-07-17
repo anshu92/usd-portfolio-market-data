@@ -406,3 +406,52 @@ def test_official_archive_registry_and_workflow_headers() -> None:
     assert "--user-agent \"$SEC_USER_AGENT\"" in workflow
     assert "Accept-Encoding: gzip, deflate" in workflow
     assert "--compressed" in workflow
+
+
+def test_sec_ticker_collision_uses_unique_latest_filer(
+    enrichment_module, tmp_path: Path
+) -> None:
+    def submission(cik: int, accession: str, filing_date: str) -> dict[str, object]:
+        return {
+            "cik": cik,
+            "name": f"Registrant {cik}",
+            "sic": "2834",
+            "tickers": ["AAPL"],
+            "filings": {
+                "recent": {
+                    "accessionNumber": [accession],
+                    "filingDate": [filing_date],
+                    "reportDate": ["2025-12-31"],
+                    "acceptanceDateTime": [f"{filing_date}T20:00:00Z"],
+                    "form": ["10-K"],
+                    "primaryDocument": ["form10k.htm"],
+                    "items": [""],
+                    "fileNumber": ["001-00001"],
+                    "filmNumber": ["26000001"],
+                }
+            },
+        }
+
+    archive = tmp_path / "submissions.zip"
+    with zipfile.ZipFile(archive, "w") as output:
+        output.writestr(
+            "CIK0000000001.json",
+            json.dumps(submission(1, "0000000001-25-000001", "2025-02-01")),
+        )
+        output.writestr(
+            "CIK0000000002.json",
+            json.dumps(submission(2, "0000000002-26-000001", "2026-02-01")),
+        )
+    masters, filings, _, cik_mapping = enrichment_module.parse_submissions(
+        archive,
+        {"AAPL": "XNAS:AAPL"},
+        {"XNAS:AAPL": {"ticker": "AAPL", "exchange_mic": "XNAS"}},
+        date(2026, 7, 17),
+        datetime(2026, 7, 17, 12, 0),
+    )
+    assert masters[0]["cik"] == "0000000002"
+    assert masters[0]["mapping_status"] == "LATEST_SEC_FILING_TICKER_COLLISION"
+    assert [row["accession_number"] for row in filings] == [
+        "0000000002-26-000001"
+    ]
+    assert cik_mapping == {"0000000002": "XNAS:AAPL"}
