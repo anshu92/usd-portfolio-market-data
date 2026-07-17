@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 
 import pytest
@@ -102,10 +103,57 @@ def test_export_workflow_is_read_only_and_sha_pinned():
     assert "verify-github-release.py" in workflow
     assert "verify-release.py" in workflow
     assert "--require-production" in workflow
+    assert "publish_pointer:" in workflow
+    assert "actions: read\n      contents: write" in workflow
+    assert "consumer/latest-production-artifact.json" in workflow
+    assert "actions/artifacts/${EXPECTED_ARTIFACT_ID}" in workflow
     for line in workflow.splitlines():
         if "uses:" in line:
             reference = line.split("uses:", 1)[1].split("#", 1)[0].strip()
             assert re_full_sha_reference(reference), reference
+
+
+def test_consumer_pointer_schema_and_identity():
+    pointer = json.loads(
+        (
+            Path(__file__).resolve().parents[1]
+            / "consumer/latest-production-artifact.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert set(pointer) == {
+        "artifact_expires_at",
+        "artifact_id",
+        "artifact_name",
+        "artifact_sha256",
+        "artifact_size_bytes",
+        "generated_at_utc",
+        "manifest_sha256",
+        "producer_commit",
+        "release_immutable",
+        "release_tag",
+        "repository",
+        "schema_version",
+        "workflow_run_id",
+    }
+    assert pointer["schema_version"] == "1.0.0"
+    assert pointer["repository"] == "anshu92/usd-portfolio-market-data"
+    assert pointer["release_immutable"] is True
+    assert pointer["artifact_name"] == f"validated-market-data-{pointer['release_tag']}"
+    assert isinstance(pointer["workflow_run_id"], int)
+    assert isinstance(pointer["artifact_id"], int)
+    assert isinstance(pointer["artifact_size_bytes"], int)
+    assert len(pointer["artifact_sha256"]) == 64
+    assert len(pointer["manifest_sha256"]) == 64
+    assert len(pointer["producer_commit"]) == 40
+
+
+def test_production_publish_dispatches_consumer_export():
+    workflow = (
+        Path(__file__).resolve().parents[1]
+        / ".github/workflows/build-market-data.yml"
+    ).read_text(encoding="utf-8")
+    assert "actions: write" in workflow
+    assert "gh workflow run export-release-for-consumer.yml" in workflow
 
 
 def re_full_sha_reference(reference: str) -> bool:

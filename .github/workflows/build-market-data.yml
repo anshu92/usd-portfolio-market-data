@@ -255,7 +255,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
-      actions: read
+      actions: write
       contents: write
     steps:
       - name: Check out verifier
@@ -300,3 +300,12 @@ jobs:
             --title "Portfolio market data $TAG" \
             --notes-file dist/release-notes.md
           gh release edit "$TAG" --draft=false --latest
+
+      - name: Dispatch validated consumer export
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh workflow run export-release-for-consumer.yml \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref main

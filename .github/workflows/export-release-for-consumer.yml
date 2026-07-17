@@ -14,6 +14,12 @@ jobs:
   export:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    outputs:
+      artifact_digest: ${{ steps.upload.outputs['artifact-digest'] }}
+      artifact_id: ${{ steps.upload.outputs['artifact-id'] }}
+      artifact_name: ${{ steps.release.outputs.artifact_name }}
+      manifest_sha256: ${{ steps.metadata.outputs.manifest_sha256 }}
+      tag: ${{ steps.release.outputs.tag }}
     steps:
       - name: Check out validators
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -31,6 +37,7 @@ jobs:
         run: python -m pip install --disable-pip-version-check --require-hashes -r requirements-market-data.txt
 
       - name: Resolve immutable latest release
+        id: release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -46,6 +53,8 @@ jobs:
             --metadata staging/github-release.json
           tag="$(jq -r '.tag_name' staging/github-release.json)"
           echo "TAG=$tag" >> "$GITHUB_ENV"
+          echo "artifact_name=validated-market-data-$tag" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
       - name: Download pinned release assets
         shell: bash
@@ -86,11 +95,111 @@ jobs:
           cp staging/github-release.json staging/release/github-release.json
           printf '%s\n' "$TAG" > staging/release/resolved-tag.txt
 
+      - name: Record manifest digest
+        id: metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          manifest_sha256="$(sha256sum staging/release/manifest.json | awk '{print $1}')"
+          echo "manifest_sha256=$manifest_sha256" >> "$GITHUB_OUTPUT"
+
       - name: Upload validated consumer artifact
+        id: upload
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: validated-market-data-${{ env.TAG }}
+          name: ${{ steps.release.outputs.artifact_name }}
           path: staging/release
           compression-level: 0
           retention-days: 30
           if-no-files-found: error
+
+  publish_pointer:
+    needs: export
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Resolve uploaded artifact
+        shell: bash
+        env:
+          EXPECTED_ARTIFACT_DIGEST: ${{ needs.export.outputs.artifact_digest }}
+          EXPECTED_ARTIFACT_ID: ${{ needs.export.outputs.artifact_id }}
+          EXPECTED_ARTIFACT_NAME: ${{ needs.export.outputs.artifact_name }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          expected_digest="sha256:${EXPECTED_ARTIFACT_DIGEST#sha256:}"
+          gh api \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/${GITHUB_REPOSITORY}/actions/artifacts/${EXPECTED_ARTIFACT_ID}" \
+            > "$RUNNER_TEMP/artifact.json"
+          jq -e \
+            --arg digest "$expected_digest" \
+            --argjson artifact_id "$EXPECTED_ARTIFACT_ID" \
+            --arg name "$EXPECTED_ARTIFACT_NAME" \
+            --arg producer_commit "$GITHUB_SHA" \
+            --argjson run_id "$GITHUB_RUN_ID" \
+            '.id == $artifact_id and
+             .name == $name and
+             .digest == $digest and
+             .expired == false and
+             .workflow_run.id == $run_id and
+             .workflow_run.head_sha == $producer_commit and
+             (.size_in_bytes | type == "number" and . > 0) and
+             (.expires_at | type == "string" and length > 0)' \
+            "$RUNNER_TEMP/artifact.json"
+
+      - name: Build consumer pointer
+        shell: bash
+        env:
+          MANIFEST_SHA256: ${{ needs.export.outputs.manifest_sha256 }}
+          RELEASE_TAG: ${{ needs.export.outputs.tag }}
+        run: |
+          set -euo pipefail
+          jq -n \
+            --arg manifest_sha256 "$MANIFEST_SHA256" \
+            --arg release_tag "$RELEASE_TAG" \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --slurpfile artifact "$RUNNER_TEMP/artifact.json" \
+            '{
+              schema_version: "1.0.0",
+              repository: $repository,
+              release_tag: $release_tag,
+              workflow_run_id: $artifact[0].workflow_run.id,
+              artifact_id: $artifact[0].id,
+              artifact_name: $artifact[0].name,
+              artifact_sha256: ($artifact[0].digest | sub("^sha256:"; "")),
+              artifact_size_bytes: $artifact[0].size_in_bytes,
+              artifact_expires_at: $artifact[0].expires_at,
+              producer_commit: $artifact[0].workflow_run.head_sha,
+              manifest_sha256: $manifest_sha256,
+              release_immutable: true,
+              generated_at_utc: (now | todateiso8601)
+            }' > "$RUNNER_TEMP/latest-production-artifact.json"
+
+      - name: Commit consumer pointer
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.export.outputs.tag }}
+        run: |
+          set -euo pipefail
+          pointer_path="consumer/latest-production-artifact.json"
+          current_sha="$(gh api \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/${GITHUB_REPOSITORY}/contents/${pointer_path}?ref=main" \
+            --jq '.sha')"
+          content="$(base64 -w 0 "$RUNNER_TEMP/latest-production-artifact.json")"
+          gh api --method PUT \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/${GITHUB_REPOSITORY}/contents/${pointer_path}" \
+            -f branch=main \
+            -f content="$content" \
+            -f message="Update consumer artifact pointer for ${RELEASE_TAG}" \
+            -f sha="$current_sha"

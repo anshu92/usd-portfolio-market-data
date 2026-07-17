@@ -1,0 +1,15 @@
+{
+  "schema_version": "1.0.0",
+  "repository": "anshu92/usd-portfolio-market-data",
+  "release_tag": "market-data-20260717T032654Z",
+  "workflow_run_id": 29554027503,
+  "artifact_id": 8396778706,
+  "artifact_name": "validated-market-data-market-data-20260717T032654Z",
+  "artifact_sha256": "745caf8508a59fd4783ceb04686f565025931cc25856a8d2e364c99111c0d059",
+  "artifact_size_bytes": 23505552,
+  "artifact_expires_at": "2026-08-16T04:06:57Z",
+  "producer_commit": "68b95f96daa1bbbbfd6b2622fe8f92dc725d1ef9",
+  "manifest_sha256": "5dcd7b4857ee8463fe2e4bcd6a4ca7c0d7577193e5acdae3f37ed4cfaba2c2f7",
+  "release_immutable": true,
+  "generated_at_utc": "2026-07-17T04:06:57Z"
+}

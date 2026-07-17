@@ -29,6 +29,12 @@ tag, verifies GitHub's SHA-256 digest for all five assets, runs the production m
 verifier, and uploads `validated-market-data-{tag}` as a 30-day workflow artifact. The
 artifact also contains `github-release.json` and `resolved-tag.txt` so the receiving
 consumer can independently revalidate the pinned release before atomic promotion.
+After upload, a separate write-scoped job commits
+`consumer/latest-production-artifact.json` with the exact run, artifact, release,
+producer-commit, expiry, size, and digest values. Consumers must compare that pointer
+against the Actions artifact API and then revalidate the downloaded contents; the
+pointer is discovery metadata, not a substitute for validation. Successful production
+publication automatically dispatches a fresh consumer export.
 
 ## Universe policy
 
