@@ -93,6 +93,23 @@ CORE_NORMALIZED_FIELDS = {
 SUPPORTED_UNITS = {"USD", "shares", "USD/shares", "pure"}
 PARSER_VERSION = "sec-events-1.0.0"
 FACTOR_MODEL_VERSION = "fundamental-factors-1.0.0"
+NORMALIZATION_FACT_COLUMNS = (
+    "security_id",
+    "cik",
+    "taxonomy",
+    "concept",
+    "unit",
+    "unit_status",
+    "value",
+    "fiscal_year",
+    "fiscal_period",
+    "filed_date",
+    "period_start",
+    "period_end",
+    "accession_number",
+    "source_acceptance_datetime_utc",
+    "source_retrieved_at_utc",
+)
 
 
 class EnrichmentError(RuntimeError):
@@ -678,7 +695,9 @@ def build_company_facts_asset(
                 and isinstance(fiscal_year, int)
                 and fiscal_year >= normalization_floor
             ):
-                normalization_rows.append(row)
+                normalization_rows.append(
+                    {column: row[column] for column in NORMALIZATION_FACT_COLUMNS}
+                )
             yield row
 
     row_count = write_parquet(

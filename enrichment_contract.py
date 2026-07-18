@@ -6,6 +6,7 @@ import csv
 import hashlib
 import math
 import os
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,6 +24,7 @@ POINT_IN_TIME_COLUMNS = (
     ("source_retrieved_at_utc", "TIMESTAMP"),
 )
 CSV_NULL_MARKER = "__USD_PORTFOLIO_MARKET_DATA_NULL_7F3E9A2C__"
+DUCKDB_MEMORY_LIMIT = "3GB"
 
 
 @dataclass(frozen=True)
@@ -502,59 +504,67 @@ def write_parquet(
                 flush=True,
             )
 
-        con = duckdb.connect()
-        try:
-            if row_count:
-                csv_columns = ", ".join(
-                    f"{_literal(name)}: {_literal(sql_type)}"
-                    for name, sql_type in contract.columns
-                )
+        with tempfile.TemporaryDirectory(
+            dir=path.parent, prefix=".duckdb-spill-"
+        ) as spill_directory:
+            con = duckdb.connect()
+            try:
+                con.execute(f"SET memory_limit = '{DUCKDB_MEMORY_LIMIT}'")
+                con.execute("SET preserve_insertion_order = false")
                 con.execute(
-                    f"CREATE VIEW output AS SELECT * FROM read_csv({_literal(spool)}, "
-                    f"auto_detect = false, header = false, parallel = true, "
-                    f"nullstr = '{CSV_NULL_MARKER}', columns = {{{csv_columns}}})",
+                    f"SET temp_directory = {_literal(spill_directory)}"
                 )
-            else:
-                definitions = ", ".join(
-                    f"{_quoted(name)} {sql_type}"
-                    for name, sql_type in contract.columns
-                )
-                con.execute(f"CREATE TABLE output ({definitions})")
-            key_sql = ", ".join(_quoted(name) for name in contract.primary_key)
-            duplicate_count = con.execute(
-                f"SELECT count(*) - count(DISTINCT ({key_sql})) FROM output"
-            ).fetchone()[0]
-            if duplicate_count:
-                raise ContractError(
-                    f"{contract.filename} has {int(duplicate_count)} duplicate primary keys"
-                )
-            null_key = " OR ".join(
-                f"{_quoted(name)} IS NULL" for name in contract.primary_key
-            )
-            if (
-                not contract.allow_null_primary_key
-                and con.execute(
-                    f"SELECT count(*) FROM output WHERE {null_key}"
+                if row_count:
+                    csv_columns = ", ".join(
+                        f"{_literal(name)}: {_literal(sql_type)}"
+                        for name, sql_type in contract.columns
+                    )
+                    con.execute(
+                        f"CREATE VIEW output AS SELECT * FROM read_csv({_literal(spool)}, "
+                        f"auto_detect = false, header = false, parallel = true, "
+                        f"nullstr = '{CSV_NULL_MARKER}', columns = {{{csv_columns}}})",
+                    )
+                else:
+                    definitions = ", ".join(
+                        f"{_quoted(name)} {sql_type}"
+                        for name, sql_type in contract.columns
+                    )
+                    con.execute(f"CREATE TABLE output ({definitions})")
+                key_sql = ", ".join(_quoted(name) for name in contract.primary_key)
+                duplicate_count = con.execute(
+                    f"SELECT count(*) - count(DISTINCT ({key_sql})) FROM output"
                 ).fetchone()[0]
-            ):
-                raise ContractError(
-                    f"{contract.filename} has a null primary-key value"
+                if duplicate_count:
+                    raise ContractError(
+                        f"{contract.filename} has {int(duplicate_count)} duplicate primary keys"
+                    )
+                null_key = " OR ".join(
+                    f"{_quoted(name)} IS NULL" for name in contract.primary_key
                 )
-            order_sql = ", ".join(_quoted(name) for name in contract.primary_key)
-            con.execute(
-                f"COPY (SELECT * FROM output ORDER BY {order_sql}) TO ? "
-                "(FORMAT PARQUET, COMPRESSION ZSTD)",
-                [str(tmp)],
-            )
-            if row_count >= 100_000:
-                print(
-                    f"parquet_writer file={contract.filename} phase=complete "
-                    f"rows={row_count} elapsed_seconds="
-                    f"{time.monotonic() - started_at:.1f}",
-                    flush=True,
+                if (
+                    not contract.allow_null_primary_key
+                    and con.execute(
+                        f"SELECT count(*) FROM output WHERE {null_key}"
+                    ).fetchone()[0]
+                ):
+                    raise ContractError(
+                        f"{contract.filename} has a null primary-key value"
+                    )
+                order_sql = ", ".join(_quoted(name) for name in contract.primary_key)
+                con.execute(
+                    f"COPY (SELECT * FROM output ORDER BY {order_sql}) TO ? "
+                    "(FORMAT PARQUET, COMPRESSION ZSTD)",
+                    [str(tmp)],
                 )
-        finally:
-            con.close()
+                if row_count >= 100_000:
+                    print(
+                        f"parquet_writer file={contract.filename} phase=complete "
+                        f"rows={row_count} elapsed_seconds="
+                        f"{time.monotonic() - started_at:.1f}",
+                        flush=True,
+                    )
+            finally:
+                con.close()
     finally:
         if spool.exists():
             spool.unlink()
