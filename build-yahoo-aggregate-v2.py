@@ -10,8 +10,13 @@ import json
 import os
 import shutil
 import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable
 
@@ -243,7 +248,8 @@ def validate_source_schema(
 
 
 def prepare_price_source(
-    con: duckdb.DuckDBPyConnection, path: Path, cutoff: date
+    con: duckdb.DuckDBPyConnection, path: Path, cutoff: date, *, dataset: str,
+    revision: str, observed_at: str,
 ) -> int:
     validate_source_schema(
         con,
@@ -260,13 +266,16 @@ def prepare_price_source(
                try_cast(p.high AS DOUBLE) AS high,
                try_cast(p.low AS DOUBLE) AS low,
                try_cast(p.close AS DOUBLE) AS close,
-               try_cast(p.volume AS BIGINT) AS volume
+               try_cast(p.volume AS BIGINT) AS volume,
+               cast(? AS VARCHAR) AS source_dataset,
+               cast(? AS VARCHAR) AS source_revision,
+               cast(? AS VARCHAR) AS observed_at_utc
         FROM read_parquet(?) p
         JOIN (SELECT DISTINCT source_symbol FROM aliases) a
           ON upper(trim(p.symbol)) = a.source_symbol
         WHERE try_cast(p.report_date AS DATE) <= cast(? AS DATE)
         """,
-        [str(path), cutoff.isoformat()],
+        [dataset, revision, observed_at, str(path), cutoff.isoformat()],
     )
     conflicts = int(
         con.execute(
@@ -333,6 +342,7 @@ def prepare_price_candidates(
         WITH matched AS (
           SELECT a.security_id, a.ticker, p.source_symbol, p.session_date,
                  p.open, p.high, p.low, p.close, p.volume,
+                 p.source_dataset, p.source_revision, p.observed_at_utc,
                  row_number() OVER (
                    PARTITION BY a.security_id, p.session_date
                    ORDER BY a.priority, p.source_symbol
@@ -492,7 +502,8 @@ def prepare_price_candidates(
 
 
 def prepare_split_source(
-    con: duckdb.DuckDBPyConnection, path: Path, cutoff: date
+    con: duckdb.DuckDBPyConnection, path: Path, cutoff: date, *, dataset: str,
+    revision: str, observed_at: str,
 ) -> int:
     validate_source_schema(
         con,
@@ -505,13 +516,16 @@ def prepare_split_source(
         CREATE TEMP TABLE split_source AS
         SELECT upper(trim(p.symbol)) AS source_symbol,
                try_cast(p.report_date AS DATE) AS event_date,
-               trim(cast(p.split_factor AS VARCHAR)) AS split_factor
+               trim(cast(p.split_factor AS VARCHAR)) AS split_factor,
+               cast(? AS VARCHAR) AS source_dataset,
+               cast(? AS VARCHAR) AS source_revision,
+               cast(? AS VARCHAR) AS observed_at_utc
         FROM read_parquet(?) p
         JOIN (SELECT DISTINCT source_symbol FROM aliases) a
           ON upper(trim(p.symbol)) = a.source_symbol
         WHERE try_cast(p.report_date AS DATE) <= cast(? AS DATE)
         """,
-        [str(path), cutoff.isoformat()],
+        [dataset, revision, observed_at, str(path), cutoff.isoformat()],
     )
     invalid = int(
         con.execute(
@@ -554,6 +568,106 @@ def prepare_split_source(
     )
     con.execute("CREATE TEMP TABLE split_dedup AS SELECT DISTINCT * FROM split_source")
     return identical_duplicates
+
+
+def supplement_missing_yahoo_chart_history(
+    con: duckdb.DuckDBPyConnection, *, cutoff: date, workers: int
+) -> dict[str, object]:
+    """Fill source-symbol gaps from Yahoo's chart endpoint with row provenance.
+
+    This is deliberately an opt-in supplement.  Each response is independently
+    hashed, and only aliases absent from the immutable snapshot are requested.
+    """
+    missing = [
+        (str(row[0]), str(row[1])) for row in con.execute(
+            """
+            SELECT DISTINCT a.security_id, a.source_symbol FROM aliases a
+            WHERE NOT EXISTS (
+              SELECT 1 FROM price_source p WHERE p.source_symbol = a.source_symbol
+            ) ORDER BY a.security_id, a.priority
+            """
+        ).fetchall()
+    ]
+    # Try aliases in priority order, stopping after the first successful one.
+    requested: dict[str, list[str]] = {}
+    for security_id, symbol in missing:
+        requested.setdefault(security_id, []).append(symbol)
+
+    def fetch(security_id: str, aliases: list[str]):
+        errors: list[str] = []
+        for symbol in aliases:
+            url = (
+                "https://query2.finance.yahoo.com/v8/finance/chart/"
+                + urllib.parse.quote(symbol, safe="")
+                + "?period1=" + str(int(datetime.combine(cutoff - timedelta(days=730), datetime.min.time(), timezone.utc).timestamp()))
+                + "&period2=" + str(int(datetime.combine(cutoff + timedelta(days=1), datetime.min.time(), timezone.utc).timestamp()))
+                + "&interval=1d&events=history,split"
+            )
+            request = urllib.request.Request(url, headers={"User-Agent": "usd-portfolio-market-data/1.0"})
+            for attempt in range(5):
+                try:
+                    with urllib.request.urlopen(request, timeout=30) as response:
+                        payload = response.read()
+                    body = json.loads(payload)
+                    result = (body.get("chart", {}).get("result") or [None])[0]
+                    if not result or not result.get("timestamp"):
+                        raise AggregateError("no daily history")
+                    return security_id, symbol, payload, result, None
+                except (OSError, ValueError, AggregateError) as exc:
+                    errors.append(f"{symbol}:{exc}")
+                    # Yahoo rate-limits bursty anonymous requests; use bounded
+                    # exponential backoff rather than silently dropping data.
+                    time.sleep(1.0 * (2 ** attempt))
+        return security_id, "", b"", None, "; ".join(errors)
+
+    results = []
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(fetch, security_id, aliases) for security_id, aliases in requested.items()]
+        for future in as_completed(futures):
+            results.append(future.result())
+    con.execute(
+        "CREATE TEMP TABLE yahoo_chart_supplement(source_symbol VARCHAR, session_date DATE, open DOUBLE, high DOUBLE, low DOUBLE, close DOUBLE, volume BIGINT, source_dataset VARCHAR, source_revision VARCHAR, observed_at_utc VARCHAR)"
+    )
+    con.execute(
+        "CREATE TEMP TABLE yahoo_chart_splits(source_symbol VARCHAR, event_date DATE, split_factor VARCHAR, source_dataset VARCHAR, source_revision VARCHAR, observed_at_utc VARCHAR)"
+    )
+    price_records: list[tuple[object, ...]] = []
+    split_records: list[tuple[object, ...]] = []
+    response_records: list[dict[str, object]] = []
+    failures: list[dict[str, str]] = []
+    for security_id, symbol, payload, result, error in results:
+        if error or result is None:
+            failures.append({"security_id": security_id, "error": error or "unknown error"})
+            continue
+        digest = hashlib.sha256(payload).hexdigest()
+        observed = format_utc(utcnow())
+        quote = ((result.get("indicators") or {}).get("quote") or [{}])[0]
+        timestamps = result.get("timestamp") or []
+        for index, timestamp in enumerate(timestamps):
+            values = [quote.get(field, [None] * len(timestamps))[index] for field in ("open", "high", "low", "close", "volume")]
+            if any(value is None for value in values):
+                continue
+            session = datetime.fromtimestamp(int(timestamp), timezone.utc).date()
+            if session <= cutoff:
+                price_records.append((symbol, session, *values, "Yahoo Finance Chart API", digest, observed))
+        for event in ((result.get("events") or {}).get("splits") or {}).values():
+            event_date = datetime.fromtimestamp(int(event["date"]), timezone.utc).date()
+            if event_date <= cutoff:
+                factor = f"{event.get('numerator')}:{event.get('denominator')}"
+                split_records.append((symbol, event_date, factor, "Yahoo Finance Chart API", digest, observed))
+        response_records.append({"security_id": security_id, "source_symbol": symbol, "sha256": digest, "observed_at_utc": observed})
+    if price_records:
+        con.executemany("INSERT INTO yahoo_chart_supplement VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", price_records)
+        con.execute("INSERT INTO price_source SELECT * FROM yahoo_chart_supplement")
+    if split_records:
+        con.executemany("INSERT INTO yahoo_chart_splits VALUES (?, ?, ?, ?, ?, ?)", split_records)
+        con.execute("INSERT INTO split_source SELECT * FROM yahoo_chart_splits")
+    # Re-deduplicate after adding non-overlapping supplemental observations.
+    con.execute("DROP TABLE price_dedup")
+    con.execute("CREATE TEMP TABLE price_dedup AS SELECT DISTINCT * FROM price_source")
+    con.execute("DROP TABLE split_dedup")
+    con.execute("CREATE TEMP TABLE split_dedup AS SELECT DISTINCT * FROM split_source")
+    return {"requested": len(requested), "responses": response_records, "failures": failures, "price_rows": len(price_records), "split_rows": len(split_records)}
 
 
 def write_unmatched(
@@ -654,8 +768,20 @@ def build(args: argparse.Namespace) -> tuple[dict[str, object], int]:
     con = duckdb.connect()
     try:
         build_alias_table(con, securities)
-        price_duplicate_count = prepare_price_source(con, prices_path, cutoff)
-        split_duplicate_count = prepare_split_source(con, splits_path, cutoff)
+        observed_text = format_utc(observed_at)
+        price_duplicate_count = prepare_price_source(
+            con, prices_path, cutoff, dataset=args.source_repo,
+            revision=prices_revision, observed_at=observed_text,
+        )
+        split_duplicate_count = prepare_split_source(
+            con, splits_path, cutoff, dataset=args.source_repo,
+            revision=splits_revision, observed_at=observed_text,
+        )
+        chart_supplement: dict[str, object] | None = None
+        if args.yahoo_chart_supplement:
+            chart_supplement = supplement_missing_yahoo_chart_history(
+                con, cutoff=cutoff, workers=args.yahoo_chart_workers
+            )
         expected_session = expected_latest_session(cutoff)
         (
             oldest_active_session,
@@ -680,9 +806,7 @@ def build(args: argparse.Namespace) -> tuple[dict[str, object], int]:
         aggregate_query = """
           SELECT p.security_id, p.ticker, p.source_symbol, p.session_date,
                  p.open, p.high, p.low, p.close, p.volume,
-                 cast(? AS VARCHAR) AS source_dataset,
-                 cast(? AS VARCHAR) AS source_revision,
-                 cast(? AS VARCHAR) AS observed_at_utc
+                 p.source_dataset, p.source_revision, p.observed_at_utc
           FROM price_candidate p
           JOIN active_security_ids a USING (security_id)
           LEFT JOIN quarantined_price_sessions q USING (session_date)
@@ -692,18 +816,14 @@ def build(args: argparse.Namespace) -> tuple[dict[str, object], int]:
         atomic_copy_to_parquet(
             con,
             aggregate_query,
-            [
-                args.source_repo,
-                prices_revision,
-                format_utc(observed_at),
-            ],
+            [],
             aggregate_path,
         )
 
         split_query = """
           WITH matched AS (
             SELECT a.security_id, a.ticker, s.source_symbol, s.event_date,
-                   s.split_factor,
+                   s.split_factor, s.source_dataset, s.source_revision, s.observed_at_utc,
                    row_number() OVER (
                      PARTITION BY a.security_id, s.event_date
                      ORDER BY a.priority, s.source_symbol
@@ -713,16 +833,14 @@ def build(args: argparse.Namespace) -> tuple[dict[str, object], int]:
             JOIN active_security_ids active ON a.security_id = active.security_id
           )
           SELECT security_id, ticker, source_symbol, event_date, split_factor,
-                 cast(? AS VARCHAR) AS source_dataset,
-                 cast(? AS VARCHAR) AS source_revision,
-                 cast(? AS VARCHAR) AS observed_at_utc
+                 source_dataset, source_revision, observed_at_utc
           FROM matched WHERE alias_rank = 1
           ORDER BY ticker, event_date
         """
         atomic_copy_to_parquet(
             con,
             split_query,
-            [args.source_repo, splits_revision, format_utc(observed_at)],
+            [],
             splits_out,
         )
 
@@ -996,6 +1114,8 @@ def build(args: argparse.Namespace) -> tuple[dict[str, object], int]:
                 },
             },
         }
+        if chart_supplement is not None:
+            manifest["source"]["yahoo_chart_supplement"] = chart_supplement
         atomic_json(manifest_path, manifest)
         print(json.dumps(manifest, indent=2, sort_keys=True))
         return manifest, 0 if status == "READY" else 2
@@ -1023,6 +1143,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--prices-file")
     parser.add_argument("--splits-file")
     parser.add_argument("--cache-dir", default=".hf-cache")
+    parser.add_argument(
+        "--yahoo-chart-supplement", action="store_true",
+        help="Fetch missing immutable-snapshot symbols from Yahoo's chart API",
+    )
+    parser.add_argument("--yahoo-chart-workers", type=int, default=2)
     parser.add_argument("--observed-at", help="RFC3339 UTC timestamp; defaults to now")
     args = parser.parse_args(argv)
 
@@ -1038,6 +1163,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--source-reuse-price-ratio must be greater than 1")
     if args.minimum_systemic_session_securities <= 0:
         parser.error("--minimum-systemic-session-securities must be positive")
+    if args.yahoo_chart_workers <= 0 or args.yahoo_chart_workers > 16:
+        parser.error("--yahoo-chart-workers must be in [1, 16]")
     if not (0 < args.systemic_invalid_session_rate <= 1):
         parser.error("--systemic-invalid-session-rate must be in (0, 1]")
     for name in ("minimum_coverage", "minimum_adequate_history_coverage"):

@@ -209,16 +209,26 @@ jobs:
           python build-security-universe.py "${args[@]}"
 
       - name: Build compact aggregate
+        shell: bash
+        env:
+          MODE: ${{ steps.inputs.outputs.mode }}
         run: |
-          python build-yahoo-aggregate-v2.py \
-            --universe dist/security-universe.csv \
-            --universe-metadata dist/security-universe.metadata.json \
-            --out-dir dist \
-            --sessions "${{ steps.inputs.outputs.sessions }}" \
-            --minimum-history "${{ steps.inputs.outputs.minimum_history }}" \
-            --minimum-coverage 0.80 \
-            --minimum-adequate-history-coverage 0.50 \
+          set -euo pipefail
+          args=(
+            python build-yahoo-aggregate-v2.py
+            --universe dist/security-universe.csv
+            --universe-metadata dist/security-universe.metadata.json
+            --out-dir dist
+            --sessions "${{ steps.inputs.outputs.sessions }}"
+            --minimum-history "${{ steps.inputs.outputs.minimum_history }}"
+            --minimum-coverage 0.80
+            --minimum-adequate-history-coverage 0.50
             --cutoff-date "${{ steps.inputs.outputs.cutoff }}"
+          )
+          if [[ "$MODE" == "full" ]]; then
+            args+=(--yahoo-chart-supplement --yahoo-chart-workers 2)
+          fi
+          "${args[@]}"
 
       - name: Download official SEC bulk sources
         if: steps.inputs.outputs.mode == 'full' && steps.inputs.outputs.refresh_enrichment == 'true'

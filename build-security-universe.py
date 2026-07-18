@@ -287,6 +287,10 @@ def make_row(
     if not ticker:
         raise UniverseError(f"Blank ticker in {source_name}")
     security_type = classify_security(legal_name, is_etf, is_nextshares)
+    # ADR identity is reviewed issuer/security-master metadata, never inferred
+    # from the ticker.  Exchange descriptions are not consistently explicit.
+    if metadata["adr_status"] == "ADR":
+        security_type = "ADR"
     status, reason = admission(
         security_type=security_type,
         is_test=is_test,
