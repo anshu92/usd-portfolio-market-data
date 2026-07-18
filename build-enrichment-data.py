@@ -279,7 +279,7 @@ def load_universe(path: Path) -> tuple[dict[str, dict[str, str]], dict[str, str]
         ticker_to_id: dict[str, str] = {}
         for raw in reader:
             row = {str(key): str(value or "").strip() for key, value in raw.items()}
-            if row["universe_admission_status"] != "ADMITTED":
+            if row["universe_admission_status"] not in {"ADMITTED", "ADMITTED_ETF"}:
                 continue
             security_id = row["security_id"]
             ticker = row["ticker"].upper()

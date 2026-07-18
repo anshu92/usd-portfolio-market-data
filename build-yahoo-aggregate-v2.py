@@ -138,7 +138,7 @@ def load_universe(path: Path) -> list[Security]:
         if missing:
             raise AggregateError(f"Universe lacks required columns: {sorted(missing)}")
         for line_number, row in enumerate(reader, start=2):
-            if str(row.get("universe_admission_status") or "").strip().upper() != "ADMITTED":
+            if str(row.get("universe_admission_status") or "").strip().upper() not in {"ADMITTED", "ADMITTED_ETF"}:
                 continue
             security_id = str(row.get("security_id") or "").strip()
             ticker = str(row.get("ticker") or "").strip().upper()

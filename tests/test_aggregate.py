@@ -90,6 +90,18 @@ def test_builds_ready_aggregate_and_resolves_class_share_alias(
     }
 
 
+def test_admitted_etf_is_loaded_for_yahoo_history(aggregate_module, tmp_path):
+    universe = tmp_path / "security-universe.csv"
+    universe.write_text(
+        "security_id,ticker,universe_admission_status\n"
+        "BATS:MAGS,MAGS,ADMITTED_ETF\n",
+        encoding="utf-8",
+    )
+    assert aggregate_module.load_universe(universe) == [
+        aggregate_module.Security("BATS:MAGS", "MAGS")
+    ]
+
+
 def test_conflicting_source_rows_fail(aggregate_module, aggregate_inputs, tmp_path):
     con = duckdb.connect()
     try:

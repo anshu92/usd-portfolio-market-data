@@ -39,6 +39,22 @@ OUTPUT_FIELDS = (
     "legal_name",
     "exchange_mic",
     "security_type",
+    "exchange_country",
+    "currency",
+    "listing_status",
+    "cik",
+    "cusip",
+    "isin",
+    "adr_status",
+    "adr_ratio",
+    "home_exchange",
+    "home_country",
+    "fund_provider",
+    "index_tracked",
+    "expense_ratio",
+    "asset_class",
+    "leveraged",
+    "inverse",
     "universe_admission_status",
     "admission_reason",
     "source_file",
@@ -46,13 +62,14 @@ OUTPUT_FIELDS = (
     "source_file_sha256",
     "generated_at_utc",
 )
-ADMITTED_TYPES = {
-    "COMMON_EQUITY",
-    "ORDINARY_EQUITY",
-    "ADR_ADS",
-    "REIT_BENEFICIAL_INTEREST",
-    "COMMON_PARTNERSHIP_UNIT",
-}
+METADATA_FIELDS = (
+    "exchange_mic", "source_symbol", "cik", "cusip", "isin", "adr_status", "adr_ratio",
+    "home_exchange", "home_country", "fund_provider", "index_tracked",
+    "expense_ratio", "asset_class", "leveraged", "inverse", "currency",
+    "listing_status", "exchange_country",
+)
+OTHER_LISTED_VENUES = {"N": "XNYS", "P": "ARCX", "Z": "BATS", "C": "CBOE"}
+ADMITTED_STATUSES = {"ADMITTED", "ADMITTED_ETF"}
 
 
 class UniverseError(RuntimeError):
@@ -67,6 +84,22 @@ class SecurityRow:
     legal_name: str
     exchange_mic: str
     security_type: str
+    exchange_country: str
+    currency: str
+    listing_status: str
+    cik: str
+    cusip: str
+    isin: str
+    adr_status: str
+    adr_ratio: str
+    home_exchange: str
+    home_country: str
+    fund_provider: str
+    index_tracked: str
+    expense_ratio: str
+    asset_class: str
+    leveraged: str
+    inverse: str
     universe_admission_status: str
     admission_reason: str
     source_file: str
@@ -167,7 +200,7 @@ def classify_security(name: str, is_etf: bool, is_nextshares: bool) -> str:
     if is_etf:
         return "ETF"
     if is_nextshares:
-        return "NEXTSHARES"
+        return "OTHER"
     # Exclusion classes take precedence. For example, a warrant description can
     # mention the common units it purchases, and a preferred issue can be
     # represented by American depositary shares.
@@ -179,22 +212,22 @@ def classify_security(name: str, is_etf: bool, is_nextshares: bool) -> str:
         re.search(r"\bDEPOSITARY SHARES?\b", text)
         and not re.search(r"\bAMERICAN DEPOSIT(?:A|O)RY SHARES?\b", text)
     ):
-        return "PREFERRED_EQUITY"
+        return "PREFERRED"
     if re.search(r"\bNOTES?\b|\bBONDS?\b|\bDEBENTURES?\b", text):
-        return "DEBT"
+        return "OTHER"
     if re.search(r"\bAMERICAN DEPOSIT(?:A|O)RY SHARES?\b|\bADRS?\b|\bADS\b", text):
-        return "ADR_ADS"
+        return "ADR"
     if "SHARES OF BENEFICIAL INTEREST" in text:
-        return "REIT_BENEFICIAL_INTEREST"
+        return "REIT"
     if re.search(r"\b(?:COMMON|LIMITED PARTNERSHIP) UNITS?\b", text):
-        return "COMMON_PARTNERSHIP_UNIT"
+        return "MLP"
     if re.search(r"\bUNITS?\b", text):
-        return "ACQUISITION_UNIT"
+        return "UNIT"
     if re.search(r"\bORDINARY SHARES?\b", text):
-        return "ORDINARY_EQUITY"
+        return "COMMON"
     if re.search(r"\bCOMMON STOCK\b|\bCOMMON SHARES?\b", text):
-        return "COMMON_EQUITY"
-    return "UNCLASSIFIED"
+        return "COMMON"
+    return "OTHER"
 
 
 def admission(
@@ -202,18 +235,37 @@ def admission(
     security_type: str,
     is_test: bool,
     financial_status: str | None,
+    metadata: dict[str, str],
 ) -> tuple[str, str]:
     if is_test:
-        return "EXCLUDED", "TEST_ISSUE"
-    if security_type in {"ETF", "NEXTSHARES"}:
-        return "EXCLUDED", security_type
+        return "REJECTED_INACTIVE", "TEST_ISSUE"
+    if metadata["exchange_country"] != "USA":
+        return "REJECTED_NON_US", "EXCHANGE_COUNTRY_NOT_USA"
+    if metadata["currency"] != "USD":
+        return "REJECTED_NON_USD", "CURRENCY_NOT_USD"
+    if metadata["listing_status"] != "ACTIVE":
+        return "REJECTED_INACTIVE", "LISTING_NOT_ACTIVE"
     if financial_status is not None and financial_status != "N":
-        return "EXCLUDED", f"NASDAQ_FINANCIAL_STATUS_{financial_status or 'MISSING'}"
-    if security_type in ADMITTED_TYPES:
-        return "ADMITTED", f"ADMITTED_{security_type}"
-    if security_type == "UNCLASSIFIED":
-        return "REVIEW_REQUIRED", "UNCLASSIFIED_INSTRUMENT"
-    return "EXCLUDED", security_type
+        return "REJECTED_INACTIVE", f"NASDAQ_FINANCIAL_STATUS_{financial_status or 'MISSING'}"
+    if security_type == "ETF":
+        if metadata["leveraged"] == "true":
+            return "REJECTED_LEVERAGED_ETF", "LEVERAGED_ETF"
+        if metadata["inverse"] == "true":
+            return "REJECTED_INVERSE_ETF", "INVERSE_ETF"
+        return "ADMITTED_ETF", "ADMITTED_ELIGIBLE_ETF"
+    if security_type == "ADR":
+        if not metadata["cik"]:
+            return "REJECTED_IDENTITY_CONFLICT", "ADR_CIK_MISSING"
+        return "ADMITTED", "ADMITTED_ADR"
+    if security_type == "COMMON":
+        return "ADMITTED", "ADMITTED_COMMON"
+    if security_type == "WARRANT":
+        return "REJECTED_WARRANT", "WARRANT"
+    if security_type == "RIGHT":
+        return "REJECTED_RIGHT", "RIGHT"
+    if security_type == "UNIT":
+        return "REJECTED_UNIT", "UNIT"
+    return "REJECTED_UNKNOWN_SECURITY_TYPE", security_type
 
 
 def make_row(
@@ -229,6 +281,7 @@ def make_row(
     is_etf: bool,
     is_nextshares: bool,
     financial_status: str | None,
+    metadata: dict[str, str],
 ) -> SecurityRow:
     ticker = ticker.strip().upper()
     if not ticker:
@@ -238,6 +291,7 @@ def make_row(
         security_type=security_type,
         is_test=is_test,
         financial_status=financial_status,
+        metadata=metadata,
     )
     return SecurityRow(
         security_id=f"{exchange_mic}:{ticker}",
@@ -246,6 +300,22 @@ def make_row(
         legal_name=legal_name.strip(),
         exchange_mic=exchange_mic,
         security_type=security_type,
+        exchange_country=metadata["exchange_country"],
+        currency=metadata["currency"],
+        listing_status=metadata["listing_status"],
+        cik=metadata["cik"],
+        cusip=metadata["cusip"],
+        isin=metadata["isin"],
+        adr_status=metadata["adr_status"],
+        adr_ratio=metadata["adr_ratio"],
+        home_exchange=metadata["home_exchange"],
+        home_country=metadata["home_country"],
+        fund_provider=metadata["fund_provider"],
+        index_tracked=metadata["index_tracked"],
+        expense_ratio=metadata["expense_ratio"],
+        asset_class=metadata["asset_class"],
+        leveraged=metadata["leveraged"],
+        inverse=metadata["inverse"],
         universe_admission_status=status,
         admission_reason=reason,
         source_file=source_name,
@@ -253,6 +323,58 @@ def make_row(
         source_file_sha256=source_sha,
         generated_at_utc=format_utc(generated_at),
     )
+
+
+def default_metadata(exchange_mic: str, ticker: str) -> dict[str, str]:
+    return {
+        "exchange_mic": exchange_mic,
+        "source_symbol": ticker,
+        "cik": "",
+        "cusip": "",
+        "isin": "",
+        "adr_status": "NOT_ADR",
+        "adr_ratio": "",
+        "home_exchange": "",
+        "home_country": "",
+        "fund_provider": "",
+        "index_tracked": "",
+        "expense_ratio": "",
+        "asset_class": "",
+        "leveraged": "false",
+        "inverse": "false",
+        "currency": "USD",
+        "listing_status": "ACTIVE",
+        "exchange_country": "USA",
+    }
+
+
+def load_security_metadata(path: Path) -> dict[tuple[str, str], dict[str, str]]:
+    if not path.exists():
+        raise UniverseError(f"Security metadata file does not exist: {path}")
+    with path.open(newline="", encoding="utf-8-sig") as handle:
+        reader = csv.DictReader(handle)
+        if tuple(reader.fieldnames or ()) != METADATA_FIELDS:
+            raise UniverseError(
+                f"Security metadata columns must be exactly {','.join(METADATA_FIELDS)}"
+            )
+        output: dict[tuple[str, str], dict[str, str]] = {}
+        for line_number, raw in enumerate(reader, start=2):
+            row = {key: str(value or "").strip() for key, value in raw.items()}
+            if not any(row.values()):
+                continue
+            key = (row["exchange_mic"].upper(), row["source_symbol"].upper())
+            if not all(key) or key in output:
+                raise UniverseError(f"Invalid or duplicate metadata key at {path}:{line_number}")
+            row["exchange_mic"], row["source_symbol"] = key
+            for field in ("leveraged", "inverse"):
+                value = row[field].lower()
+                if value not in {"", "true", "false"}:
+                    raise UniverseError(f"Invalid {field} at {path}:{line_number}")
+                row[field] = value or "false"
+            for field in ("currency", "listing_status", "exchange_country", "adr_status"):
+                row[field] = row[field].upper()
+            output[key] = row
+    return output
 
 
 def build_rows(
@@ -264,12 +386,16 @@ def build_rows(
     nasdaq_sha: str,
     other_sha: str,
     generated_at: datetime,
+    security_metadata: dict[tuple[str, str], dict[str, str]],
 ) -> list[SecurityRow]:
     output: list[SecurityRow] = []
     for row in nasdaq_rows:
+        ticker = row.get("Symbol", "").strip().upper()
+        metadata = default_metadata("XNAS", ticker)
+        metadata.update(security_metadata.get(("XNAS", ticker), {}))
         output.append(
             make_row(
-                ticker=row.get("Symbol", ""),
+                ticker=ticker,
                 legal_name=row.get("Security Name", ""),
                 exchange_mic="XNAS",
                 source_name="nasdaqlisted.txt",
@@ -280,16 +406,21 @@ def build_rows(
                 is_etf=row.get("ETF") == "Y",
                 is_nextshares=row.get("NextShares") == "Y",
                 financial_status=row.get("Financial Status", ""),
+                metadata=metadata,
             )
         )
     for row in other_rows:
-        if row.get("Exchange") != "N":
+        exchange_mic = OTHER_LISTED_VENUES.get(row.get("Exchange", "").upper())
+        if exchange_mic is None:
             continue
+        ticker = row.get("ACT Symbol", "").strip().upper()
+        metadata = default_metadata(exchange_mic, ticker)
+        metadata.update(security_metadata.get((exchange_mic, ticker), {}))
         output.append(
             make_row(
-                ticker=row.get("ACT Symbol", ""),
+                ticker=ticker,
                 legal_name=row.get("Security Name", ""),
-                exchange_mic="XNYS",
+                exchange_mic=exchange_mic,
                 source_name="otherlisted.txt",
                 source_created_at=other_created_at,
                 source_sha=other_sha,
@@ -298,6 +429,7 @@ def build_rows(
                 is_etf=row.get("ETF") == "Y",
                 is_nextshares=False,
                 financial_status=None,
+                metadata=metadata,
             )
         )
     return output
@@ -348,13 +480,20 @@ def apply_overrides(
             output.append(row)
             continue
         found.add(key)
-        status = "ADMITTED" if override["action"] == "ADMIT" else "EXCLUDED"
+        override_type = override["security_type"] or row.security_type
+        status = (
+            "ADMITTED_ETF"
+            if override["action"] == "ADMIT" and override_type == "ETF"
+            else "ADMITTED"
+            if override["action"] == "ADMIT"
+            else "REJECTED_UNKNOWN_SECURITY_TYPE"
+        )
         output.append(
             replace(
                 row,
                 security_id=override["security_id"] or row.security_id,
                 ticker=(override["canonical_ticker"] or row.ticker).upper(),
-                security_type=override["security_type"] or row.security_type,
+                security_type=override_type,
                 universe_admission_status=status,
                 admission_reason=f"OVERRIDE_{override['action']}:{override['reason']}",
             )
@@ -380,7 +519,7 @@ def validate_identifiers(rows: list[SecurityRow]) -> None:
                 f"security_id {row.security_id!r} collides between {previous_key} and {source_key}"
             )
         security_ids[row.security_id] = source_key
-        if row.universe_admission_status == "ADMITTED":
+        if row.universe_admission_status in ADMITTED_STATUSES:
             previous_id = admitted_tickers.get(row.ticker)
             if previous_id is not None and previous_id != row.security_id:
                 raise UniverseError(
@@ -401,7 +540,7 @@ def admitted_ids_from_csv(path: Path) -> set[str]:
             str(row.get("security_id") or "").strip()
             for row in reader
             if str(row.get("universe_admission_status") or "").strip().upper()
-            == "ADMITTED"
+            in ADMITTED_STATUSES
         }
 
 
@@ -419,6 +558,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out", default="security-universe.csv")
     parser.add_argument("--metadata-out")
     parser.add_argument("--overrides", default="config/universe-overrides.csv")
+    parser.add_argument("--security-metadata", default="config/security-metadata.csv")
     parser.add_argument("--nasdaq-file")
     parser.add_argument("--other-listed-file")
     parser.add_argument("--previous-universe")
@@ -451,6 +591,9 @@ def main(argv: list[str] | None = None) -> int:
         other_rows, other_created_at = parse_pipe_feed(other_data, "otherlisted.txt")
         nasdaq_sha = sha256_bytes(nasdaq_data)
         other_sha = sha256_bytes(other_data)
+        security_metadata = load_security_metadata(
+            Path(args.security_metadata).resolve()
+        )
         rows = build_rows(
             nasdaq_rows,
             other_rows,
@@ -459,6 +602,7 @@ def main(argv: list[str] | None = None) -> int:
             nasdaq_sha=nasdaq_sha,
             other_sha=other_sha,
             generated_at=generated_at,
+            security_metadata=security_metadata,
         )
 
         selected_tickers: set[str] | None = None
@@ -486,6 +630,16 @@ def main(argv: list[str] | None = None) -> int:
 
         errors: list[str] = []
         warnings: list[str] = []
+        for row in rows:
+            if row.universe_admission_status == "ADMITTED" and row.security_type == "ADR" and not row.cik:
+                errors.append(f"Admitted ADR lacks CIK: {row.security_id}")
+            if row.universe_admission_status == "ADMITTED_ETF":
+                if not row.expense_ratio:
+                    warnings.append(f"ETF expense ratio unavailable: {row.security_id}")
+                if not row.fund_provider:
+                    warnings.append(f"ETF fund provider unavailable: {row.security_id}")
+            if row.security_type == "ADR" and not row.home_exchange:
+                warnings.append(f"ADR home exchange unavailable: {row.security_id}")
         source_snapshots = [
             SourceSnapshot(
                 "nasdaqlisted.txt",
@@ -517,7 +671,7 @@ def main(argv: list[str] | None = None) -> int:
         admitted_ids = {
             row.security_id
             for row in rows
-            if row.universe_admission_status == "ADMITTED"
+            if row.universe_admission_status in ADMITTED_STATUSES
         }
         if not admitted_ids:
             errors.append("No securities were admitted")
@@ -568,7 +722,7 @@ def main(argv: list[str] | None = None) -> int:
                 ),
             },
             "filters": {
-                "exchange_mics": ["XNAS", "XNYS"],
+                "exchange_mics": ["XNAS", "XNYS", "ARCX", "BATS", "CBOE"],
                 "only_tickers": sorted(selected_tickers) if selected_tickers else None,
             },
             "errors": errors,

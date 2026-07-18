@@ -133,7 +133,7 @@ def verify_enrichment(
         admitted_ids = {
             str(row.get("security_id") or "")
             for row in csv.DictReader(handle)
-            if str(row.get("universe_admission_status") or "").upper() == "ADMITTED"
+            if str(row.get("universe_admission_status") or "").upper() in {"ADMITTED", "ADMITTED_ETF"}
         }
     if not admitted_ids <= master_ids:
         raise VerificationError(

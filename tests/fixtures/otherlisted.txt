@@ -3,4 +3,5 @@ AMEX|Ignored American Exchange - Common Stock|A|AMEX|N|100|N|AMEX
 BRK.B|Berkshire Hathaway Inc. Class B - Common Stock|N|BRK.B|N|100|N|BRK-B
 NYETF|Example NYSE ETF|N|NYETF|Y|100|N|NYETF
 TSM|Taiwan Semiconductor Manufacturing Company Limited - American Depositary Shares|N|TSM|N|100|N|TSM
+MAGS|Roundhill Magnificent Seven ETF|Z|MAGS|Y|100|N|MAGS
 File Creation Time: 0716202621:31||||||

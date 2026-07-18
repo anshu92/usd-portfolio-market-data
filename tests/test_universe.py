@@ -51,22 +51,28 @@ def test_builds_selected_venues_and_instrument_statuses(universe_module, tmp_pat
     assert rows["AAPL"]["security_id"] == "XNAS:AAPL"
     assert rows["BRK.B"]["security_id"] == "XNYS:BRK.B"
     assert rows["BRK.B"]["universe_admission_status"] == "ADMITTED"
-    assert rows["ADRX"]["security_type"] == "ADR_ADS"
-    assert rows["ORDY"]["security_type"] == "ORDINARY_EQUITY"
-    assert rows["LPCO"]["security_type"] == "COMMON_PARTNERSHIP_UNIT"
-    assert rows["REIT"]["security_type"] == "REIT_BENEFICIAL_INTEREST"
-    assert rows["BADF"]["universe_admission_status"] == "EXCLUDED"
-    assert rows["ETFQ"]["admission_reason"] == "ETF"
-    assert rows["NEXT"]["security_type"] == "NEXTSHARES"
-    assert rows["PREF"]["security_type"] == "PREFERRED_EQUITY"
-    assert rows["PADS"]["security_type"] == "PREFERRED_EQUITY"
-    assert rows["DEBT"]["security_type"] == "DEBT"
+    assert rows["TSM"]["security_type"] == "ADR"
+    assert rows["TSM"]["cik"] == "0001046179"
+    assert rows["TSM"]["universe_admission_status"] == "ADMITTED"
+    assert rows["MAGS"]["security_id"] == "BATS:MAGS"
+    assert rows["MAGS"]["security_type"] == "ETF"
+    assert rows["MAGS"]["universe_admission_status"] == "ADMITTED_ETF"
+    assert rows["MAGS"]["leveraged"] == "false"
+    assert rows["ORDY"]["security_type"] == "COMMON"
+    assert rows["LPCO"]["security_type"] == "MLP"
+    assert rows["REIT"]["security_type"] == "REIT"
+    assert rows["BADF"]["universe_admission_status"] == "REJECTED_INACTIVE"
+    assert rows["ETFQ"]["universe_admission_status"] == "ADMITTED_ETF"
+    assert rows["PREF"]["security_type"] == "PREFERRED"
+    assert rows["PADS"]["security_type"] == "PREFERRED"
+    assert rows["DEBT"]["security_type"] == "OTHER"
     assert rows["RIGHTR"]["security_type"] == "RIGHT"
-    assert rows["UNITU"]["security_type"] == "ACQUISITION_UNIT"
+    assert rows["UNITU"]["security_type"] == "UNIT"
     assert rows["WARRW"]["security_type"] == "WARRANT"
     assert rows["WCUW"]["security_type"] == "WARRANT"
     assert rows["TEST"]["admission_reason"] == "TEST_ISSUE"
-    assert rows["UNKN"]["universe_admission_status"] == "REVIEW_REQUIRED"
+    assert rows["UNKN"]["security_type"] == "OTHER"
+    assert rows["UNKN"]["universe_admission_status"] == "REJECTED_UNKNOWN_SECURITY_TYPE"
     assert rows["AAPL"]["source_file_created_at_utc"] == "2026-07-17T01:31:00Z"
     assert len(rows["AAPL"]["source_file_sha256"]) == 64
     manifest = json.loads(metadata.read_text())
@@ -88,7 +94,7 @@ def test_override_is_applied_and_collisions_fail(universe_module, tmp_path):
     overrides = tmp_path / "overrides.csv"
     overrides.write_text(
         "exchange_mic,source_symbol,action,security_id,canonical_ticker,security_type,reason\n"
-        "XNAS,UNKN,ADMIT,XNAS:UNKN,UNKN,COMMON_EQUITY,reviewed common equity\n",
+        "XNAS,UNKN,ADMIT,XNAS:UNKN,UNKN,COMMON,reviewed common equity\n",
         encoding="utf-8",
     )
     exit_code, out, _, _ = run_builder(universe_module, tmp_path)
@@ -99,7 +105,7 @@ def test_override_is_applied_and_collisions_fail(universe_module, tmp_path):
 
     overrides.write_text(
         "exchange_mic,source_symbol,action,security_id,canonical_ticker,security_type,reason\n"
-        "XNAS,UNKN,ADMIT,XNAS:AAPL,UNKN,COMMON_EQUITY,collision test\n",
+        "XNAS,UNKN,ADMIT,XNAS:AAPL,UNKN,COMMON,collision test\n",
         encoding="utf-8",
     )
     exit_code, _, _, _ = run_builder(universe_module, tmp_path)
@@ -114,8 +120,8 @@ def test_duplicate_overrides_fail(universe_module, tmp_path):
     )
     overrides.write_text(
         header
-        + "XNAS,UNKN,ADMIT,XNAS:UNKN,UNKN,COMMON_EQUITY,first review\n"
-        + "XNAS,UNKN,EXCLUDE,,,UNCLASSIFIED,second review\n",
+        + "XNAS,UNKN,ADMIT,XNAS:UNKN,UNKN,COMMON,first review\n"
+        + "XNAS,UNKN,EXCLUDE,,,OTHER,second review\n",
         encoding="utf-8",
     )
     exit_code, _, _, _ = run_builder(universe_module, tmp_path)

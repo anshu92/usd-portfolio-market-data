@@ -176,7 +176,7 @@ def admitted_securities(path: Path) -> dict[str, dict[str, str]]:
             raise SnapshotReuseError("Fresh security universe schema is incomplete")
         output: dict[str, dict[str, str]] = {}
         for row in reader:
-            if str(row.get("universe_admission_status") or "").upper() != "ADMITTED":
+            if str(row.get("universe_admission_status") or "").upper() not in {"ADMITTED", "ADMITTED_ETF"}:
                 continue
             security_id = str(row.get("security_id") or "")
             if not security_id or security_id in output:

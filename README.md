@@ -62,18 +62,22 @@ and factor-disable contract.
 
 `build-security-universe.py` reads the Nasdaq Trader symbol directories and admits:
 
-- normal-status Nasdaq securities or NYSE exchange-code `N` securities;
-- common or ordinary equities, ADRs/ADSs, REIT beneficial interests, and common
-  partnership units.
+- active USD listings on `XNAS`, `XNYS`, `ARCX`, `BATS`, and `CBOE` whose exchange
+  country is the USA;
+- `COMMON`, `ADR`, and non-leveraged, non-inverse `ETF` securities. ETFs receive
+  `ADMITTED_ETF`; equities and ADRs receive `ADMITTED`.
 
-It excludes test issues, ETFs/NextShares, preferreds, debt, warrants, rights,
-acquisition units, and non-normal Nasdaq financial status. Unknown descriptions are
-`REVIEW_REQUIRED`, not silently admitted. IDs are deterministic MIC/ticker pairs such
-as `XNAS:AAPL` and `XNYS:BRK.B`.
+It explicitly rejects inactive, non-USD/non-US, leveraged/inverse ETF, warrant, right,
+unit, and unknown-security listings. Every non-admitted row has a deterministic
+rejection state; unknowns are never emitted as `UNCLASSIFIED`. IDs are deterministic
+MIC/ticker pairs such as `XNAS:AAPL`, `XNYS:TSM`, and `BATS:MAGS`.
 
-Reviewed exceptions belong in `config/universe-overrides.csv`. Every override requires
-an action, security type, and reason. Use an explicit `security_id` override to preserve
-continuity across a known ticker rename or venue move.
+`config/security-metadata.csv` records reviewed ADR identity and ETF metadata (CIK,
+home market, fund provider, index, expense ratio, asset class, leverage, and inverse
+flags). `config/universe-overrides.csv` remains the continuity registry for listing
+renames or venue moves. ETFs are included in price, split, and security-master assets,
+but are not stock-archetype candidates; consumers should treat them as diversification
+and benchmark instruments.
 
 ## Local development
 

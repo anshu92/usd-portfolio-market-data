@@ -1,0 +1,3 @@
+exchange_mic,source_symbol,cik,cusip,isin,adr_status,adr_ratio,home_exchange,home_country,fund_provider,index_tracked,expense_ratio,asset_class,leveraged,inverse,currency,listing_status,exchange_country
+XNYS,TSM,0001046179,,,ADR,,TWSE,TW,,,,,,,USD,ACTIVE,USA
+BATS,MAGS,,,,NOT_ADR,,,,Roundhill Investments,Solactive Magnificent Seven Index,0.29,Equity ETF,false,false,USD,ACTIVE,USA
