@@ -117,6 +117,17 @@ def build_companyfacts(path: Path) -> None:
     add("InterestExpenseNonOperating", [1, 1, 1, 4])
     add("AccountsReceivableNetCurrent", [20, 21, 22, 23], instant=True)
     add("InventoryNet", [8, 8, 9, 9], instant=True)
+    concepts["Assets"]["units"]["USD"].append(
+        {
+            "end": "2026-12-31",
+            "val": 999,
+            "accn": ACCESSIONS["FY"],
+            "fy": 2026,
+            "fp": "FY",
+            "form": "10-K",
+            "filed": "2026-02-01",
+        }
+    )
     path.write_text(
         json.dumps(
             {
@@ -343,6 +354,11 @@ def test_offline_enrichment_build_is_point_in_time_safe(
             [str(root / "fundamental-factors.parquet")],
         ).fetchone()[0]
         assert unavailable == 0
+        assert con.execute(
+            "SELECT count(*) FROM read_parquet(?) "
+            "WHERE period_end IS NOT NULL AND filed_date < period_end",
+            [str(root / "sec-company-facts.parquet")],
+        ).fetchone()[0] == 0
         finra_dates = con.execute(
             "SELECT settlement_date, publication_date FROM read_parquet(?)",
             [str(root / "finra-short-interest.parquet")],

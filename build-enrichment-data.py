@@ -591,6 +591,12 @@ def iter_company_facts(
                             )
                         period_start = parse_date(observation.get("start"))
                         period_end = parse_date(observation.get("end"))
+                        if period_end is not None and filed_date < period_end:
+                            # SEC bulk history contains a small number of observations
+                            # whose reported period end is after the filing date.  They
+                            # cannot be known at the stated filing time, so retaining
+                            # them would violate the point-in-time contract.
+                            continue
                         fiscal_year = observation.get("fy")
                         fiscal_period = str(observation.get("fp") or "").strip() or None
                         value = finite_number(observation.get("val"))
