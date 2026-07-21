@@ -34,6 +34,11 @@ on:
         required: true
         default: false
         type: boolean
+      reuse_yahoo_chart_history:
+        description: "Reuse the latest validated Yahoo Chart baseline and fetch a recent delta (full mode only)"
+        required: true
+        default: false
+        type: boolean
   schedule:
     - cron: "17 20 * * 1-5"
       timezone: "America/New_York"
@@ -87,6 +92,7 @@ jobs:
           INPUT_PUBLISH: ${{ inputs.publish }}
           INPUT_ALLOW_DRIFT: ${{ inputs.allow_universe_drift }}
           INPUT_REFRESH_ENRICHMENT: ${{ inputs.refresh_enrichment }}
+          INPUT_REUSE_CHART_HISTORY: ${{ inputs.reuse_yahoo_chart_history }}
           RELEASES_ENABLED: ${{ vars.PRODUCTION_RELEASES_ENABLED }}
         run: |
           set -euo pipefail
@@ -99,7 +105,7 @@ jobs:
           requested_publish="${INPUT_PUBLISH:-false}"
           allow_drift="${INPUT_ALLOW_DRIFT:-false}"
           refresh_enrichment="${INPUT_REFRESH_ENRICHMENT:-false}"
-          reuse_chart_history="false"
+          reuse_chart_history="${INPUT_REUSE_CHART_HISTORY:-false}"
 
           if [[ "$EVENT_NAME" == "schedule" ]]; then
             mode="full"
@@ -118,11 +124,18 @@ jobs:
               echo "Enrichment refresh is only valid in full mode" >&2
               exit 2
             fi
+            if [[ "$reuse_chart_history" == "true" ]]; then
+              echo "Yahoo Chart history reuse is only valid in full mode" >&2
+              exit 2
+            fi
             sessions="30"
             minimum_history="30"
             only_tickers="AAPL,MSFT,BRK.B,NVDA,TSM"
             requested_publish="false"
             allow_drift="false"
+          elif [[ "$reuse_chart_history" != "true" && "$reuse_chart_history" != "false" ]]; then
+            echo "reuse_yahoo_chart_history must be true or false" >&2
+            exit 2
           elif [[ "$mode" != "full" ]]; then
             echo "Unsupported mode: $mode" >&2
             exit 2
