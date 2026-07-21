@@ -99,6 +99,7 @@ jobs:
           requested_publish="${INPUT_PUBLISH:-false}"
           allow_drift="${INPUT_ALLOW_DRIFT:-false}"
           refresh_enrichment="${INPUT_REFRESH_ENRICHMENT:-false}"
+          reuse_chart_history="false"
 
           if [[ "$EVENT_NAME" == "schedule" ]]; then
             mode="full"
@@ -110,6 +111,7 @@ jobs:
               refresh_enrichment="true"
             else
               refresh_enrichment="false"
+              reuse_chart_history="true"
             fi
           elif [[ "$mode" == "smoke" ]]; then
             if [[ "$refresh_enrichment" == "true" ]]; then
@@ -153,6 +155,7 @@ jobs:
           echo "publish=$requested_publish" >> "$GITHUB_OUTPUT"
           echo "allow_drift=$allow_drift" >> "$GITHUB_OUTPUT"
           echo "refresh_enrichment=$refresh_enrichment" >> "$GITHUB_OUTPUT"
+          echo "reuse_chart_history=$reuse_chart_history" >> "$GITHUB_OUTPUT"
           echo "artifact_name=market-data-${GITHUB_RUN_ID}" >> "$GITHUB_OUTPUT"
           echo "tag=market-data-$(date -u +%Y%m%dT%H%M%SZ)" >> "$GITHUB_OUTPUT"
 
@@ -208,10 +211,51 @@ jobs:
           fi
           python build-security-universe.py "${args[@]}"
 
+      - name: Download validated Yahoo Chart history baseline
+        id: previous_chart
+        if: steps.inputs.outputs.reuse_chart_history == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          release_dir="$RUNNER_TEMP/previous-chart-history"
+          metadata="$RUNNER_TEMP/previous-chart-release.json"
+          mkdir -p "$release_dir"
+          gh api \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/${GITHUB_REPOSITORY}/releases/latest" > "$metadata"
+          python verify-github-release.py --metadata "$metadata"
+          tag="$(jq -r '.tag_name' "$metadata")"
+          gh release download "$tag" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir "$release_dir" \
+            --pattern manifest.json \
+            --pattern yahoo-ohlcv-320.parquet \
+            --pattern yahoo-splits.parquet
+          python - "$release_dir" <<'PY'
+          import hashlib
+          import json
+          import sys
+          from pathlib import Path
+
+          directory = Path(sys.argv[1])
+          manifest = json.loads((directory / "manifest.json").read_text())
+          records = {item["file"]: item for item in manifest["release_files"]}
+          for name in ("yahoo-ohlcv-320.parquet", "yahoo-splits.parquet"):
+              path = directory / name
+              actual = hashlib.sha256(path.read_bytes()).hexdigest()
+              if records.get(name, {}).get("sha256") != actual:
+                  raise SystemExit(f"Previous {name} hash does not match manifest")
+          PY
+          echo "dir=$release_dir" >> "$GITHUB_OUTPUT"
+
       - name: Build compact aggregate
         shell: bash
         env:
           MODE: ${{ steps.inputs.outputs.mode }}
+          PREVIOUS_CHART_DIR: ${{ steps.previous_chart.outputs.dir }}
         run: |
           set -euo pipefail
           args=(
@@ -226,7 +270,14 @@ jobs:
             --cutoff-date "${{ steps.inputs.outputs.cutoff }}"
           )
           if [[ "$MODE" == "full" ]]; then
-            args+=(--yahoo-chart-supplement --yahoo-chart-workers 2)
+            args+=(--yahoo-chart-supplement --yahoo-chart-workers 4)
+            if [[ -n "$PREVIOUS_CHART_DIR" ]]; then
+              args+=(
+                --previous-aggregate "$PREVIOUS_CHART_DIR/yahoo-ohlcv-320.parquet"
+                --previous-splits "$PREVIOUS_CHART_DIR/yahoo-splits.parquet"
+                --yahoo-chart-lookback-days 14
+              )
+            fi
           fi
           "${args[@]}"
 

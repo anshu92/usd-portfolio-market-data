@@ -172,7 +172,10 @@ dispatched:
   `PRODUCTION_RELEASES_ENABLED=true`;
 - scheduled builds publish only when the same variable is true;
 - weekday scheduled builds reuse the latest fully validated immutable enrichment
-  snapshot and have a 24-minute build budget plus a 5-minute publish budget;
+  snapshot and Yahoo Chart history baseline, then replace the prior 14 calendar days
+  of Chart-backed observations with a fresh Yahoo delta. This keeps ETF/ADR history
+  complete while retaining current-session freshness within the 24-minute build
+  budget plus a 5-minute publish budget;
 - Saturday scheduled builds set `refresh_enrichment=true` and perform the slower
   official SEC/FINRA rebuild with a six-hour ceiling; this weekly cadence captures SEC
   filing/fundamental changes and FINRA's semi-monthly updates without paying the

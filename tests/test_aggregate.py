@@ -102,6 +102,93 @@ def test_admitted_etf_is_loaded_for_yahoo_history(aggregate_module, tmp_path):
     ]
 
 
+def test_reuses_prior_chart_history_only_when_snapshot_lacks_symbol(
+    aggregate_module, tmp_path
+):
+    prior = tmp_path / "prior.parquet"
+    con = duckdb.connect()
+    try:
+        con.execute(
+            """CREATE TABLE prior AS SELECT * FROM (VALUES
+              ('BATS:MAGS', 'MAGS', 'MAGS', DATE '2024-01-10', 10.0, 11.0, 9.0, 10.5, 1000::BIGINT,
+               'Yahoo Finance Chart API', 'response-sha', '2024-01-11T00:00:00Z')
+            ) AS t(security_id, ticker, source_symbol, session_date, open, high, low, close, volume,
+                     source_dataset, source_revision, observed_at_utc)"""
+        )
+        con.execute("COPY prior TO ? (FORMAT PARQUET)", [str(prior)])
+        con.execute("CREATE TEMP TABLE aliases(security_id VARCHAR, ticker VARCHAR, source_symbol VARCHAR, priority INTEGER)")
+        con.execute("INSERT INTO aliases VALUES ('BATS:MAGS', 'MAGS', 'MAGS', 0)")
+        con.execute("""CREATE TEMP TABLE price_source AS
+                     SELECT source_symbol, session_date, open, high, low, close, volume,
+                            source_dataset, source_revision, observed_at_utc
+                     FROM prior WHERE false""")
+        con.execute("CREATE TEMP TABLE split_source(source_symbol VARCHAR, event_date DATE, split_factor VARCHAR, source_dataset VARCHAR, source_revision VARCHAR, observed_at_utc VARCHAR)")
+        con.execute("CREATE TEMP TABLE price_dedup AS SELECT * FROM price_source")
+        con.execute("CREATE TEMP TABLE split_dedup AS SELECT * FROM split_source")
+        aggregate_module.append_previous_chart_history(
+            con, aggregate_path=prior, splits_path=None,
+            cutoff=aggregate_module.parse_date("2024-01-10"),
+        )
+        assert con.execute("SELECT count(*) FROM price_source").fetchone()[0] == 1
+    finally:
+        con.close()
+
+
+def test_chart_delta_replaces_overlapping_cached_observation(
+    aggregate_module, monkeypatch
+):
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return json.dumps(
+                {
+                    "chart": {
+                        "result": [
+                            {
+                                "timestamp": [1704844800],
+                                "indicators": {
+                                    "quote": [
+                                        {
+                                            "open": [11.0], "high": [12.0],
+                                            "low": [10.0], "close": [11.5],
+                                            "volume": [1001],
+                                        }
+                                    ]
+                                },
+                            }
+                        ]
+                    }
+                }
+            ).encode()
+
+    monkeypatch.setattr(aggregate_module.urllib.request, "urlopen", lambda *_args, **_kwargs: Response())
+    con = duckdb.connect()
+    try:
+        con.execute("CREATE TEMP TABLE aliases(security_id VARCHAR, ticker VARCHAR, source_symbol VARCHAR, priority INTEGER)")
+        con.execute("INSERT INTO aliases VALUES ('BATS:MAGS', 'MAGS', 'MAGS', 0)")
+        con.execute("""CREATE TEMP TABLE price_source AS SELECT * FROM (VALUES
+          ('MAGS', DATE '2024-01-10', 10.0::DOUBLE, 11.0::DOUBLE, 9.0::DOUBLE,
+           10.5::DOUBLE, 1000::BIGINT,
+           'Yahoo Finance Chart API', 'old-sha', '2024-01-10T00:00:00Z')
+        ) AS t(source_symbol, session_date, open, high, low, close, volume,
+               source_dataset, source_revision, observed_at_utc)""")
+        con.execute("CREATE TEMP TABLE split_source(source_symbol VARCHAR, event_date DATE, split_factor VARCHAR, source_dataset VARCHAR, source_revision VARCHAR, observed_at_utc VARCHAR)")
+        con.execute("CREATE TEMP TABLE price_dedup AS SELECT DISTINCT * FROM price_source")
+        con.execute("CREATE TEMP TABLE split_dedup AS SELECT DISTINCT * FROM split_source")
+        aggregate_module.supplement_missing_yahoo_chart_history(
+            con, cutoff=aggregate_module.parse_date("2024-01-10"), workers=1,
+            lookback_days=14,
+        )
+        assert con.execute("SELECT close, volume, count(*) FROM price_source GROUP BY ALL").fetchall() == [(11.5, 1001, 1)]
+    finally:
+        con.close()
+
+
 def test_conflicting_source_rows_fail(aggregate_module, aggregate_inputs, tmp_path):
     con = duckdb.connect()
     try:

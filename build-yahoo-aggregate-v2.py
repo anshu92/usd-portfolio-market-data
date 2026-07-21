@@ -570,8 +570,64 @@ def prepare_split_source(
     return identical_duplicates
 
 
+def append_previous_chart_history(
+    con: duckdb.DuckDBPyConnection,
+    *,
+    aggregate_path: Path,
+    splits_path: Path | None,
+    cutoff: date,
+) -> None:
+    """Reuse only Yahoo Chart rows absent from the immutable snapshot.
+
+    The previous release is verified by the workflow before it is supplied here.
+    Keeping the snapshot rows authoritative lets a weekday run avoid re-downloading
+    multi-year ETF history while retaining a complete 320-session window.
+    """
+    validate_source_schema(
+        con, aggregate_path, set(OHLCV_SCHEMA), "Previous aggregate"
+    )
+    con.execute(
+        """
+        INSERT INTO price_source
+        SELECT p.source_symbol, p.session_date, p.open, p.high, p.low, p.close,
+               p.volume, p.source_dataset, p.source_revision, p.observed_at_utc
+        FROM read_parquet(?) p
+        JOIN (SELECT DISTINCT source_symbol FROM aliases) a USING (source_symbol)
+        WHERE p.source_dataset = 'Yahoo Finance Chart API'
+          AND p.session_date <= cast(? AS DATE)
+          AND NOT EXISTS (
+            SELECT 1 FROM price_source current
+            WHERE current.source_symbol = p.source_symbol
+          )
+        """,
+        [str(aggregate_path), cutoff.isoformat()],
+    )
+    if splits_path is not None:
+        validate_source_schema(con, splits_path, set(SPLIT_SCHEMA), "Previous splits")
+        con.execute(
+            """
+            INSERT INTO split_source
+            SELECT p.source_symbol, p.event_date, p.split_factor, p.source_dataset,
+                   p.source_revision, p.observed_at_utc
+            FROM read_parquet(?) p
+            JOIN (SELECT DISTINCT source_symbol FROM aliases) a USING (source_symbol)
+            WHERE p.source_dataset = 'Yahoo Finance Chart API'
+              AND p.event_date <= cast(? AS DATE)
+              AND NOT EXISTS (
+                SELECT 1 FROM split_source current
+                WHERE current.source_symbol = p.source_symbol
+              )
+            """,
+            [str(splits_path), cutoff.isoformat()],
+        )
+    con.execute("DROP TABLE price_dedup")
+    con.execute("CREATE TEMP TABLE price_dedup AS SELECT DISTINCT * FROM price_source")
+    con.execute("DROP TABLE split_dedup")
+    con.execute("CREATE TEMP TABLE split_dedup AS SELECT DISTINCT * FROM split_source")
+
+
 def supplement_missing_yahoo_chart_history(
-    con: duckdb.DuckDBPyConnection, *, cutoff: date, workers: int
+    con: duckdb.DuckDBPyConnection, *, cutoff: date, workers: int, lookback_days: int
 ) -> dict[str, object]:
     """Fill source-symbol gaps from Yahoo's chart endpoint with row provenance.
 
@@ -583,8 +639,11 @@ def supplement_missing_yahoo_chart_history(
             """
             SELECT DISTINCT a.security_id, a.source_symbol FROM aliases a
             WHERE NOT EXISTS (
-              SELECT 1 FROM price_source p WHERE p.source_symbol = a.source_symbol
-            ) ORDER BY a.security_id, a.priority
+                    SELECT 1 FROM price_source p
+                    WHERE p.source_symbol = a.source_symbol
+                      AND p.source_dataset != 'Yahoo Finance Chart API'
+                  )
+            ORDER BY a.security_id, a.priority
             """
         ).fetchall()
     ]
@@ -599,7 +658,7 @@ def supplement_missing_yahoo_chart_history(
             url = (
                 "https://query2.finance.yahoo.com/v8/finance/chart/"
                 + urllib.parse.quote(symbol, safe="")
-                + "?period1=" + str(int(datetime.combine(cutoff - timedelta(days=730), datetime.min.time(), timezone.utc).timestamp()))
+                + "?period1=" + str(int(datetime.combine(cutoff - timedelta(days=lookback_days), datetime.min.time(), timezone.utc).timestamp()))
                 + "&period2=" + str(int(datetime.combine(cutoff + timedelta(days=1), datetime.min.time(), timezone.utc).timestamp()))
                 + "&interval=1d&events=history,split"
             )
@@ -658,9 +717,21 @@ def supplement_missing_yahoo_chart_history(
         response_records.append({"security_id": security_id, "source_symbol": symbol, "sha256": digest, "observed_at_utc": observed})
     if price_records:
         con.executemany("INSERT INTO yahoo_chart_supplement VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", price_records)
+        con.execute(
+            """DELETE FROM price_source USING yahoo_chart_supplement refresh
+               WHERE price_source.source_symbol = refresh.source_symbol
+                 AND price_source.session_date = refresh.session_date
+                 AND price_source.source_dataset = 'Yahoo Finance Chart API'"""
+        )
         con.execute("INSERT INTO price_source SELECT * FROM yahoo_chart_supplement")
     if split_records:
         con.executemany("INSERT INTO yahoo_chart_splits VALUES (?, ?, ?, ?, ?, ?)", split_records)
+        con.execute(
+            """DELETE FROM split_source USING yahoo_chart_splits refresh
+               WHERE split_source.source_symbol = refresh.source_symbol
+                 AND split_source.event_date = refresh.event_date
+                 AND split_source.source_dataset = 'Yahoo Finance Chart API'"""
+        )
         con.execute("INSERT INTO split_source SELECT * FROM yahoo_chart_splits")
     # Re-deduplicate after adding non-overlapping supplemental observations.
     con.execute("DROP TABLE price_dedup")
@@ -777,10 +848,24 @@ def build(args: argparse.Namespace) -> tuple[dict[str, object], int]:
             con, splits_path, cutoff, dataset=args.source_repo,
             revision=splits_revision, observed_at=observed_text,
         )
+        if args.previous_aggregate:
+            previous_aggregate = Path(args.previous_aggregate).resolve()
+            previous_splits = (
+                Path(args.previous_splits).resolve() if args.previous_splits else None
+            )
+            append_previous_chart_history(
+                con,
+                aggregate_path=previous_aggregate,
+                splits_path=previous_splits,
+                cutoff=cutoff,
+            )
         chart_supplement: dict[str, object] | None = None
         if args.yahoo_chart_supplement:
             chart_supplement = supplement_missing_yahoo_chart_history(
-                con, cutoff=cutoff, workers=args.yahoo_chart_workers
+                con,
+                cutoff=cutoff,
+                workers=args.yahoo_chart_workers,
+                lookback_days=args.yahoo_chart_lookback_days,
             )
         expected_session = expected_latest_session(cutoff)
         (
@@ -1142,12 +1227,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--source-revision", default="main")
     parser.add_argument("--prices-file")
     parser.add_argument("--splits-file")
+    parser.add_argument("--previous-aggregate")
+    parser.add_argument("--previous-splits")
     parser.add_argument("--cache-dir", default=".hf-cache")
     parser.add_argument(
         "--yahoo-chart-supplement", action="store_true",
         help="Fetch missing immutable-snapshot symbols from Yahoo's chart API",
     )
     parser.add_argument("--yahoo-chart-workers", type=int, default=2)
+    parser.add_argument("--yahoo-chart-lookback-days", type=int, default=730)
     parser.add_argument("--observed-at", help="RFC3339 UTC timestamp; defaults to now")
     args = parser.parse_args(argv)
 
@@ -1165,6 +1253,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--minimum-systemic-session-securities must be positive")
     if args.yahoo_chart_workers <= 0 or args.yahoo_chart_workers > 16:
         parser.error("--yahoo-chart-workers must be in [1, 16]")
+    if args.yahoo_chart_lookback_days <= 0:
+        parser.error("--yahoo-chart-lookback-days must be positive")
     if not (0 < args.systemic_invalid_session_rate <= 1):
         parser.error("--systemic-invalid-session-rate must be in (0, 1]")
     for name in ("minimum_coverage", "minimum_adequate_history_coverage"):
