@@ -887,15 +887,25 @@ def build(args: argparse.Namespace) -> tuple[dict[str, object], int]:
                 args.minimum_systemic_session_securities
             ),
         )
+        invalid_candidate_rows = int(
+            con.execute(
+                f"""
+                SELECT count(*) FROM price_candidate p
+                JOIN active_security_ids a USING (security_id)
+                LEFT JOIN quarantined_price_sessions q USING (session_date)
+                WHERE q.session_date IS NULL AND ({PRICE_INVALID_SQL})
+                """
+            ).fetchone()[0]
+        )
 
-        aggregate_query = """
+        aggregate_query = f"""
           SELECT p.security_id, p.ticker, p.source_symbol, p.session_date,
                  p.open, p.high, p.low, p.close, p.volume,
                  p.source_dataset, p.source_revision, p.observed_at_utc
           FROM price_candidate p
           JOIN active_security_ids a USING (security_id)
           LEFT JOIN quarantined_price_sessions q USING (session_date)
-          WHERE q.session_date IS NULL
+          WHERE q.session_date IS NULL AND NOT ({PRICE_INVALID_SQL})
           ORDER BY p.ticker, p.session_date
         """
         atomic_copy_to_parquet(
@@ -1019,6 +1029,10 @@ def build(args: argparse.Namespace) -> tuple[dict[str, object], int]:
         if split_duplicate_count:
             warnings.append(
                 f"Collapsed {split_duplicate_count} byte-identical split rows"
+            )
+        if invalid_candidate_rows:
+            warnings.append(
+                f"Excluded {invalid_candidate_rows} invalid OHLC source rows"
             )
         if stale_source_rows:
             warnings.append(
@@ -1196,6 +1210,7 @@ def build(args: argparse.Namespace) -> tuple[dict[str, object], int]:
                             quarantined_session_rows
                         )
                     ],
+                    "excluded_invalid_rows": invalid_candidate_rows,
                 },
             },
         }

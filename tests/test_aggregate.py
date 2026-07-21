@@ -255,6 +255,29 @@ def test_invalid_matched_ohlcv_fails(aggregate_module, aggregate_inputs, tmp_pat
     )
 
 
+def test_single_invalid_source_row_is_excluded(aggregate_module, aggregate_inputs, tmp_path):
+    con = duckdb.connect()
+    invalid = tmp_path / "single-invalid.parquet"
+    try:
+        con.execute(
+            "CREATE TABLE invalid AS SELECT * FROM read_parquet(?)",
+            [str(aggregate_inputs["prices"])],
+        )
+        con.execute(
+            """UPDATE invalid SET high = low - 1
+               WHERE symbol = 'AAPL' AND report_date = '2024-01-10'"""
+        )
+        con.execute("COPY invalid TO ? (FORMAT PARQUET)", [str(invalid)])
+    finally:
+        con.close()
+    aggregate_inputs["prices"] = invalid
+    out_dir = tmp_path / "dist-single-invalid"
+    assert aggregate_module.main(build_args(aggregate_inputs, out_dir)) == 0
+    manifest = json.loads((out_dir / "manifest.json").read_text())
+    assert manifest["source"]["quality"]["excluded_invalid_rows"] == 1
+    assert any("Excluded 1 invalid OHLC source rows" in warning for warning in manifest["validation"]["warnings"])
+
+
 def test_systemic_invalid_session_is_quarantined(
     aggregate_module, aggregate_inputs, tmp_path
 ):
