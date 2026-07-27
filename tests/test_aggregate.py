@@ -4,6 +4,7 @@ import csv
 import hashlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import duckdb
 
@@ -230,6 +231,49 @@ def test_immutable_source_revision_skips_mutable_api_resolution(
 
     assert path == source
     assert resolved == revision
+
+
+def test_mutable_source_revision_retries_rate_limit(
+    aggregate_module, monkeypatch, tmp_path
+):
+    source = tmp_path / "source.parquet"
+    source.write_bytes(b"fixture")
+    calls = 0
+
+    class RetryableError(OSError):
+        def __init__(self):
+            self.response = SimpleNamespace(status_code=429, headers={})
+
+    class Api:
+        def dataset_info(self, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RetryableError()
+            return SimpleNamespace(
+                sha="12b2f27287cf71face14cc2e2e1b5cef0d640182"
+            )
+
+    monkeypatch.setattr(aggregate_module, "HfHubHTTPError", RetryableError)
+    monkeypatch.setattr(aggregate_module, "HfApi", Api)
+    monkeypatch.setattr(aggregate_module.time, "sleep", lambda delay: None)
+    monkeypatch.setattr(
+        aggregate_module,
+        "hf_hub_download",
+        lambda **kwargs: str(source),
+    )
+
+    path, resolved = aggregate_module.resolve_source_file(
+        repo_id="example/dataset",
+        revision="main",
+        filename="data/example.parquet",
+        local_override=None,
+        cache_dir=tmp_path / "cache",
+    )
+
+    assert calls == 2
+    assert path == source
+    assert resolved == "12b2f27287cf71face14cc2e2e1b5cef0d640182"
 
 
 def test_reuses_prior_chart_history_only_when_snapshot_lacks_symbol(

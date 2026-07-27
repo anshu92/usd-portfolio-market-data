@@ -25,6 +25,7 @@ from typing import Iterable
 import duckdb
 import exchange_calendars as xcals
 from huggingface_hub import HfApi, hf_hub_download
+from huggingface_hub.errors import HfHubHTTPError
 
 
 DEFAULT_REPO = "defeatbeta/yahoo-finance-data"
@@ -229,8 +230,18 @@ def resolve_source_file(
     # strengthening the source pin.
     resolved_revision = revision
     if re.fullmatch(r"[0-9a-fA-F]{40}", revision) is None:
-        info = HfApi().dataset_info(repo_id=repo_id, revision=revision)
-        resolved_revision = str(info.sha or revision)
+        for attempt in range(5):
+            try:
+                info = HfApi().dataset_info(repo_id=repo_id, revision=revision)
+                resolved_revision = str(info.sha or revision)
+                break
+            except HfHubHTTPError as exc:
+                status = exc.response.status_code
+                if attempt == 4 or (status != 429 and status < 500):
+                    raise
+                retry_after = exc.response.headers.get("retry-after")
+                delay = float(retry_after) if retry_after else float(2**attempt)
+                time.sleep(min(delay, 60.0))
     path = Path(
         hf_hub_download(
             repo_id=repo_id,
