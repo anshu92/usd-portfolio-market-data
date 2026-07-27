@@ -436,6 +436,7 @@ def test_official_archive_registry_and_workflow_headers() -> None:
     assert "github.event.schedule == '17 20 * * 1-5' && 24 || 360" in workflow
     assert "github.event.schedule == '17 20 * * 1-5' && 5 || 15" in workflow
     assert "reuse-enrichment-snapshot.py" in workflow
+    assert '--current-manifest dist/manifest.json' in workflow
     assert "reuse_chart_history" in workflow
     assert "Download validated Yahoo Chart history baseline" in workflow
     assert "--previous-aggregate" in workflow

@@ -405,7 +405,7 @@ jobs:
           candidate="$RUNNER_TEMP/candidate-release"
           if [[ "$REFRESH_ENRICHMENT" != "true" && "$MARKET_CANDIDATE_OUTCOME" == "success" ]]; then
             python reuse-enrichment-snapshot.py \
-              --current-manifest "$candidate/manifest.json" \
+              --current-manifest dist/manifest.json \
               --previous-release "$RUNNER_TEMP/previous-release" \
               --out-dir dist \
               --source-tag "${{ steps.previous_enrichment.outputs.tag }}"
