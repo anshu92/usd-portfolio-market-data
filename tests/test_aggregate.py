@@ -276,6 +276,49 @@ def test_mutable_source_revision_retries_rate_limit(
     assert resolved == "12b2f27287cf71face14cc2e2e1b5cef0d640182"
 
 
+def test_price_candidates_exclude_rows_after_expected_market_session(
+    aggregate_module,
+):
+    con = duckdb.connect()
+    try:
+        con.execute(
+            "CREATE TEMP TABLE aliases(security_id VARCHAR, ticker VARCHAR, "
+            "source_symbol VARCHAR, priority INTEGER)"
+        )
+        con.execute("INSERT INTO aliases VALUES ('XNAS:AAPL', 'AAPL', 'AAPL', 0)")
+        con.execute(
+            """CREATE TEMP TABLE price_dedup AS SELECT * FROM (VALUES
+              ('AAPL', DATE '2024-01-12', 100.0, 102.0, 99.0, 101.0,
+               1000::BIGINT, 'fixture', 'revision', '2024-01-15T00:00:00Z'),
+              ('AAPL', DATE '2024-01-14', 101.0, 103.0, 100.0, 102.0,
+               1100::BIGINT, 'fixture', 'revision', '2024-01-15T00:00:00Z')
+            ) AS t(source_symbol, session_date, open, high, low, close, volume,
+                   source_dataset, source_revision, observed_at_utc)"""
+        )
+        con.execute(
+            "CREATE TEMP TABLE split_dedup(source_symbol VARCHAR, event_date DATE, "
+            "split_factor VARCHAR, source_dataset VARCHAR, source_revision VARCHAR, "
+            "observed_at_utc VARCHAR)"
+        )
+
+        aggregate_module.prepare_price_candidates(
+            con,
+            sessions=320,
+            expected_session=aggregate_module.parse_date("2024-01-12"),
+            maximum_security_staleness_sessions=5,
+            maximum_source_gap_days=14,
+            source_reuse_price_ratio=4.0,
+            systemic_invalid_session_rate=0.01,
+            minimum_systemic_session_securities=100,
+        )
+
+        assert con.execute(
+            "SELECT max(session_date) FROM price_candidate"
+        ).fetchone()[0] == aggregate_module.parse_date("2024-01-12")
+    finally:
+        con.close()
+
+
 def test_reuses_prior_chart_history_only_when_snapshot_lacks_symbol(
     aggregate_module, tmp_path
 ):

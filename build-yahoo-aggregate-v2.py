@@ -368,6 +368,7 @@ def prepare_price_candidates(
                  ) AS alias_rank
           FROM price_dedup p
           JOIN aliases a ON p.source_symbol = a.source_symbol
+          WHERE p.session_date <= cast(? AS DATE)
         ), best_alias AS (
           SELECT * EXCLUDE(alias_rank) FROM matched WHERE alias_rank = 1
         ), with_previous AS (
@@ -436,7 +437,12 @@ def prepare_price_candidates(
         )
         SELECT * FROM ranked WHERE history_rank <= ?
         """,
-        [maximum_source_gap_days, source_reuse_price_ratio, sessions],
+        [
+            expected_session.isoformat(),
+            maximum_source_gap_days,
+            source_reuse_price_ratio,
+            sessions,
+        ],
     )
 
     calendar = xcals.get_calendar("XNYS")
