@@ -109,11 +109,15 @@ def test_export_workflow_is_read_only_and_sha_pinned():
         / ".github/workflows/publish-consumer-pointer.yml"
     ).read_text(encoding="utf-8")
     assert "workflow_run:" in pointer_workflow
+    assert "workflow_dispatch:" in pointer_workflow
     assert "github.event.workflow_run.conclusion == 'success'" in pointer_workflow
     assert "actions: read\n      contents: write" in pointer_workflow
     assert "verify-consumer-pointer.py" in pointer_workflow
     assert "consumer/latest-production-artifact.json" in pointer_workflow
     assert "actions/artifacts/${artifact_id}" in pointer_workflow
+    assert ".workflow_id == 314869492" in pointer_workflow
+    assert "steps.artifact.outputs.run_id" in pointer_workflow
+    assert "gh workflow run publish-consumer-pointer.yml" in workflow
     for line in (workflow + pointer_workflow).splitlines():
         if "uses:" in line:
             reference = line.split("uses:", 1)[1].split("#", 1)[0].strip()

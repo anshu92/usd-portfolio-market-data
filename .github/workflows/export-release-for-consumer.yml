@@ -14,6 +14,9 @@ jobs:
   export:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    permissions:
+      actions: write
+      contents: read
     outputs:
       artifact_digest: ${{ steps.upload.outputs['artifact-digest'] }}
       artifact_id: ${{ steps.upload.outputs['artifact-id'] }}
@@ -125,3 +128,12 @@ jobs:
           compression-level: 0
           retention-days: 30
           if-no-files-found: error
+
+      - name: Dispatch validated pointer publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run publish-consumer-pointer.yml \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref main \
+            -f export_run_id="$GITHUB_RUN_ID"

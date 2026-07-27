@@ -4,6 +4,12 @@ on:
   workflow_run:
     workflows: ["Export validated market-data release"]
     types: [completed]
+  workflow_dispatch:
+    inputs:
+      export_run_id:
+        description: "Successful Export validated market-data release run"
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -14,7 +20,7 @@ concurrency:
 
 jobs:
   publish_pointer:
-    if: github.event.workflow_run.conclusion == 'success'
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -24,7 +30,7 @@ jobs:
       - name: Check out the producer commit used by export
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          ref: ${{ github.event.workflow_run.head_sha }}
+          ref: main
           persist-credentials: false
 
       - name: Set up Python
@@ -41,7 +47,7 @@ jobs:
         id: artifact
         shell: bash
         env:
-          EXPORT_RUN_ID: ${{ github.event.workflow_run.id }}
+          EXPORT_RUN_ID: ${{ github.event.workflow_run.id || inputs.export_run_id }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
@@ -50,6 +56,13 @@ jobs:
             -H 'X-GitHub-Api-Version: 2026-03-10' \
             "repos/${GITHUB_REPOSITORY}/actions/runs/${EXPORT_RUN_ID}" \
             > "$RUNNER_TEMP/run.json"
+          jq -e --arg repo "$GITHUB_REPOSITORY" '
+            .workflow_id == 314869492 and
+            .head_repository.full_name == $repo and
+            .head_branch == "main" and
+            .status == "completed" and
+            .conclusion == "success"
+          ' "$RUNNER_TEMP/run.json" >/dev/null
           gh api \
             -H 'Accept: application/vnd.github+json' \
             -H 'X-GitHub-Api-Version: 2026-03-10' \
@@ -68,6 +81,7 @@ jobs:
             "repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}" \
             > "$RUNNER_TEMP/artifact.json"
           echo "artifact_name=$artifact_name" >> "$GITHUB_OUTPUT"
+          echo "run_id=$EXPORT_RUN_ID" >> "$GITHUB_OUTPUT"
 
       - name: Download the exact completed-run artifact
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -75,7 +89,7 @@ jobs:
           name: ${{ steps.artifact.outputs.artifact_name }}
           path: staging/release
           repository: ${{ github.repository }}
-          run-id: ${{ github.event.workflow_run.id }}
+          run-id: ${{ steps.artifact.outputs.run_id }}
           github-token: ${{ github.token }}
           digest-mismatch: error
 
