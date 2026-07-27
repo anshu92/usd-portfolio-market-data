@@ -376,6 +376,38 @@ def test_offline_enrichment_build_is_point_in_time_safe(
     verify_module.verify(root, require_ready=True, require_production=False)
 
 
+def test_enrichment_groups_are_manifested_for_quarantined_market_candidate(
+    enrichment_module, enrichment_inputs: dict[str, Path]
+) -> None:
+    manifest_path = enrichment_inputs["manifest"]
+    manifest = json.loads(manifest_path.read_text())
+    manifest["status"] = "VALIDATION_FAILED"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    root = enrichment_inputs["root"]
+
+    assert enrichment_module.main(
+        [
+            "--universe", str(enrichment_inputs["universe"]),
+            "--prices", str(enrichment_inputs["prices"]),
+            "--manifest", str(manifest_path),
+            "--companyfacts", str(enrichment_inputs["companyfacts"]),
+            "--submissions", str(enrichment_inputs["submissions"]),
+            "--insider-archive", str(enrichment_inputs["insider"]),
+            "--form13f-archive", str(enrichment_inputs["form13f"]),
+            "--finra-file", str(enrichment_inputs["finra"]),
+            "--out-dir", str(root),
+            "--cutoff-date", "2026-07-17",
+            "--retrieved-at", "2026-07-17T12:00:00Z",
+        ]
+    ) == 0
+
+    result = json.loads(manifest_path.read_text())
+    assert result["status"] == "VALIDATION_FAILED"
+    assert set(CONTRACTS) <= {
+        record["file"] for record in result["release_files"]
+    }
+
+
 def test_finra_rejects_publication_before_settlement(
     enrichment_module, tmp_path: Path
 ) -> None:

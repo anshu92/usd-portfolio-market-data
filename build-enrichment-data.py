@@ -2071,8 +2071,6 @@ def merge_manifest(
     insider_diagnostics: Mapping[str, object],
 ) -> None:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if manifest.get("status") != "READY":
-        raise EnrichmentError("Cannot enrich a market manifest that is not READY")
     event_fields = {
         "sec-company-facts.parquet": "period_end",
         "normalized-fundamentals-quarterly.parquet": "period_end",
