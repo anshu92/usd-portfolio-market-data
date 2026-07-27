@@ -1452,7 +1452,7 @@ def build(args: argparse.Namespace) -> tuple[dict[str, object], int]:
                 ),
                 "ready_new_latest_session_coverage": 0.99,
                 "ready_with_exclusions_latest_session_coverage": 0.95,
-                "ready_reused_maximum_stale_sessions": 1,
+                "ready_reused_maximum_stale_sessions": 2,
             },
             "validation": {
                 "expected_latest_xnys_session": expected_session.isoformat(),

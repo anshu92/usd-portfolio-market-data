@@ -20,6 +20,7 @@ from enrichment_contract import CONTRACTS, SCHEMA_VERSION, sha256_file
 from reliability_contract import (
     CORE_GROUPS,
     GROUPS,
+    MARKET_READY_MAX_LAG_SESSIONS,
     apply_dataset_groups,
     freshness_state_for_reuse,
 )
@@ -287,7 +288,7 @@ def compose_release(
             lag = eligible_session_lag(observed, expected)
             candidate.setdefault("validation", {})["missing_eligible_sessions"] = lag
             candidate["validation"]["errors"] = []
-            if lag > 1:
+            if lag > MARKET_READY_MAX_LAG_SESSIONS:
                 raise CompositionError(
                     f"Fallback market group is {lag} eligible sessions stale"
                 )

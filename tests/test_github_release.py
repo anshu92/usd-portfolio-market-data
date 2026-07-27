@@ -163,6 +163,27 @@ def test_production_publish_dispatches_consumer_export():
     assert "gh workflow run export-release-for-consumer.yml" in workflow
 
 
+def test_recovery_workflow_is_bounded_and_trusts_only_production_artifacts():
+    workflow = (
+        Path(__file__).resolve().parents[1]
+        / ".github/workflows/recover-market-data-release.yml"
+    ).read_text(encoding="utf-8")
+    assert "timeout-minutes: 20" in workflow
+    assert "timeout-minutes: 10" in workflow
+    assert ".workflow_id == 314836103" in workflow
+    assert '.head_branch == "main"' in workflow
+    assert "run-id: ${{ inputs.source_run_id }}" in workflow
+    assert "actions: write\n      contents: write" in workflow
+    assert (
+        "python verify-release.py --dist dist --require-ready --require-production"
+        in workflow
+    )
+    for line in workflow.splitlines():
+        if "uses:" in line:
+            reference = line.split("uses:", 1)[1].split("#", 1)[0].strip()
+            assert re_full_sha_reference(reference), reference
+
+
 def re_full_sha_reference(reference: str) -> bool:
     owner_action, separator, revision = reference.rpartition("@")
     return bool(owner_action and separator and len(revision) == 40) and all(

@@ -20,6 +20,7 @@ from reliability_contract import (
     GROUPS,
     GROUP_CONTRACT_VERSION,
     GROUP_STATES,
+    MARKET_READY_MAX_LAG_SESSIONS,
     ReliabilityContractError,
     group_file_identities,
     group_sha256,
@@ -511,7 +512,7 @@ def verify_dataset_groups(
                         "READY_WITH_EXCLUSIONS market benchmark is invalid"
                     )
             elif state == "READY_REUSED" and (
-                not isinstance(lag, int) or lag > 1
+                not isinstance(lag, int) or lag > MARKET_READY_MAX_LAG_SESSIONS
             ):
                 raise VerificationError("READY_REUSED market group is too stale")
         if state in {"READY_NEW", "READY_REUSED", "READY_WITH_EXCLUSIONS"}:

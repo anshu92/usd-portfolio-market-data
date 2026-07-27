@@ -1,0 +1,163 @@
+name: Recover validated market-data release
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: "Completed Build portfolio market-data release run containing the candidate artifact"
+        required: true
+        type: string
+      publish:
+        description: "Publish the recovered candidate after production verification"
+        required: true
+        default: false
+        type: boolean
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      artifact_name: ${{ steps.identity.outputs.artifact_name }}
+      publish: ${{ steps.identity.outputs.publish }}
+      tag: ${{ steps.identity.outputs.tag }}
+    steps:
+      - name: Check out trusted verifier
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.13.14"
+          cache: pip
+          cache-dependency-path: requirements-market-data.txt
+
+      - name: Install reviewed dependencies
+        run: python -m pip install --disable-pip-version-check --require-hashes -r requirements-market-data.txt
+
+      - name: Validate source-run identity
+        id: identity
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          REQUESTED_PUBLISH: ${{ inputs.publish }}
+          RELEASES_ENABLED: ${{ vars.PRODUCTION_RELEASES_ENABLED }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_RUN_ID" =~ ^[0-9]+$ ]] || { echo "source_run_id must be numeric" >&2; exit 2; }
+          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}" > "$RUNNER_TEMP/source-run.json"
+          jq -e --arg repo "$GITHUB_REPOSITORY" '
+            .workflow_id == 314836103 and
+            .head_repository.full_name == $repo and
+            .head_branch == "main" and
+            (.event == "workflow_dispatch" or .event == "schedule") and
+            .status == "completed"
+          ' "$RUNNER_TEMP/source-run.json" >/dev/null
+          if [[ "$REQUESTED_PUBLISH" == "true" && "${RELEASES_ENABLED:-false}" != "true" ]]; then
+            echo "Set PRODUCTION_RELEASES_ENABLED=true before publication" >&2
+            exit 2
+          fi
+          echo "artifact_name=recovered-market-data-${GITHUB_RUN_ID}" >> "$GITHUB_OUTPUT"
+          echo "publish=$REQUESTED_PUBLISH" >> "$GITHUB_OUTPUT"
+          echo "tag=market-data-$(date -u +%Y%m%dT%H%M%SZ)" >> "$GITHUB_OUTPUT"
+
+      - name: Download trusted candidate artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: market-data-${{ inputs.source_run_id }}
+          path: candidate
+          run-id: ${{ inputs.source_run_id }}
+          github-token: ${{ github.token }}
+          digest-mismatch: error
+
+      - name: Download and verify immutable fallback release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir previous-release
+          gh api -H 'Accept: application/vnd.github+json' \
+            "repos/${GITHUB_REPOSITORY}/releases/latest" > "$RUNNER_TEMP/previous-release.json"
+          python verify-github-release.py --metadata "$RUNNER_TEMP/previous-release.json"
+          tag="$(jq -r '.tag_name' "$RUNNER_TEMP/previous-release.json")"
+          gh release download "$tag" --repo "$GITHUB_REPOSITORY" --dir previous-release
+          python verify-github-release.py --metadata "$RUNNER_TEMP/previous-release.json" --dist previous-release
+          echo "$tag" > "$RUNNER_TEMP/source-tag"
+
+      - name: Compose and verify recovered release
+        run: |
+          set -euo pipefail
+          source_tag="$(cat "$RUNNER_TEMP/source-tag")"
+          mkdir dist
+          python compose-release.py \
+            --candidate candidate \
+            --previous-release previous-release \
+            --out-dir dist \
+            --source-tag "$source_tag"
+          python verify-release.py --dist dist --require-ready --require-production
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          manifest = json.loads(Path("dist/manifest.json").read_text())
+          Path("dist/release-notes.md").write_text(
+              "Validated recovery composition from a trusted same-repository production artifact.\n\n"
+              f"- Cutoff: {manifest['cutoff_date']}\n"
+              f"- Status: {manifest['status']}\n"
+              f"- Candidate group failures: {len(manifest.get('candidate_group_failures', []))}\n\n"
+              "Historical research only; see NOTICE.md for attribution.\n",
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Upload validated recovery artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.identity.outputs.artifact_name }}
+          path: dist
+          retention-days: 7
+          compression-level: 0
+
+  publish:
+    needs: recover
+    if: needs.recover.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: write
+      contents: write
+    steps:
+      - name: Check out trusted verifier
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.13.14"
+          cache: pip
+          cache-dependency-path: requirements-market-data.txt
+      - name: Install reviewed dependencies
+        run: python -m pip install --disable-pip-version-check --require-hashes -r requirements-market-data.txt
+      - name: Download same-run validated artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ needs.recover.outputs.artifact_name }}
+          path: dist
+          digest-mismatch: error
+      - name: Reverify and publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.recover.outputs.tag }}
+        run: |
+          set -euo pipefail
+          python verify-release.py --dist dist --require-ready --require-production
+          assets=(dist/NOTICE.md dist/*.parquet dist/security-universe.csv dist/unmatched-tickers.csv dist/manifest.json)
+          gh release create "$TAG" "${assets[@]}" --draft \
+            --title "Portfolio market data $TAG" --notes-file dist/release-notes.md
+          gh release edit "$TAG" --draft=false --latest
+          gh workflow run export-release-for-consumer.yml --repo "$GITHUB_REPOSITORY" --ref main

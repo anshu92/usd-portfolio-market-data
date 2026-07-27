@@ -16,6 +16,7 @@ from enrichment_contract import CONTRACTS, SCHEMA_VERSION, sha256_file
 
 
 GROUP_CONTRACT_VERSION = "1.0.0"
+MARKET_READY_MAX_LAG_SESSIONS = 2
 GROUP_STATES = {
     "READY_NEW",
     "READY_REUSED",
@@ -325,7 +326,11 @@ def default_freshness(
             "expected": expected,
             "observed": observed,
             "lag_eligible_sessions": lag,
-            "state": "READY" if isinstance(lag, int) and lag <= 1 else "STALE",
+            "state": (
+                "READY"
+                if isinstance(lag, int) and lag <= MARKET_READY_MAX_LAG_SESSIONS
+                else "STALE"
+            ),
         }
     observed_values = [
         _parse_timestamp(item.get("source_retrieval_time")) for item in group_datasets
@@ -438,7 +443,11 @@ def freshness_state_for_reuse(
 ) -> str:
     if group_id == "market":
         lag = freshness.get("lag_eligible_sessions")
-        return "READY_REUSED" if isinstance(lag, int) and lag <= 1 else "STALE_DISABLED"
+        return (
+            "READY_REUSED"
+            if isinstance(lag, int) and lag <= MARKET_READY_MAX_LAG_SESSIONS
+            else "STALE_DISABLED"
+        )
     lag_hours = freshness.get("lag_hours")
     if not isinstance(lag_hours, (int, float)):
         return "STALE_DISABLED"

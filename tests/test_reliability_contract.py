@@ -198,6 +198,17 @@ def test_stale_noncore_group_disables_only_its_dependents(
         con.close()
 
 
+def test_market_reuse_allows_documented_two_session_lag() -> None:
+    from reliability_contract import freshness_state_for_reuse
+
+    assert freshness_state_for_reuse(
+        "market", {"lag_eligible_sessions": 2}
+    ) == "READY_REUSED"
+    assert freshness_state_for_reuse(
+        "market", {"lag_eligible_sessions": 3}
+    ) == "STALE_DISABLED"
+
+
 def test_insider_resolution_is_cik_first_and_share_class_constrained(
     enrichment_module,
 ):
