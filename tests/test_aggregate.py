@@ -203,6 +203,35 @@ def test_admitted_etf_is_loaded_for_yahoo_history(aggregate_module, tmp_path):
     ]
 
 
+def test_immutable_source_revision_skips_mutable_api_resolution(
+    aggregate_module, monkeypatch, tmp_path
+):
+    source = tmp_path / "source.parquet"
+    source.write_bytes(b"fixture")
+    revision = "20876c9459acbc29a1ca5b84efb4508932a9179a"
+
+    def unexpected_api_call():
+        raise AssertionError("immutable revisions must not call HfApi")
+
+    monkeypatch.setattr(aggregate_module, "HfApi", unexpected_api_call)
+    monkeypatch.setattr(
+        aggregate_module,
+        "hf_hub_download",
+        lambda **kwargs: str(source),
+    )
+
+    path, resolved = aggregate_module.resolve_source_file(
+        repo_id="example/dataset",
+        revision=revision,
+        filename="data/example.parquet",
+        local_override=None,
+        cache_dir=tmp_path / "cache",
+    )
+
+    assert path == source
+    assert resolved == revision
+
+
 def test_reuses_prior_chart_history_only_when_snapshot_lacks_symbol(
     aggregate_module, tmp_path
 ):

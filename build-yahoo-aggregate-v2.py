@@ -9,6 +9,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import shutil
 import sys
 import time
@@ -222,8 +223,14 @@ def resolve_source_file(
         if not path.is_file():
             raise AggregateError(f"Source file does not exist: {path}")
         return path, "LOCAL_OVERRIDE"
-    info = HfApi().dataset_info(repo_id=repo_id, revision=revision)
-    resolved_revision = str(info.sha or revision)
+    # A revision copied from a previously validated manifest is already an
+    # immutable Hugging Face commit.  Do not resolve it through the mutable
+    # revision API again: that adds a rate-limited network dependency without
+    # strengthening the source pin.
+    resolved_revision = revision
+    if re.fullmatch(r"[0-9a-fA-F]{40}", revision) is None:
+        info = HfApi().dataset_info(repo_id=repo_id, revision=revision)
+        resolved_revision = str(info.sha or revision)
     path = Path(
         hf_hub_download(
             repo_id=repo_id,

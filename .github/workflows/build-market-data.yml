@@ -263,6 +263,12 @@ jobs:
                   raise SystemExit(f"Previous {name} hash does not match manifest")
           PY
           echo "dir=$release_dir" >> "$GITHUB_OUTPUT"
+          source_revision="$(jq -r '.source.revision' "$release_dir/manifest.json")"
+          if ! [[ "$source_revision" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "Previous release has no immutable Hugging Face source revision" >&2
+            exit 2
+          fi
+          echo "source_revision=$source_revision" >> "$GITHUB_OUTPUT"
 
       - name: Build compact aggregate
         id: market_candidate
@@ -271,6 +277,7 @@ jobs:
         env:
           MODE: ${{ steps.inputs.outputs.mode }}
           PREVIOUS_CHART_DIR: ${{ steps.previous_chart.outputs.dir }}
+          PREVIOUS_SOURCE_REVISION: ${{ steps.previous_chart.outputs.source_revision }}
         run: |
           set -euo pipefail
           args=(
@@ -293,6 +300,7 @@ jobs:
             )
             if [[ -n "$PREVIOUS_CHART_DIR" ]]; then
               args+=(
+                --source-revision "$PREVIOUS_SOURCE_REVISION"
                 --previous-aggregate "$PREVIOUS_CHART_DIR/yahoo-ohlcv-320.parquet"
                 --previous-splits "$PREVIOUS_CHART_DIR/yahoo-splits.parquet"
                 --yahoo-chart-lookback-days 14
