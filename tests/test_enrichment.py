@@ -441,6 +441,10 @@ def test_official_archive_registry_and_workflow_headers() -> None:
     assert "--previous-aggregate" in workflow
     assert "--yahoo-chart-workers 4" in workflow
     assert "--yahoo-chart-lookback-days 14" in workflow
+    assert "continue-on-error: ${{ steps.inputs.outputs.mode == 'full' }}" in workflow
+    assert 'candidate="$RUNNER_TEMP/candidate-release"' in workflow
+    assert "python compose-release.py" in workflow
+    assert "quarantined-candidates-${{ github.run_id }}" in workflow
     assert (
         "steps.inputs.outputs.mode == 'full' && "
         "steps.inputs.outputs.refresh_enrichment == 'true'"
@@ -481,7 +485,20 @@ def test_daily_build_reuses_validated_snapshot_and_adds_new_admissions(
     prices = daily / "yahoo-ohlcv-320.parquet"
     splits = daily / "yahoo-splits.parquet"
     shutil.copyfile(enrichment_inputs["prices"], prices)
-    shutil.copyfile(enrichment_inputs["prices"], splits)
+    con = duckdb.connect()
+    try:
+        con.execute(
+            """
+            CREATE TABLE splits(
+              security_id VARCHAR, ticker VARCHAR, source_symbol VARCHAR,
+              event_date DATE, split_factor VARCHAR, source_dataset VARCHAR,
+              source_revision VARCHAR, observed_at_utc VARCHAR
+            )
+            """
+        )
+        con.execute("COPY splits TO ? (FORMAT PARQUET)", [str(splits)])
+    finally:
+        con.close()
 
     def release_record(path: Path, rows: int) -> dict[str, object]:
         return {
@@ -555,7 +572,7 @@ def test_daily_build_reuses_validated_snapshot_and_adds_new_admissions(
     )
 
 
-def test_sec_ticker_collision_uses_unique_latest_filer(
+def test_sec_ticker_collision_is_unresolved_without_reviewed_override(
     enrichment_module, tmp_path: Path
 ) -> None:
     def submission(cik: int, accession: str, filing_date: str) -> dict[str, object]:
@@ -596,12 +613,25 @@ def test_sec_ticker_collision_uses_unique_latest_filer(
         date(2026, 7, 17),
         datetime(2026, 7, 17, 12, 0),
     )
-    assert masters[0]["cik"] == "0000000002"
-    assert masters[0]["mapping_status"] == "LATEST_SEC_FILING_TICKER_COLLISION"
-    assert [row["accession_number"] for row in filings] == [
+    assert masters[0]["cik"] is None
+    assert masters[0]["mapping_status"] == "UNRESOLVED_CIK_IDENTITY_CONFLICT"
+    assert filings == []
+    assert cik_mapping == {}
+
+    reviewed, reviewed_filings, _, reviewed_mapping = enrichment_module.parse_submissions(
+        archive,
+        {"AAPL": "XNAS:AAPL"},
+        {"XNAS:AAPL": {"ticker": "AAPL", "exchange_mic": "XNAS"}},
+        date(2026, 7, 17),
+        datetime(2026, 7, 17, 12, 0),
+        cik_overrides={"XNAS:AAPL": "0000000002"},
+    )
+    assert reviewed[0]["cik"] == "0000000002"
+    assert reviewed[0]["mapping_status"] == "REVIEWED_EFFECTIVE_DATED_OVERRIDE"
+    assert [row["accession_number"] for row in reviewed_filings] == [
         "0000000002-26-000001"
     ]
-    assert cik_mapping == {"0000000002": "XNAS:AAPL"}
+    assert reviewed_mapping == {"0000000002": "XNAS:AAPL"}
 
 
 def test_ownership_schedule_attaches_to_subject_not_filer(

@@ -8,6 +8,11 @@ transactions, credentials, or other private state.
 The output is historical research data, not a quote feed. Raw `close` is deliberately
 not described as adjusted close.
 
+Published production data is governed by the
+[producer reliability contract](PRODUCER_RELIABILITY_CONTRACT.md). The contract is
+enforced by the builders, group composer, release verifier, production workflow, and
+consumer export workflow; it is not documentation-only.
+
 ## Outputs
 
 A production release contains:
@@ -32,7 +37,8 @@ A production release contains:
 - `yahoo-splits.parquet`
 
 Consumers must download `manifest.json` first, require schema `1.0.0` and status
-`READY`, then validate every file's SHA-256, size, row count, and schema before use.
+`READY`, then validate every file's SHA-256, size, row count, schema, and deterministic
+`dataset_groups` identity before use.
 The manifest records source revisions and hashes, universe provenance and drift,
 coverage, history eligibility, XNYS-session freshness, and all warnings.
 

@@ -103,11 +103,18 @@ def test_export_workflow_is_read_only_and_sha_pinned():
     assert "verify-github-release.py" in workflow
     assert "verify-release.py" in workflow
     assert "--require-production" in workflow
-    assert "publish_pointer:" in workflow
-    assert "actions: read\n      contents: write" in workflow
-    assert "consumer/latest-production-artifact.json" in workflow
-    assert "actions/artifacts/${EXPECTED_ARTIFACT_ID}" in workflow
-    for line in workflow.splitlines():
+    assert "contents: write" not in workflow
+    pointer_workflow = (
+        Path(__file__).resolve().parents[1]
+        / ".github/workflows/publish-consumer-pointer.yml"
+    ).read_text(encoding="utf-8")
+    assert "workflow_run:" in pointer_workflow
+    assert "github.event.workflow_run.conclusion == 'success'" in pointer_workflow
+    assert "actions: read\n      contents: write" in pointer_workflow
+    assert "verify-consumer-pointer.py" in pointer_workflow
+    assert "consumer/latest-production-artifact.json" in pointer_workflow
+    assert "actions/artifacts/${artifact_id}" in pointer_workflow
+    for line in (workflow + pointer_workflow).splitlines():
         if "uses:" in line:
             reference = line.split("uses:", 1)[1].split("#", 1)[0].strip()
             assert re_full_sha_reference(reference), reference

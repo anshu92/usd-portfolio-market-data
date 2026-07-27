@@ -1,0 +1,156 @@
+name: Publish validated consumer artifact pointer
+
+on:
+  workflow_run:
+    workflows: ["Export validated market-data release"]
+    types: [completed]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-validated-consumer-pointer
+  cancel-in-progress: false
+
+jobs:
+  publish_pointer:
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Check out the producer commit used by export
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.13.14"
+          cache: pip
+          cache-dependency-path: requirements-market-data.txt
+
+      - name: Install reviewed dependencies
+        run: python -m pip install --disable-pip-version-check --require-hashes -r requirements-market-data.txt
+
+      - name: Resolve the completed export run and its single artifact
+        id: artifact
+        shell: bash
+        env:
+          EXPORT_RUN_ID: ${{ github.event.workflow_run.id }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${EXPORT_RUN_ID}" \
+            > "$RUNNER_TEMP/run.json"
+          gh api \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${EXPORT_RUN_ID}/artifacts" \
+            > "$RUNNER_TEMP/artifacts.json"
+          artifact_count="$(jq '[.artifacts[] | select(.name | startswith("validated-market-data-market-data-"))] | length' "$RUNNER_TEMP/artifacts.json")"
+          if [[ "$artifact_count" != "1" ]]; then
+            echo "Expected exactly one validated export artifact, found $artifact_count" >&2
+            exit 2
+          fi
+          artifact_id="$(jq -r '.artifacts[] | select(.name | startswith("validated-market-data-market-data-")) | .id' "$RUNNER_TEMP/artifacts.json")"
+          artifact_name="$(jq -r '.artifacts[] | select(.name | startswith("validated-market-data-market-data-")) | .name' "$RUNNER_TEMP/artifacts.json")"
+          gh api \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}" \
+            > "$RUNNER_TEMP/artifact.json"
+          echo "artifact_name=$artifact_name" >> "$GITHUB_OUTPUT"
+
+      - name: Download the exact completed-run artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ steps.artifact.outputs.artifact_name }}
+          path: staging/release
+          repository: ${{ github.repository }}
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+          digest-mismatch: error
+
+      - name: Resolve release metadata and validate all bytes and groups
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="$(tr -d '\r\n' < staging/release/resolved-tag.txt)"
+          gh api \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" \
+            > "$RUNNER_TEMP/release.json"
+          python verify-github-release.py \
+            --metadata "$RUNNER_TEMP/release.json" \
+            --dist staging/release
+          python verify-release.py \
+            --dist staging/release \
+            --require-ready \
+            --require-production
+
+      - name: Build and verify the exact consumer pointer
+        shell: bash
+        run: |
+          set -euo pipefail
+          manifest_sha256="$(sha256sum staging/release/manifest.json | awk '{print $1}')"
+          jq -n \
+            --arg manifest_sha256 "$manifest_sha256" \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --slurpfile artifact "$RUNNER_TEMP/artifact.json" \
+            --slurpfile run "$RUNNER_TEMP/run.json" \
+            --slurpfile release "$RUNNER_TEMP/release.json" \
+            '{
+              schema_version: "1.0.0",
+              repository: $repository,
+              release_tag: $release[0].tag_name,
+              workflow_run_id: $run[0].id,
+              artifact_id: $artifact[0].id,
+              artifact_name: $artifact[0].name,
+              artifact_sha256: ($artifact[0].digest | sub("^sha256:"; "")),
+              artifact_size_bytes: $artifact[0].size_in_bytes,
+              artifact_expires_at: $artifact[0].expires_at,
+              producer_commit: $run[0].head_sha,
+              manifest_sha256: $manifest_sha256,
+              release_immutable: $release[0].immutable,
+              generated_at_utc: (now | todateiso8601)
+            }' > "$RUNNER_TEMP/latest-production-artifact.json"
+          python verify-consumer-pointer.py \
+            --pointer "$RUNNER_TEMP/latest-production-artifact.json" \
+            --artifact-metadata "$RUNNER_TEMP/artifact.json" \
+            --run-metadata "$RUNNER_TEMP/run.json" \
+            --release-metadata "$RUNNER_TEMP/release.json" \
+            --artifact-dir staging/release
+
+      - name: Commit validated pointer
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          pointer_path="consumer/latest-production-artifact.json"
+          release_tag="$(jq -r '.release_tag' "$RUNNER_TEMP/latest-production-artifact.json")"
+          current_sha="$(gh api \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/${GITHUB_REPOSITORY}/contents/${pointer_path}?ref=main" \
+            --jq '.sha')"
+          content="$(base64 -w 0 "$RUNNER_TEMP/latest-production-artifact.json")"
+          gh api --method PUT \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/${GITHUB_REPOSITORY}/contents/${pointer_path}" \
+            -f branch=main \
+            -f content="$content" \
+            -f message="Update consumer artifact pointer for ${release_tag}" \
+            -f sha="$current_sha"

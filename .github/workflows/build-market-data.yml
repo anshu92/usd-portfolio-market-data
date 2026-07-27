@@ -265,6 +265,8 @@ jobs:
           echo "dir=$release_dir" >> "$GITHUB_OUTPUT"
 
       - name: Build compact aggregate
+        id: market_candidate
+        continue-on-error: ${{ steps.inputs.outputs.mode == 'full' }}
         shell: bash
         env:
           MODE: ${{ steps.inputs.outputs.mode }}
@@ -283,7 +285,12 @@ jobs:
             --cutoff-date "${{ steps.inputs.outputs.cutoff }}"
           )
           if [[ "$MODE" == "full" ]]; then
-            args+=(--yahoo-chart-supplement --yahoo-chart-workers 4)
+            args+=(
+              --yahoo-chart-supplement
+              --yahoo-chart-workers 4
+              --benchmark-ticker VTI
+              --require-benchmark
+            )
             if [[ -n "$PREVIOUS_CHART_DIR" ]]; then
               args+=(
                 --previous-aggregate "$PREVIOUS_CHART_DIR/yahoo-ohlcv-320.parquet"
@@ -326,7 +333,9 @@ jobs:
           done < <(jq -r '.form13f_archives[]' config/official-source-archives.json)
 
       - name: Build official-source enrichment assets
+        id: enrichment_candidate
         if: steps.inputs.outputs.mode == 'full' && steps.inputs.outputs.refresh_enrichment == 'true'
+        continue-on-error: true
         shell: bash
         run: |
           set -euo pipefail
@@ -349,9 +358,9 @@ jobs:
             --out-dir dist \
             --cutoff-date "${{ steps.inputs.outputs.cutoff }}"
 
-      - name: Download and validate previous enrichment snapshot
+      - name: Download and validate previous immutable release
         id: previous_enrichment
-        if: steps.inputs.outputs.mode == 'full' && steps.inputs.outputs.refresh_enrichment != 'true'
+        if: steps.inputs.outputs.mode == 'full'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -375,14 +384,39 @@ jobs:
             --dist "$release_dir"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
-      - name: Reuse validated enrichment snapshot
-        if: steps.inputs.outputs.mode == 'full' && steps.inputs.outputs.refresh_enrichment != 'true'
+      - name: Stage immutable candidate bytes
+        if: steps.inputs.outputs.mode == 'full'
+        shell: bash
         run: |
-          python reuse-enrichment-snapshot.py \
-            --current-manifest dist/manifest.json \
-            --previous-release "$RUNNER_TEMP/previous-release" \
-            --out-dir dist \
-            --source-tag "${{ steps.previous_enrichment.outputs.tag }}"
+          set -euo pipefail
+          candidate="$RUNNER_TEMP/candidate-release"
+          mkdir -p "$candidate"
+          cp -a dist/. "$candidate/"
+
+      - name: Compose validated dataset groups
+        id: group_composition
+        if: steps.inputs.outputs.mode == 'full'
+        shell: bash
+        env:
+          MARKET_CANDIDATE_OUTCOME: ${{ steps.market_candidate.outcome }}
+          REFRESH_ENRICHMENT: ${{ steps.inputs.outputs.refresh_enrichment }}
+        run: |
+          set -euo pipefail
+          candidate="$RUNNER_TEMP/candidate-release"
+          if [[ "$REFRESH_ENRICHMENT" != "true" && "$MARKET_CANDIDATE_OUTCOME" == "success" ]]; then
+            python reuse-enrichment-snapshot.py \
+              --current-manifest "$candidate/manifest.json" \
+              --previous-release "$RUNNER_TEMP/previous-release" \
+              --out-dir dist \
+              --source-tag "${{ steps.previous_enrichment.outputs.tag }}"
+          else
+            python compose-release.py \
+              --candidate "$candidate" \
+              --previous-release "$RUNNER_TEMP/previous-release" \
+              --out-dir dist \
+              --source-tag "${{ steps.previous_enrichment.outputs.tag }}"
+          fi
+          echo "failure_count=$(jq '.candidate_group_failures | length' dist/manifest.json)" >> "$GITHUB_OUTPUT"
 
       - name: Verify build output
         run: |
@@ -439,6 +473,16 @@ jobs:
           retention-days: 7
           compression-level: 0
 
+      - name: Upload quarantined candidate bytes
+        if: always() && steps.inputs.outputs.mode == 'full' && steps.group_composition.outputs.failure_count != '0'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: quarantined-candidates-${{ github.run_id }}
+          path: ${{ runner.temp }}/candidate-release
+          if-no-files-found: warn
+          retention-days: 7
+          compression-level: 0
+
   publish:
     needs: build
     if: needs.build.outputs.publish == 'true'
@@ -451,6 +495,7 @@ jobs:
       - name: Check out verifier
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
 
       - name: Set up Python

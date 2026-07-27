@@ -24,6 +24,7 @@ from enrichment_contract import (
     sha256_file,
     write_parquet,
 )
+from reliability_contract import apply_dataset_groups, freshness_state_for_reuse
 
 
 LEGACY_PRODUCTION_FILES = {
@@ -400,6 +401,55 @@ def reuse_snapshot(
         warnings.append(
             f"{unresolved_daily_admissions} admissions await SEC mapping at the next "
             "explicit enrichment refresh"
+        )
+
+    reused_groups = {
+        "fundamentals",
+        "filings_events",
+        "insiders",
+        "institutional",
+        "short_interest",
+    }
+    group_overrides: dict[str, dict[str, object]] = {
+        "identity": {"state": "READY_NEW", "mode": "COMPOSED_IDENTITY"},
+        "market": {
+            "state": str(current.get("market_candidate_state") or "READY_NEW"),
+            "mode": "FRESH_CANDIDATE",
+        },
+    }
+    for group_id in reused_groups:
+        group_overrides[group_id] = {
+            "state": "READY_REUSED",
+            "mode": "PINNED_IMMUTABLE_GROUP_REUSE",
+            "source_release_tag": source_tag,
+            "source_manifest_sha256": previous_manifest_sha256,
+        }
+    apply_dataset_groups(
+        current,
+        out_dir,
+        group_overrides=group_overrides,
+        candidate_group_failures=[],
+    )
+    previous_groups = {
+        str(record.get("group_id")): record
+        for record in previous.get("dataset_groups", [])
+        if isinstance(record, dict)
+    }
+    for record in current["dataset_groups"]:
+        group_id = str(record.get("group_id") or "")
+        if group_id not in reused_groups:
+            continue
+        source_group_sha = (
+            previous_groups.get(group_id, {}).get("group_sha256")
+            or record["group_sha256"]
+        )
+        if source_group_sha != record["group_sha256"]:
+            raise SnapshotReuseError(
+                f"Reused group digest differs from {source_tag}: {group_id}"
+            )
+        record["source_group_sha256"] = source_group_sha
+        record["state"] = freshness_state_for_reuse(
+            group_id, record["freshness"]
         )
 
     temporary = current_manifest_path.with_suffix(".json.snapshot.tmp")

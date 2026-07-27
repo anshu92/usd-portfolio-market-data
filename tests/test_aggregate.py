@@ -1,10 +1,111 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 from pathlib import Path
 
 import duckdb
+
+
+def test_two_percent_invalid_latest_rows_are_excluded_without_losing_session(
+    aggregate_module, monkeypatch, tmp_path: Path
+):
+    universe = tmp_path / "security-universe.csv"
+    symbols = ["VTI", *(f"S{index:03d}" for index in range(99))]
+    universe.write_text(
+        "security_id,ticker,universe_admission_status\n"
+        + "".join(f"XNAS:{symbol},{symbol},ADMITTED\n" for symbol in symbols),
+        encoding="utf-8",
+    )
+    metadata = tmp_path / "security-universe.metadata.json"
+    metadata.write_text(
+        json.dumps(
+            {
+                "schema_version": "1.0.0",
+                "status": "READY",
+                "sha256": hashlib.sha256(universe.read_bytes()).hexdigest(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    prices = tmp_path / "prices.parquet"
+    splits = tmp_path / "splits.parquet"
+    con = duckdb.connect()
+    try:
+        con.execute(
+            "CREATE TABLE prices(symbol VARCHAR, report_date VARCHAR, "
+            "open DOUBLE, high DOUBLE, low DOUBLE, close DOUBLE, volume BIGINT)"
+        )
+        rows = []
+        for index, symbol in enumerate(symbols):
+            base = 50.0 + index
+            for day, offset in (("2024-01-08", 0.0), ("2024-01-09", 1.0)):
+                rows.append(
+                    (symbol, day, base + offset, base + offset + 1, base + offset - 1,
+                     base + offset + 0.5, 1000 + index)
+                )
+            invalid = index >= 98
+            rows.append(
+                (symbol, "2024-01-10", -1.0 if invalid else base + 2,
+                 base + 3, base + 1, base + 2.5, 1100 + index)
+            )
+        con.executemany("INSERT INTO prices VALUES (?, ?, ?, ?, ?, ?, ?)", rows)
+        con.execute("COPY prices TO ? (FORMAT PARQUET)", [str(prices)])
+        con.execute(
+            "CREATE TABLE splits(symbol VARCHAR, report_date VARCHAR, split_factor VARCHAR)"
+        )
+        con.execute("COPY splits TO ? (FORMAT PARQUET)", [str(splits)])
+    finally:
+        con.close()
+
+    monkeypatch.setattr(
+        aggregate_module,
+        "supplement_missing_yahoo_chart_history",
+        lambda *args, **kwargs: {"requested_symbols": [], "responses": [], "failures": []},
+    )
+    monkeypatch.setattr(
+        aggregate_module,
+        "repair_invalid_yahoo_chart_rows",
+        lambda *args, **kwargs: {
+            "requested_rows": 2,
+            "repaired_rows": 0,
+            "responses": [],
+            "failures": ["S097:2024-01-10", "S098:2024-01-10"],
+        },
+    )
+    out_dir = tmp_path / "dist"
+    exit_code = aggregate_module.main(
+        [
+            "--universe", str(universe),
+            "--universe-metadata", str(metadata),
+            "--out-dir", str(out_dir),
+            "--prices-file", str(prices),
+            "--splits-file", str(splits),
+            "--sessions", "3",
+            "--minimum-history", "2",
+            "--minimum-coverage", "1.0",
+            "--minimum-adequate-history-coverage", "1.0",
+            "--cutoff-date", "2024-01-10",
+            "--observed-at", "2024-01-11T01:00:00Z",
+            "--yahoo-chart-supplement",
+            "--require-benchmark",
+        ]
+    )
+    assert exit_code == 0
+    manifest = json.loads((out_dir / "manifest.json").read_text())
+    assert manifest["market_candidate_state"] == "READY_WITH_EXCLUSIONS"
+    assert manifest["validation"]["latest_session_coverage"] == 0.98
+    assert len(manifest["source"]["quality"]["unresolved_invalid_rows"]) == 2
+    con = duckdb.connect()
+    try:
+        latest_rows = con.execute(
+            "SELECT count(*) FROM read_parquet(?) WHERE session_date = DATE '2024-01-10'",
+            [str(out_dir / "yahoo-ohlcv-3.parquet")],
+        ).fetchone()[0]
+    finally:
+        con.close()
+    assert latest_rows == 98
 
 
 def build_args(inputs, out_dir: Path, *extra: str):
@@ -255,7 +356,9 @@ def test_invalid_matched_ohlcv_fails(aggregate_module, aggregate_inputs, tmp_pat
     )
 
 
-def test_single_invalid_source_row_is_excluded(aggregate_module, aggregate_inputs, tmp_path):
+def test_below_95_percent_latest_coverage_is_quarantined(
+    aggregate_module, aggregate_inputs, tmp_path
+):
     con = duckdb.connect()
     invalid = tmp_path / "single-invalid.parquet"
     try:
@@ -272,9 +375,11 @@ def test_single_invalid_source_row_is_excluded(aggregate_module, aggregate_input
         con.close()
     aggregate_inputs["prices"] = invalid
     out_dir = tmp_path / "dist-single-invalid"
-    assert aggregate_module.main(build_args(aggregate_inputs, out_dir)) == 0
+    assert aggregate_module.main(build_args(aggregate_inputs, out_dir)) == 2
     manifest = json.loads((out_dir / "manifest.json").read_text())
+    assert manifest["market_candidate_state"] == "QUARANTINED"
     assert manifest["source"]["quality"]["excluded_invalid_rows"] == 1
+    assert manifest["source"]["quality"]["latest_session"]["valid_coverage"] == 0.5
     assert any("Excluded 1 invalid OHLC source rows" in warning for warning in manifest["validation"]["warnings"])
 
 
@@ -304,19 +409,14 @@ def test_systemic_invalid_session_is_quarantined(
             "2",
         )
     )
-    assert exit_code == 0
+    assert exit_code == 2
     manifest = json.loads((out_dir / "manifest.json").read_text())
-    assert manifest["status"] == "READY"
+    assert manifest["status"] == "VALIDATION_FAILED"
+    assert manifest["market_candidate_state"] == "QUARANTINED"
     assert manifest["aggregate"]["rows"] == 4
     assert manifest["aggregate"]["max_date"] == "2024-01-09"
-    assert manifest["source"]["quality"]["quarantined_sessions"] == [
-        {
-            "session_date": "2024-01-10",
-            "invalid_rows": 2,
-            "total_rows": 2,
-            "invalid_rate": 1.0,
-        }
-    ]
+    assert manifest["source"]["quality"]["excluded_invalid_rows"] == 2
+    assert len(manifest["source"]["quality"]["unresolved_invalid_rows"]) == 2
 
 
 def test_stale_source_history_is_unmatched(
@@ -476,5 +576,6 @@ def test_freshness_warning_and_holiday_calendar(
     )
     assert exit_code == 2
     manifest = json.loads((out_dir / "manifest.json").read_text())
-    assert manifest["status"] == "STALE_WARNING"
+    assert manifest["status"] == "VALIDATION_FAILED"
+    assert manifest["market_candidate_state"] == "QUARANTINED"
     assert manifest["validation"]["missing_eligible_sessions"] == 3

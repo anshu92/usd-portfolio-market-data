@@ -14,6 +14,16 @@ from pathlib import Path
 import duckdb
 
 from enrichment_contract import CONTRACTS
+from reliability_contract import (
+    CORE_GROUPS,
+    FILE_TO_GROUP,
+    GROUPS,
+    GROUP_CONTRACT_VERSION,
+    GROUP_STATES,
+    ReliabilityContractError,
+    group_file_identities,
+    group_sha256,
+)
 
 
 SCHEMA_VERSION = "1.0.0"
@@ -100,6 +110,26 @@ def _parquet_columns(
 
 def _count(con: duckdb.DuckDBPyConnection, sql: str, path: Path) -> int:
     return int(con.execute(sql, [str(path)]).fetchone()[0])
+
+
+def insider_cik_violation_count(
+    con: duckdb.DuckDBPyConnection, insider_path: Path, master_path: Path
+) -> int:
+    return int(
+        con.execute(
+            """
+            SELECT count(*)
+            FROM read_parquet(?) insider
+            LEFT JOIN read_parquet(?) master USING (security_id)
+            WHERE master.security_id IS NULL
+               OR master.cik IS NULL
+               OR NOT regexp_full_match(master.cik, '[0-9]{10}')
+               OR lpad(regexp_replace(cast(insider.issuer_cik AS VARCHAR),
+                                      '[^0-9]', '', 'g'), 10, '0') <> master.cik
+            """,
+            [str(insider_path), str(master_path)],
+        ).fetchone()[0]
+    )
 
 
 def verify_enrichment(
@@ -262,6 +292,23 @@ def verify_enrichment(
     if _count(
         con,
         "SELECT count(*) FROM read_parquet(?) "
+        "WHERE cik IS NOT NULL AND NOT regexp_full_match(cik, '[0-9]{10}')",
+        master_path,
+    ):
+        raise VerificationError("Security master contains a non-canonical CIK")
+    insider_cik_violations = insider_cik_violation_count(
+        con,
+        directory / "insider-transactions.parquet",
+        master_path,
+    )
+    if insider_cik_violations:
+        raise VerificationError(
+            "Insider canonical-CIK join contains "
+            f"{insider_cik_violations} violations"
+        )
+    if _count(
+        con,
+        "SELECT count(*) FROM read_parquet(?) "
         "WHERE accession_number IS NULL OR source_document_url IS NULL",
         directory / "corporate-events.parquet",
     ):
@@ -315,6 +362,206 @@ def verify_enrichment(
         raise VerificationError("Unexpected analyst-estimates status")
 
 
+def verify_dataset_groups(
+    con: duckdb.DuckDBPyConnection,
+    directory: Path,
+    manifest: dict[str, object],
+    *,
+    require_production: bool,
+) -> None:
+    raw_datasets = manifest.get("datasets")
+    raw_groups = manifest.get("dataset_groups")
+    if not isinstance(raw_groups, list):
+        if require_production:
+            raise VerificationError("Production manifest has no dataset_groups")
+        return
+    if not isinstance(raw_datasets, list):
+        raise VerificationError("Grouped manifest has no datasets")
+    datasets: dict[str, dict[str, object]] = {}
+    for raw in raw_datasets:
+        if not isinstance(raw, dict):
+            raise VerificationError("datasets contains a non-object")
+        filename = str(raw.get("path") or "")
+        if filename in datasets:
+            raise VerificationError(f"Duplicate dataset identity: {filename}")
+        datasets[filename] = raw
+        expected_group = FILE_TO_GROUP.get(filename)
+        if expected_group is None or raw.get("group_id") != expected_group:
+            raise VerificationError(f"Invalid dataset group assignment: {filename}")
+        path = directory / filename
+        if not path.is_file():
+            raise VerificationError(f"Grouped dataset file is missing: {filename}")
+        if raw.get("logical_columns") != [
+            item.get("name")
+            for item in raw.get("physical_schema", [])
+            if isinstance(item, dict)
+        ]:
+            raise VerificationError(f"Logical/physical schema mismatch: {filename}")
+        actual = _parquet_columns(con, path) if path.suffix == ".parquet" else None
+        if actual is not None and raw.get("physical_schema") != [
+            {"name": name, "type": sql_type} for name, sql_type in actual
+        ]:
+            raise VerificationError(f"Physical schema mismatch: {filename}")
+        if not isinstance(raw.get("nullability_policy"), dict):
+            raise VerificationError(f"Missing nullability policy: {filename}")
+        required_dataset_fields = {
+            "schema_version",
+            "sha256",
+            "byte_size",
+            "row_count",
+            "primary_key",
+            "source_name",
+            "immutable_source_revision",
+            "source_retrieval_time",
+            "point_in_time_safe",
+            "validation_result",
+        }
+        if not required_dataset_fields <= set(raw):
+            raise VerificationError(f"Incomplete dataset identity: {filename}")
+        if raw.get("validation_result") != "PASS":
+            raise VerificationError(f"Dataset validation did not pass: {filename}")
+
+    groups: dict[str, dict[str, object]] = {}
+    for raw in raw_groups:
+        if not isinstance(raw, dict):
+            raise VerificationError("dataset_groups contains a non-object")
+        group_id = str(raw.get("group_id") or "")
+        if group_id in groups or group_id not in GROUPS:
+            raise VerificationError(f"Unknown or duplicate dataset group: {group_id}")
+        groups[group_id] = raw
+    if set(groups) != set(GROUPS):
+        raise VerificationError("dataset_groups does not cover the group contract")
+
+    for group_id, contract in GROUPS.items():
+        record = groups[group_id]
+        state = str(record.get("state") or "")
+        if record.get("group_contract_version") != GROUP_CONTRACT_VERSION:
+            raise VerificationError(f"Unsupported group contract: {group_id}")
+        if state not in GROUP_STATES:
+            raise VerificationError(f"Invalid group state: {group_id}:{state}")
+        expected_files = [] if state == "NOT_CONFIGURED" else sorted(contract.files)
+        if record.get("files") != expected_files:
+            raise VerificationError(f"Group file set mismatch: {group_id}")
+        if state == "NOT_CONFIGURED":
+            if not contract.optional or record.get("group_sha256") is not None:
+                raise VerificationError(f"Required group is NOT_CONFIGURED: {group_id}")
+            continue
+        identities = group_file_identities(contract, datasets)
+        actual_digest = group_sha256(identities)
+        if record.get("group_sha256") != actual_digest:
+            raise VerificationError(f"Group digest mismatch: {group_id}")
+        for key in (
+            "freshness",
+            "validation_errors",
+            "validation_warnings",
+            "exclusions",
+            "dependencies",
+            "dependency_group_identities",
+        ):
+            if key not in record:
+                raise VerificationError(f"Group {group_id} lacks {key}")
+        if record.get("dependencies") != list(contract.dependencies):
+            raise VerificationError(f"Group dependencies mismatch: {group_id}")
+        freshness = record.get("freshness")
+        if not isinstance(freshness, dict) or not {
+            "expected",
+            "observed",
+            "state",
+        } <= set(freshness):
+            raise VerificationError(f"Group freshness is incomplete: {group_id}")
+        if state == "READY_REUSED":
+            for key in (
+                "source_release_tag",
+                "source_manifest_sha256",
+                "source_group_sha256",
+            ):
+                if not record.get(key):
+                    raise VerificationError(f"Reused group lacks {key}: {group_id}")
+            if record.get("source_group_sha256") != actual_digest:
+                raise VerificationError(f"Reused group bytes changed: {group_id}")
+        if group_id == "market":
+            lag = freshness.get("lag_eligible_sessions")
+            if state == "READY_NEW":
+                if lag != 0 or float(
+                    (manifest.get("validation") or {}).get(
+                        "latest_session_coverage", 0.0
+                    )
+                ) < 0.99:
+                    raise VerificationError(
+                        "READY_NEW market group misses freshness/coverage threshold"
+                    )
+                if require_production and (
+                    (manifest.get("validation") or {}).get("benchmark_valid") is not True
+                ):
+                    raise VerificationError("READY_NEW market benchmark is invalid")
+            elif state == "READY_WITH_EXCLUSIONS":
+                coverage = float(
+                    (manifest.get("validation") or {}).get(
+                        "latest_session_coverage", 0.0
+                    )
+                )
+                if lag != 0 or coverage < 0.95 or not record.get("exclusions"):
+                    raise VerificationError(
+                        "READY_WITH_EXCLUSIONS market group violates threshold"
+                    )
+                if require_production and (
+                    (manifest.get("validation") or {}).get("benchmark_valid") is not True
+                ):
+                    raise VerificationError(
+                        "READY_WITH_EXCLUSIONS market benchmark is invalid"
+                    )
+            elif state == "READY_REUSED" and (
+                not isinstance(lag, int) or lag > 1
+            ):
+                raise VerificationError("READY_REUSED market group is too stale")
+        if state in {"READY_NEW", "READY_REUSED", "READY_WITH_EXCLUSIONS"}:
+            if record.get("validation_errors"):
+                raise VerificationError(f"Usable group has validation errors: {group_id}")
+        if group_id in CORE_GROUPS and state not in {
+            "READY_NEW",
+            "READY_REUSED",
+            "READY_WITH_EXCLUSIONS",
+        }:
+            raise VerificationError(f"Core group is not usable: {group_id}")
+
+    for group_id, record in groups.items():
+        if record.get("state") not in {
+            "READY_NEW",
+            "READY_REUSED",
+            "READY_WITH_EXCLUSIONS",
+        }:
+            continue
+        dependency_ids = record.get("dependency_group_identities")
+        if not isinstance(dependency_ids, dict):
+            raise VerificationError(f"Dependency identities are invalid: {group_id}")
+        for dependency in GROUPS[group_id].dependencies:
+            dependency_record = groups[dependency]
+            if dependency_record.get("state") not in {
+                "READY_NEW",
+                "READY_REUSED",
+                "READY_WITH_EXCLUSIONS",
+            }:
+                raise VerificationError(
+                    f"Usable group {group_id} has disabled dependency {dependency}"
+                )
+            if dependency_ids.get(dependency) != dependency_record.get("group_sha256"):
+                raise VerificationError(
+                    f"Dependency identity mismatch: {group_id}->{dependency}"
+                )
+
+    failures = manifest.get("candidate_group_failures")
+    if not isinstance(failures, list):
+        raise VerificationError("Manifest lacks candidate_group_failures")
+    for failure in failures:
+        if (
+            not isinstance(failure, dict)
+            or failure.get("state") != "QUARANTINED"
+            or failure.get("group_id") not in GROUPS
+            or not isinstance(failure.get("diagnostics"), list)
+        ):
+            raise VerificationError("Invalid quarantined candidate diagnostics")
+
+
 def verify(directory: Path, require_ready: bool, require_production: bool) -> dict[str, object]:
     manifest_path = directory / "manifest.json"
     if not manifest_path.is_file():
@@ -349,6 +596,9 @@ def verify(directory: Path, require_ready: bool, require_production: bool) -> di
         verify_enrichment(
             con, directory, manifest, require_production=require_production
         )
+        verify_dataset_groups(
+            con, directory, manifest, require_production=require_production
+        )
     finally:
         con.close()
     return manifest
@@ -364,7 +614,13 @@ def main(argv: list[str] | None = None) -> int:
         manifest = verify(
             Path(args.dist).resolve(), args.require_ready, args.require_production
         )
-    except (VerificationError, OSError, duckdb.Error, ValueError) as exc:
+    except (
+        VerificationError,
+        ReliabilityContractError,
+        OSError,
+        duckdb.Error,
+        ValueError,
+    ) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     print(

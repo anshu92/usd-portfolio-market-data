@@ -20,7 +20,7 @@ import zipfile
 from collections import defaultdict
 from datetime import date, datetime, time as datetime_time, timedelta, timezone
 from pathlib import Path
-from typing import Iterable, Iterator, Mapping
+from typing import Iterable, Iterator, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
 import duckdb
@@ -33,6 +33,7 @@ from enrichment_contract import (
     sha256_file,
     write_parquet,
 )
+from reliability_contract import apply_dataset_groups
 
 
 ACCESSION_PATTERN = re.compile(r"^[0-9]{10}-[0-9]{2}-[0-9]{6}$")
@@ -301,6 +302,75 @@ def resolve_ticker(ticker: str, ticker_to_id: Mapping[str, str]) -> str | None:
     return next(iter(matches)) if matches else None
 
 
+def load_security_cik_overrides(
+    path: Path,
+    universe: Mapping[str, Mapping[str, str]],
+    cutoff: date,
+) -> dict[str, str]:
+    """Load reviewed, effective-dated identity decisions without overlap."""
+    required = {
+        "security_id",
+        "cik",
+        "effective_from",
+        "effective_to",
+        "source_url",
+        "reviewed_at_utc",
+    }
+    if not path.is_file():
+        raise EnrichmentError(f"Security-CIK override registry is missing: {path}")
+    by_security: dict[str, list[tuple[date, date | None, str]]] = defaultdict(list)
+    with path.open(newline="", encoding="utf-8-sig") as handle:
+        reader = csv.DictReader(handle)
+        if not required.issubset(reader.fieldnames or []):
+            raise EnrichmentError("Security-CIK override registry schema is incomplete")
+        for line_number, raw in enumerate(reader, start=2):
+            security_id = str(raw.get("security_id") or "").strip()
+            if security_id not in universe:
+                raise EnrichmentError(
+                    f"Security-CIK override line {line_number} has unknown security_id: "
+                    f"{security_id!r}"
+                )
+            cik = cik10(raw.get("cik"))
+            effective_from = parse_date(raw.get("effective_from"))
+            effective_to = parse_date(raw.get("effective_to"))
+            if effective_from is None or (
+                effective_to is not None and effective_to < effective_from
+            ):
+                raise EnrichmentError(
+                    f"Security-CIK override line {line_number} has invalid dates"
+                )
+            if not str(raw.get("source_url") or "").strip():
+                raise EnrichmentError(
+                    f"Security-CIK override line {line_number} lacks source_url"
+                )
+            if parse_datetime(raw.get("reviewed_at_utc")) is None:
+                raise EnrichmentError(
+                    f"Security-CIK override line {line_number} lacks reviewed_at_utc"
+                )
+            by_security[security_id].append((effective_from, effective_to, cik))
+    output: dict[str, str] = {}
+    for security_id, periods in by_security.items():
+        ordered = sorted(periods)
+        for previous, current in zip(ordered, ordered[1:]):
+            previous_end = previous[1] or date.max
+            if current[0] <= previous_end:
+                raise EnrichmentError(
+                    f"Security-CIK overrides overlap for {security_id}"
+                )
+        active = [
+            cik
+            for effective_from, effective_to, cik in ordered
+            if effective_from <= cutoff and (effective_to is None or cutoff <= effective_to)
+        ]
+        if len(active) > 1:
+            raise EnrichmentError(
+                f"Multiple active Security-CIK overrides for {security_id}"
+            )
+        if active:
+            output[security_id] = active[0]
+    return output
+
+
 def conservative_available_date(
     filing_date: date | None, acceptance: datetime | None
 ) -> date | None:
@@ -361,6 +431,7 @@ def parse_submissions(
     cutoff: date,
     retrieved_at: datetime,
     source_revision: str | None = None,
+    cik_overrides: Mapping[str, str] | None = None,
 ) -> tuple[
     list[dict[str, object]],
     list[dict[str, object]],
@@ -399,15 +470,23 @@ def parse_submissions(
         for security_id in ordered_ids:
             security_candidates[security_id].append((latest_activity, cik))
 
+    reviewed_overrides = dict(cik_overrides or {})
     selected_ciks_by_security: dict[str, str] = {}
+    unresolved_collisions: set[str] = set()
     for security_id, choices in security_candidates.items():
-        ordered = sorted(choices, reverse=True)
-        if len(ordered) > 1 and ordered[0][0] == ordered[1][0]:
-            raise EnrichmentError(
-                f"Security {security_id} has an ambiguous SEC registrant tie at "
-                f"{ordered[0][0]}: {ordered[0][1]} and {ordered[1][1]}"
-            )
-        selected_ciks_by_security[security_id] = ordered[0][1]
+        candidate_ciks = {cik for _, cik in choices}
+        override = reviewed_overrides.get(security_id)
+        if override is not None:
+            if override not in candidate_ciks:
+                raise EnrichmentError(
+                    f"Reviewed CIK override for {security_id} is absent from SEC "
+                    f"candidates: {override}"
+                )
+            selected_ciks_by_security[security_id] = override
+        elif len(candidate_ciks) == 1:
+            selected_ciks_by_security[security_id] = next(iter(candidate_ciks))
+        else:
+            unresolved_collisions.add(security_id)
 
     securities_by_cik: dict[str, list[str]] = defaultdict(list)
     for security_id, cik in selected_ciks_by_security.items():
@@ -420,7 +499,9 @@ def parse_submissions(
         security_id = ordered_ids[0]
         cik_to_security[cik] = security_id
         for mapped_id in ordered_ids:
-            collision_resolved = len(security_candidates[mapped_id]) > 1
+            collision_resolved = len(
+                {candidate_cik for _, candidate_cik in security_candidates[mapped_id]}
+            ) > 1
             master_by_id[mapped_id] = {
                 "security_id": mapped_id,
                 "ticker": universe[mapped_id]["ticker"],
@@ -429,7 +510,7 @@ def parse_submissions(
                 "registrant_name": str(document.get("name") or "").strip(),
                 "sic": str(document.get("sic") or "").strip() or None,
                 "mapping_status": (
-                    "LATEST_SEC_FILING_TICKER_COLLISION"
+                    "REVIEWED_EFFECTIVE_DATED_OVERRIDE"
                     if collision_resolved
                     else "EXACT_SEC_PRIMARY_TICKER"
                     if mapped_id == security_id
@@ -525,7 +606,11 @@ def parse_submissions(
             "cik": None,
             "registrant_name": None,
             "sic": None,
-            "mapping_status": "UNMAPPED_SEC_CIK",
+            "mapping_status": (
+                "UNRESOLVED_CIK_IDENTITY_CONFLICT"
+                if security_id in unresolved_collisions
+                else "UNMAPPED_SEC_CIK"
+            ),
             "source_url": None,
             "source_revision": revision,
             **pit_fields(
@@ -1383,15 +1468,63 @@ def build_events(
     return events, earnings
 
 
+def resolve_insider_security(
+    issuer_cik: str,
+    issuer_symbol: str,
+    master_by_id: Mapping[str, Mapping[str, object]],
+    ticker_to_id: Mapping[str, str],
+) -> tuple[str | None, str | None]:
+    """Resolve an issuer CIK first and constrain share-class routing to that CIK."""
+    security_ids_by_cik: dict[str, list[str]] = defaultdict(list)
+    for security_id, master in master_by_id.items():
+        canonical_cik = (
+            cik10(master.get("cik")) if master.get("cik") not in (None, "") else None
+        )
+        if canonical_cik is not None:
+            security_ids_by_cik[canonical_cik].append(security_id)
+    candidates = sorted(security_ids_by_cik.get(issuer_cik, []))
+    ticker_security = resolve_ticker(issuer_symbol, ticker_to_id)
+    if len(candidates) == 1:
+        return candidates[0], None
+    if len(candidates) > 1:
+        if ticker_security in candidates:
+            return ticker_security, None
+        if ticker_security is not None:
+            ticker_cik = master_by_id.get(ticker_security, {}).get("cik")
+            return (
+                None,
+                "MISSING_CANONICAL_CIK"
+                if ticker_cik in (None, "")
+                else "TICKER_CIK_CONFLICT",
+            )
+        return None, "AMBIGUOUS_SHARE_CLASS"
+    if ticker_security is not None:
+        ticker_cik = master_by_id.get(ticker_security, {}).get("cik")
+        if ticker_cik in (None, ""):
+            return None, "MISSING_CANONICAL_CIK"
+        return None, "TICKER_CIK_CONFLICT"
+    return None, "UNKNOWN_ISSUER_CIK"
+
+
 def parse_insider_archives(
     paths: list[Path],
-    cik_to_security: Mapping[str, str],
+    masters: Sequence[Mapping[str, object]],
     ticker_to_id: Mapping[str, str],
     filings: Mapping[tuple[str, str], Mapping[str, object]],
     cutoff: date,
     retrieved_at: datetime,
+    diagnostics: dict[str, object] | None = None,
 ) -> list[dict[str, object]]:
     output: dict[tuple[str, str, str], dict[str, object]] = {}
+    master_by_id = {str(row["security_id"]): row for row in masters}
+    rejected_by_reason: dict[str, int] = defaultdict(int)
+    sample_accessions: dict[str, list[str]] = defaultdict(list)
+
+    def reject(reason: str, accession: str) -> None:
+        rejected_by_reason[reason] += 1
+        if accession not in sample_accessions[reason] and len(sample_accessions[reason]) < 20:
+            sample_accessions[reason].append(accession)
+
     for path in paths:
         submissions = {row["ACCESSION_NUMBER"]: row for row in zip_tsv(path, "SUBMISSION.tsv")}
         owners: dict[str, list[dict[str, str]]] = defaultdict(list)
@@ -1409,10 +1542,14 @@ def parse_insider_archives(
                 if filing_date is None or filing_date > cutoff or transaction_date is None:
                     continue
                 issuer_cik = cik10(submission.get("ISSUERCIK"))
-                security_id = cik_to_security.get(issuer_cik) or resolve_ticker(
-                    submission.get("ISSUERTRADINGSYMBOL", ""), ticker_to_id
+                security_id, rejection_reason = resolve_insider_security(
+                    issuer_cik,
+                    submission.get("ISSUERTRADINGSYMBOL", ""),
+                    master_by_id,
+                    ticker_to_id,
                 )
                 if security_id is None:
+                    reject(rejection_reason or "UNKNOWN_ISSUER_CIK", accession)
                     continue
                 filing = filings.get((issuer_cik, accession), {})
                 acceptance = filing.get("acceptance_datetime_utc")
@@ -1464,6 +1601,33 @@ def parse_insider_archives(
                     if previous is not None and previous != row:
                         raise EnrichmentError(f"Conflicting insider transaction {key}")
                     output[key] = row
+    if diagnostics is not None:
+        diagnostics.clear()
+        diagnostics.update(
+            {
+                "accepted_rows": len(output),
+                "rejected_rows": sum(rejected_by_reason.values()),
+                "rejected_by_reason": {
+                    reason: rejected_by_reason.get(reason, 0)
+                    for reason in (
+                        "UNKNOWN_ISSUER_CIK",
+                        "AMBIGUOUS_SHARE_CLASS",
+                        "TICKER_CIK_CONFLICT",
+                        "MISSING_CANONICAL_CIK",
+                    )
+                },
+                "sample_accession_numbers": {
+                    reason: sample_accessions.get(reason, [])
+                    for reason in (
+                        "UNKNOWN_ISSUER_CIK",
+                        "AMBIGUOUS_SHARE_CLASS",
+                        "TICKER_CIK_CONFLICT",
+                        "MISSING_CANONICAL_CIK",
+                    )
+                },
+                "emitted_cik_violations": 0,
+            }
+        )
     return list(output.values())
 
 
@@ -1904,6 +2068,7 @@ def merge_manifest(
     concept_map_version: str,
     notice_path: Path,
     fact_stats: Mapping[str, object],
+    insider_diagnostics: Mapping[str, object],
 ) -> None:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if manifest.get("status") != "READY":
@@ -2025,6 +2190,7 @@ def merge_manifest(
         "insider_transactions": {
             "status": "READY" if insiders else "VALIDATION_FAILED",
             "latest_filing_date": max((row["filing_date"] for row in insiders), default=None),
+            **dict(insider_diagnostics),
         },
         "institutional_ownership": {
             "status": "READY" if holdings else "VALIDATION_FAILED",
@@ -2057,13 +2223,14 @@ def merge_manifest(
         enrichment_warnings.append(
             f"{unmapped_ciks} admitted securities have no exact SEC CIK mapping"
         )
-    ticker_collisions = sum(
-        row.get("mapping_status") == "LATEST_SEC_FILING_TICKER_COLLISION"
+    unresolved_collisions = sum(
+        row.get("mapping_status") == "UNRESOLVED_CIK_IDENTITY_CONFLICT"
         for row in datasets["security-master.parquet"]
     )
-    if ticker_collisions:
+    if unresolved_collisions:
         enrichment_warnings.append(
-            f"{ticker_collisions} SEC ticker collisions selected the unique latest filer"
+            f"{unresolved_collisions} SEC ticker collisions remain unresolved pending "
+            "a reviewed effective-dated override"
         )
     partial_fundamentals = sum(
         row.get("normalization_status") != "COMPLETE" for row in normalized
@@ -2102,6 +2269,52 @@ def merge_manifest(
     manifest["source"]["normalization_floor_fiscal_year"] = int(
         fact_stats["normalization_floor_fiscal_year"]
     )
+    insider_exclusions = [
+        {
+            "reason": reason,
+            "rows": int(count),
+            "sample_accession_numbers": insider_diagnostics.get(
+                "sample_accession_numbers", {}
+            ).get(reason, []),
+        }
+        for reason, count in insider_diagnostics.get("rejected_by_reason", {}).items()
+        if int(count)
+    ]
+    group_overrides: dict[str, dict[str, object]] = {
+        "insiders": {
+            "state": (
+                "READY_WITH_EXCLUSIONS" if insider_exclusions else "READY_NEW"
+            ),
+            "mode": "FRESH_CANDIDATE",
+            "exclusions": insider_exclusions,
+        }
+    }
+    market_state = str(manifest.get("market_candidate_state") or "READY_NEW")
+    if market_state in {"READY_NEW", "READY_WITH_EXCLUSIONS"}:
+        quality = (manifest.get("source") or {}).get("quality", {})
+        group_overrides["market"] = {
+            "state": market_state,
+            "mode": "FRESH_CANDIDATE",
+            "exclusions": list(quality.get("unresolved_invalid_rows", [])),
+        }
+    production_market_files = {
+        "security-universe.csv",
+        "unmatched-tickers.csv",
+        "yahoo-ohlcv-320.parquet",
+        "yahoo-splits.parquet",
+    }
+    manifest_files = {
+        str(record.get("file") or "")
+        for record in manifest.get("release_files", [])
+        if isinstance(record, dict)
+    }
+    if production_market_files <= manifest_files:
+        apply_dataset_groups(
+            manifest,
+            out_dir,
+            group_overrides=group_overrides,
+            candidate_group_failures=[],
+        )
     atomic_json(manifest_path, manifest)
 
 
@@ -2121,6 +2334,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--notice", default="NOTICE.md")
     parser.add_argument("--concept-map", default="config/sec-concept-map-v1.json")
     parser.add_argument("--cusip-overrides", default="config/cusip-security-overrides.csv")
+    parser.add_argument(
+        "--security-cik-overrides",
+        default="config/security-cik-overrides.csv",
+    )
     parser.add_argument(
         "--finra-publication-dates",
         default="config/finra-short-interest-publication-dates.csv",
@@ -2151,6 +2368,9 @@ def main(argv: list[str] | None = None) -> int:
         known_revisions = {path: sha256_file(path) for path in source_paths}
         log_stage("source_hashes", "complete", source_hash_started)
         universe, ticker_to_id = load_universe(universe_path)
+        cik_overrides = load_security_cik_overrides(
+            Path(args.security_cik_overrides).resolve(), universe, cutoff
+        )
         submissions_started = time.monotonic()
         log_stage("submissions", "start", submissions_started)
         masters, filing_rows, all_filings, cik_to_security = parse_submissions(
@@ -2160,6 +2380,7 @@ def main(argv: list[str] | None = None) -> int:
             cutoff,
             retrieved_at,
             known_revisions[submissions_path],
+            cik_overrides,
         )
         log_stage("submissions", "complete", submissions_started)
         concept_map = load_json(Path(args.concept_map).resolve())
@@ -2194,13 +2415,15 @@ def main(argv: list[str] | None = None) -> int:
         log_stage("events", "complete", events_started)
         insiders_started = time.monotonic()
         log_stage("insiders", "start", insiders_started)
+        insider_diagnostics: dict[str, object] = {}
         insiders = parse_insider_archives(
             insider_paths,
-            cik_to_security,
+            masters,
             ticker_to_id,
             all_filings,
             cutoff,
             retrieved_at,
+            insider_diagnostics,
         )
         insider_signals = build_insider_signals(insiders, cutoff, retrieved_at)
         log_stage("insiders", "complete", insiders_started)
@@ -2300,6 +2523,7 @@ def main(argv: list[str] | None = None) -> int:
             str(concept_map.get("version") or ""),
             notice_target,
             fact_stats,
+            insider_diagnostics,
         )
         log_stage("manifest", "complete", manifest_started)
     except (ContractError, EnrichmentError, OSError, ValueError, duckdb.Error, zipfile.BadZipFile) as exc:

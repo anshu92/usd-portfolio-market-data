@@ -1,5 +1,8 @@
 # Consumer contract
 
+This operational contract implements the repository's
+[producer reliability contract](../PRODUCER_RELIABILITY_CONTRACT.md).
+
 Consume only a validated, immutable tag. Resolve
 `latest-production-artifact.json`, confirm its run/artifact/release identity through the
 GitHub Actions API, download into a tag-scoped staging directory, and run both
@@ -14,6 +17,21 @@ Compare every release file with both its `release_files` record and its `dataset
 entry. Validate SHA-256, bytes, rows, ordered columns, physical types, primary keys,
 and `security_id` membership. Promote the staged directory atomically only after all
 checks pass. On any failure, leave the previous validated tag and database untouched.
+
+Use `dataset_groups`, not the package-wide `status`, to enable data-dependent behavior:
+
+- `READY_NEW`, `READY_REUSED`, and `READY_WITH_EXCLUSIONS` are usable, subject to the
+  group's freshness and exclusions.
+- `STALE_DISABLED` remains importable for audit, but every factor or archetype that
+  depends on that group must be disabled.
+- `NOT_CONFIGURED` is valid only for declared optional groups.
+- `candidate_group_failures` is diagnostic evidence only. Never import quarantined
+  candidate bytes.
+
+Resolve dependencies transitively. A disabled `filings_events` group disables
+`insiders`, while ready `market`, `fundamentals`, `institutional`, and
+`short_interest` groups remain independently usable. Persist the group ID, state,
+digest, source release provenance, freshness lag, and disable reason with each run.
 
 Import each Parquet file into a same-named normalized SQLite table and record its
 manifest `source_revision`, `source_retrieved_at_utc`, minimum/maximum event dates,

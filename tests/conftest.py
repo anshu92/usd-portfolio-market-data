@@ -42,6 +42,16 @@ def reuse_module():
     return load_script("reuse_enrichment_snapshot", "reuse-enrichment-snapshot.py")
 
 
+@pytest.fixture
+def compose_module():
+    return load_script("compose_release", "compose-release.py")
+
+
+@pytest.fixture
+def pointer_module():
+    return load_script("verify_consumer_pointer", "verify-consumer-pointer.py")
+
+
 @pytest.fixture(scope="session")
 def verify_module():
     return load_script("verify_release", "verify-release.py")

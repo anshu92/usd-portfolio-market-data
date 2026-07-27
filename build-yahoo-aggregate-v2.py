@@ -7,6 +7,7 @@ import argparse
 import csv
 import hashlib
 import json
+import math
 import os
 import shutil
 import sys
@@ -327,14 +328,14 @@ def prepare_price_candidates(
     list[tuple[str, date, date, str]],
     list[tuple[date, int, int, float]],
 ]:
-    """Select releasable history and isolate systemic upstream session failures.
+    """Select releasable history and detect affirmative common-mode corruption.
 
     Invalid rows outside the requested per-security history cannot enter an output and
     therefore do not invalidate a build. A recent source symbol must have observations
     within the configured XNYS-session window; this prevents histories from a recycled
-    ticker from being attached to a current listing. If a sufficiently broad source
-    session has a systemic invalid-OHLC rate, the entire session is quarantined and the
-    normal market-freshness gate evaluates the resulting output date.
+    ticker from being attached to a current listing. Invalid rows are handled locally;
+    a session is quarantined only when otherwise valid rows show affirmative common-mode
+    evidence (an implausibly repeated complete OHLCV observation).
     """
     con.execute(
         f"""
@@ -367,8 +368,13 @@ def prepare_price_candidates(
                         AND datediff('day', previous_session, session_date) > ?
                      THEN 'SESSION_GAP'
                    WHEN previous_close > 0 AND close > 0
-                        AND ({PRICE_INVALID_SQL})
                         AND greatest(close / previous_close, previous_close / close) >= ?
+                        AND NOT EXISTS (
+                          SELECT 1 FROM split_dedup split
+                          WHERE split.source_symbol = with_previous.source_symbol
+                            AND split.event_date > with_previous.previous_session
+                            AND split.event_date <= with_previous.session_date
+                        )
                      THEN 'INVALID_PRICE_DISCONTINUITY'
                    ELSE NULL
                  END AS segment_break_reason
@@ -468,27 +474,39 @@ def prepare_price_candidates(
     con.execute(
         f"""
         CREATE TEMP TABLE quarantined_price_sessions AS
-        WITH quality AS (
-          SELECT session_date,
-                 count(*) AS total_rows,
-                 count(*) FILTER (WHERE {PRICE_INVALID_SQL}) AS invalid_rows
+        WITH patterns AS (
+          SELECT session_date, open, high, low, close, volume,
+                 count(*) AS repeated_rows
           FROM price_candidate
           JOIN active_security_ids USING (security_id)
+          WHERE NOT ({PRICE_INVALID_SQL})
+          GROUP BY session_date, open, high, low, close, volume
+        ), quality AS (
+          SELECT session_date,
+                 sum(repeated_rows) AS total_rows,
+                 max(repeated_rows) AS common_mode_rows
+          FROM patterns
           GROUP BY session_date
         )
-        SELECT session_date, invalid_rows, total_rows,
-               cast(invalid_rows AS DOUBLE) / total_rows AS invalid_rate
+        SELECT session_date, common_mode_rows, total_rows,
+               cast(common_mode_rows AS DOUBLE) / total_rows AS common_mode_rate
         FROM quality
         WHERE total_rows >= ?
-          AND cast(invalid_rows AS DOUBLE) / total_rows > ?
+          AND common_mode_rows >= 25
+          AND cast(common_mode_rows AS DOUBLE) / total_rows >= 0.25
         """,
-        [minimum_systemic_session_securities, systemic_invalid_session_rate],
+        [minimum_systemic_session_securities],
     )
     quarantined_rows = [
-        (session_date, int(invalid_rows), int(total_rows), float(invalid_rate))
-        for session_date, invalid_rows, total_rows, invalid_rate in con.execute(
+        (
+            session_date,
+            int(common_mode_rows),
+            int(total_rows),
+            float(common_mode_rate),
+        )
+        for session_date, common_mode_rows, total_rows, common_mode_rate in con.execute(
             """
-            SELECT session_date, invalid_rows, total_rows, invalid_rate
+            SELECT session_date, common_mode_rows, total_rows, common_mode_rate
             FROM quarantined_price_sessions ORDER BY session_date
             """
         ).fetchall()
@@ -741,6 +759,170 @@ def supplement_missing_yahoo_chart_history(
     return {"requested": len(requested), "responses": response_records, "failures": failures, "price_rows": len(price_records), "split_rows": len(split_records)}
 
 
+def repair_invalid_yahoo_chart_rows(
+    con: duckdb.DuckDBPyConnection,
+    *,
+    cutoff: date,
+    sessions: int,
+    workers: int,
+) -> dict[str, object]:
+    """Repair exact invalid source-symbol/session rows before local exclusion."""
+    floor = cutoff - timedelta(days=max(30, sessions * 2))
+    invalid = [
+        (str(symbol), session_date)
+        for symbol, session_date in con.execute(
+            f"""
+            SELECT DISTINCT source_symbol, session_date
+            FROM price_dedup
+            WHERE session_date >= cast(? AS DATE)
+              AND session_date <= cast(? AS DATE)
+              AND ({PRICE_INVALID_SQL})
+            ORDER BY source_symbol, session_date
+            """,
+            [floor.isoformat(), cutoff.isoformat()],
+        ).fetchall()
+    ]
+    by_symbol: dict[str, set[date]] = {}
+    for symbol, session_date in invalid:
+        by_symbol.setdefault(symbol, set()).add(session_date)
+
+    def fetch(symbol: str, target_dates: set[date]):
+        period_start = min(target_dates) - timedelta(days=2)
+        period_end = max(target_dates) + timedelta(days=2)
+        url = (
+            "https://query2.finance.yahoo.com/v8/finance/chart/"
+            + urllib.parse.quote(symbol, safe="")
+            + "?period1="
+            + str(int(datetime.combine(period_start, datetime.min.time(), timezone.utc).timestamp()))
+            + "&period2="
+            + str(int(datetime.combine(period_end, datetime.min.time(), timezone.utc).timestamp()))
+            + "&interval=1d&events=history,split"
+        )
+        request = urllib.request.Request(
+            url, headers={"User-Agent": "usd-portfolio-market-data/1.0"}
+        )
+        errors: list[str] = []
+        for attempt in range(5):
+            try:
+                with urllib.request.urlopen(request, timeout=30) as response:
+                    payload = response.read()
+                body = json.loads(payload)
+                result = (body.get("chart", {}).get("result") or [None])[0]
+                if not result or not result.get("timestamp"):
+                    raise AggregateError("no daily history")
+                return symbol, target_dates, payload, result, None
+            except (OSError, ValueError, AggregateError) as exc:
+                errors.append(str(exc))
+                time.sleep(1.0 * (2**attempt))
+        return symbol, target_dates, b"", None, "; ".join(errors)
+
+    results = []
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [
+            executor.submit(fetch, symbol, target_dates)
+            for symbol, target_dates in by_symbol.items()
+        ]
+        for future in as_completed(futures):
+            results.append(future.result())
+
+    repaired_records: list[tuple[object, ...]] = []
+    responses: list[dict[str, object]] = []
+    failures: list[dict[str, object]] = []
+    for symbol, target_dates, payload, result, error in results:
+        if error or result is None:
+            failures.append(
+                {
+                    "source_symbol": symbol,
+                    "session_dates": sorted(value.isoformat() for value in target_dates),
+                    "error": error or "unknown error",
+                }
+            )
+            continue
+        digest = hashlib.sha256(payload).hexdigest()
+        revision = f"repair:{digest}"
+        observed = format_utc(utcnow())
+        quote = ((result.get("indicators") or {}).get("quote") or [{}])[0]
+        timestamps = result.get("timestamp") or []
+        repaired_dates: set[date] = set()
+        for index, timestamp in enumerate(timestamps):
+            session = datetime.fromtimestamp(int(timestamp), timezone.utc).date()
+            if session not in target_dates:
+                continue
+            values = [
+                quote.get(field, [None] * len(timestamps))[index]
+                for field in ("open", "high", "low", "close", "volume")
+            ]
+            if any(value is None for value in values):
+                continue
+            open_value, high_value, low_value, close_value, volume_value = values
+            if (
+                not all(
+                    math.isfinite(float(value)) and float(value) > 0
+                    for value in (open_value, high_value, low_value, close_value)
+                )
+                or int(volume_value) < 0
+                or float(high_value)
+                < max(float(open_value), float(close_value), float(low_value))
+                or float(low_value)
+                > min(float(open_value), float(close_value), float(high_value))
+            ):
+                continue
+            repaired_records.append(
+                (
+                    symbol,
+                    session,
+                    open_value,
+                    high_value,
+                    low_value,
+                    close_value,
+                    int(volume_value),
+                    "Yahoo Finance Chart API",
+                    revision,
+                    observed,
+                )
+            )
+            repaired_dates.add(session)
+        responses.append(
+            {
+                "source_symbol": symbol,
+                "source_revision": revision,
+                "observed_at_utc": observed,
+                "requested_dates": sorted(value.isoformat() for value in target_dates),
+                "repaired_dates": sorted(value.isoformat() for value in repaired_dates),
+            }
+        )
+    if repaired_records:
+        con.execute(
+            """
+            CREATE TEMP TABLE repaired_yahoo_rows(
+              source_symbol VARCHAR, session_date DATE, open DOUBLE, high DOUBLE,
+              low DOUBLE, close DOUBLE, volume BIGINT, source_dataset VARCHAR,
+              source_revision VARCHAR, observed_at_utc VARCHAR
+            )
+            """
+        )
+        con.executemany(
+            "INSERT INTO repaired_yahoo_rows VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            repaired_records,
+        )
+        con.execute(
+            """
+            DELETE FROM price_source USING repaired_yahoo_rows repaired
+            WHERE price_source.source_symbol = repaired.source_symbol
+              AND price_source.session_date = repaired.session_date
+            """
+        )
+        con.execute("INSERT INTO price_source SELECT * FROM repaired_yahoo_rows")
+        con.execute("DROP TABLE price_dedup")
+        con.execute("CREATE TEMP TABLE price_dedup AS SELECT DISTINCT * FROM price_source")
+    return {
+        "requested_rows": len(invalid),
+        "repaired_rows": len(repaired_records),
+        "responses": responses,
+        "failures": failures,
+    }
+
+
 def write_unmatched(
     path: Path,
     securities: list[Security],
@@ -763,9 +945,16 @@ def write_unmatched(
                 )
 
 
-def expected_latest_session(cutoff: date) -> date:
+def expected_latest_session(
+    cutoff: date, observed_at: datetime | None = None
+) -> date:
     calendar = xcals.get_calendar("XNYS")
-    return calendar.date_to_session(cutoff.isoformat(), direction="previous").date()
+    label = calendar.date_to_session(cutoff.isoformat(), direction="previous")
+    if observed_at is not None:
+        observed = observed_at if observed_at.tzinfo else observed_at.replace(tzinfo=timezone.utc)
+        if label.date() == cutoff and observed < calendar.session_close(label).to_pydatetime():
+            label = calendar.previous_session(label)
+    return label.date()
 
 
 def stale_sessions(max_date: date, expected: date) -> int:
@@ -860,6 +1049,12 @@ def build(args: argparse.Namespace) -> tuple[dict[str, object], int]:
                 cutoff=cutoff,
             )
         chart_supplement: dict[str, object] | None = None
+        repair_report: dict[str, object] = {
+            "requested_rows": 0,
+            "repaired_rows": 0,
+            "responses": [],
+            "failures": [],
+        }
         if args.yahoo_chart_supplement:
             chart_supplement = supplement_missing_yahoo_chart_history(
                 con,
@@ -867,7 +1062,13 @@ def build(args: argparse.Namespace) -> tuple[dict[str, object], int]:
                 workers=args.yahoo_chart_workers,
                 lookback_days=args.yahoo_chart_lookback_days,
             )
-        expected_session = expected_latest_session(cutoff)
+            repair_report = repair_invalid_yahoo_chart_rows(
+                con,
+                cutoff=cutoff,
+                sessions=args.sessions,
+                workers=args.yahoo_chart_workers,
+            )
+        expected_session = expected_latest_session(cutoff, observed_at)
         (
             oldest_active_session,
             stale_source_rows,
@@ -892,11 +1093,38 @@ def build(args: argparse.Namespace) -> tuple[dict[str, object], int]:
                 f"""
                 SELECT count(*) FROM price_candidate p
                 JOIN active_security_ids a USING (security_id)
-                LEFT JOIN quarantined_price_sessions q USING (session_date)
-                WHERE q.session_date IS NULL AND ({PRICE_INVALID_SQL})
+                WHERE ({PRICE_INVALID_SQL})
                 """
             ).fetchone()[0]
         )
+        unresolved_invalid_rows = [
+            {
+                "security_id": str(security_id),
+                "source_symbol": str(source_symbol),
+                "session_date": session_date.isoformat(),
+                "reason": str(reason),
+            }
+            for security_id, source_symbol, session_date, reason in con.execute(
+                f"""
+                SELECT security_id, source_symbol, session_date,
+                       CASE
+                         WHEN open IS NULL OR high IS NULL OR low IS NULL OR close IS NULL
+                           THEN 'NULL_OHLC'
+                         WHEN NOT isfinite(open) OR NOT isfinite(high)
+                           OR NOT isfinite(low) OR NOT isfinite(close)
+                           THEN 'NON_FINITE_OHLC'
+                         WHEN open <= 0 OR high <= 0 OR low <= 0 OR close <= 0
+                           THEN 'NON_POSITIVE_OHLC'
+                         WHEN volume IS NULL OR volume < 0 THEN 'INVALID_VOLUME'
+                         ELSE 'INVALID_OHLC_BOUNDS'
+                       END AS reason
+                FROM price_candidate
+                JOIN active_security_ids USING (security_id)
+                WHERE ({PRICE_INVALID_SQL})
+                ORDER BY security_id, session_date
+                """
+            ).fetchall()
+        ]
 
         aggregate_query = f"""
           SELECT p.security_id, p.ticker, p.source_symbol, p.session_date,
@@ -904,8 +1132,7 @@ def build(args: argparse.Namespace) -> tuple[dict[str, object], int]:
                  p.source_dataset, p.source_revision, p.observed_at_utc
           FROM price_candidate p
           JOIN active_security_ids a USING (security_id)
-          LEFT JOIN quarantined_price_sessions q USING (session_date)
-          WHERE q.session_date IS NULL AND NOT ({PRICE_INVALID_SQL})
+          WHERE NOT ({PRICE_INVALID_SQL})
           ORDER BY p.ticker, p.session_date
         """
         atomic_copy_to_parquet(
@@ -1019,6 +1246,43 @@ def build(args: argparse.Namespace) -> tuple[dict[str, object], int]:
                 "320_or_more": sum(count >= 320 for count in session_counts),
             },
         }
+        latest_session_total = int(
+            con.execute("SELECT count(*) FROM active_security_ids").fetchone()[0]
+        )
+        latest_session_valid = int(
+            con.execute(
+                f"""
+                SELECT count(DISTINCT security_id)
+                FROM price_candidate
+                JOIN active_security_ids USING (security_id)
+                WHERE session_date = cast(? AS DATE)
+                  AND NOT ({PRICE_INVALID_SQL})
+                """,
+                [expected_session.isoformat()],
+            ).fetchone()[0]
+        )
+        latest_session_coverage = (
+            latest_session_valid / latest_session_total
+            if latest_session_total
+            else 0.0
+        )
+        benchmark_ids = {
+            security.security_id
+            for security in securities
+            if security.ticker == args.benchmark_ticker.upper()
+        }
+        benchmark_valid = bool(benchmark_ids) and bool(
+            con.execute(
+                f"""
+                SELECT count(*)
+                FROM price_candidate
+                WHERE security_id IN (SELECT unnest(?))
+                  AND session_date = cast(? AS DATE)
+                  AND NOT ({PRICE_INVALID_SQL})
+                """,
+                [sorted(benchmark_ids), expected_session.isoformat()],
+            ).fetchone()[0]
+        )
 
         errors: list[str] = []
         warnings: list[str] = []
@@ -1034,6 +1298,11 @@ def build(args: argparse.Namespace) -> tuple[dict[str, object], int]:
             warnings.append(
                 f"Excluded {invalid_candidate_rows} invalid OHLC source rows"
             )
+        if int(repair_report["repaired_rows"]):
+            warnings.append(
+                f"Repaired {int(repair_report['repaired_rows'])} invalid OHLC rows "
+                "from fresh Yahoo Chart observations"
+            )
         if stale_source_rows:
             warnings.append(
                 f"Excluded {len(stale_source_rows)} source-symbol histories older than "
@@ -1044,12 +1313,28 @@ def build(args: argparse.Namespace) -> tuple[dict[str, object], int]:
                 f"Truncated {len(source_history_truncation_rows)} source-symbol "
                 "histories at gap or invalid-discontinuity boundaries"
             )
-        for session_date, invalid_rows, total_rows, invalid_rate in (
+        for session_date, common_mode_rows, total_rows, common_mode_rate in (
             quarantined_session_rows
         ):
+            errors.append(
+                f"Candidate session {session_date} has affirmative common-mode "
+                f"corruption: {common_mode_rows}/{total_rows} identical OHLCV rows "
+                f"({common_mode_rate:.2%})"
+            )
+        if latest_session_coverage < 0.95:
+            errors.append(
+                f"Latest-session valid coverage {latest_session_coverage:.2%} is "
+                "below 95.00%"
+            )
+        elif latest_session_coverage < 0.99:
             warnings.append(
-                f"Quarantined systemic invalid OHLC session {session_date}: "
-                f"{invalid_rows}/{total_rows} rows ({invalid_rate:.2%})"
+                f"Latest-session valid coverage {latest_session_coverage:.2%} is "
+                "below the 99.00% READY_NEW threshold"
+            )
+        if args.require_benchmark and not benchmark_valid:
+            errors.append(
+                f"Configured benchmark {args.benchmark_ticker.upper()} is not valid "
+                f"for {expected_session}"
             )
         if coverage < args.minimum_coverage:
             errors.append(
@@ -1082,21 +1367,23 @@ def build(args: argparse.Namespace) -> tuple[dict[str, object], int]:
             errors.append("Aggregate has no maximum session date")
         else:
             missing_sessions = stale_sessions(observed_max, expected_session)
-            if 3 <= missing_sessions <= 5:
-                warnings.append(
-                    f"Market data is {missing_sessions} eligible sessions stale"
-                )
-            elif missing_sessions > 5:
+            if missing_sessions:
                 errors.append(
-                    f"Market data is {missing_sessions} eligible sessions stale"
+                    f"Fresh market candidate is {missing_sessions} eligible sessions "
+                    "behind expected_latest_completed_session"
                 )
 
         if errors:
             status = "VALIDATION_FAILED"
-        elif missing_sessions is not None and missing_sessions >= 3:
-            status = "STALE_WARNING"
         else:
             status = "READY"
+        market_candidate_state = (
+            "READY_WITH_EXCLUSIONS"
+            if status == "READY" and latest_session_coverage < 0.99
+            else "READY_NEW"
+            if status == "READY"
+            else "QUARANTINED"
+        )
 
         aggregate_record = file_record(
             aggregate_path, rows=int(stats[0] or 0), schema=OHLCV_SCHEMA
@@ -1125,6 +1412,7 @@ def build(args: argparse.Namespace) -> tuple[dict[str, object], int]:
             "created_at_utc": format_utc(observed_at),
             "cutoff_date": cutoff.isoformat(),
             "sessions_requested": args.sessions,
+            "market_candidate_state": market_candidate_state,
             "thresholds": {
                 "minimum_history_sessions": args.minimum_history,
                 "minimum_matched_coverage": args.minimum_coverage,
@@ -1138,12 +1426,16 @@ def build(args: argparse.Namespace) -> tuple[dict[str, object], int]:
                 "minimum_systemic_session_securities": (
                     args.minimum_systemic_session_securities
                 ),
-                "ready_maximum_stale_sessions": 2,
-                "warning_maximum_stale_sessions": 5,
+                "ready_new_latest_session_coverage": 0.99,
+                "ready_with_exclusions_latest_session_coverage": 0.95,
+                "ready_reused_maximum_stale_sessions": 1,
             },
             "validation": {
                 "expected_latest_xnys_session": expected_session.isoformat(),
                 "missing_eligible_sessions": missing_sessions,
+                "latest_session_coverage": latest_session_coverage,
+                "benchmark_ticker": args.benchmark_ticker.upper(),
+                "benchmark_valid": benchmark_valid,
                 "errors": errors,
                 "warnings": warnings,
             },
@@ -1199,18 +1491,28 @@ def build(args: argparse.Namespace) -> tuple[dict[str, object], int]:
                             source_history_truncation_rows
                         )
                     ],
-                    "quarantined_sessions": [
+                    "common_mode_candidate_failures": [
                         {
                             "session_date": session_date.isoformat(),
-                            "invalid_rows": invalid_rows,
+                            "common_mode_rows": common_mode_rows,
                             "total_rows": total_rows,
-                            "invalid_rate": invalid_rate,
+                            "common_mode_rate": common_mode_rate,
                         }
-                        for session_date, invalid_rows, total_rows, invalid_rate in (
+                        for session_date, common_mode_rows, total_rows, common_mode_rate in (
                             quarantined_session_rows
                         )
                     ],
                     "excluded_invalid_rows": invalid_candidate_rows,
+                    "unresolved_invalid_rows": unresolved_invalid_rows,
+                    "repair": repair_report,
+                    "latest_session": {
+                        "expected": expected_session.isoformat(),
+                        "active_matched_securities": latest_session_total,
+                        "valid_securities": latest_session_valid,
+                        "valid_coverage": latest_session_coverage,
+                        "benchmark_ticker": args.benchmark_ticker.upper(),
+                        "benchmark_valid": benchmark_valid,
+                    },
                 },
             },
         }
@@ -1237,6 +1539,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--source-reuse-price-ratio", type=float, default=4.0)
     parser.add_argument("--systemic-invalid-session-rate", type=float, default=0.01)
     parser.add_argument("--minimum-systemic-session-securities", type=int, default=100)
+    parser.add_argument("--benchmark-ticker", default="VTI")
+    parser.add_argument("--require-benchmark", action="store_true")
     parser.add_argument("--cutoff-date", default=date.today().isoformat())
     parser.add_argument("--source-repo", default=DEFAULT_REPO)
     parser.add_argument("--source-revision", default="main")
