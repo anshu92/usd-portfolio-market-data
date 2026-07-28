@@ -85,6 +85,15 @@ def _write_grouped_release(directory: Path) -> dict[str, object]:
         "source": {"revision": "market-rev"},
         "aggregate": {"min_date": "2026-07-24", "max_date": "2026-07-24"},
         "splits": {"rows": 0},
+        "coverage": {
+            "security_master": {"status": "READY"},
+            "fundamentals": {"status": "READY"},
+            "filings_and_events": {"status": "READY"},
+            "insider_transactions": {"status": "READY"},
+            "institutional_ownership": {"status": "READY"},
+            "short_interest": {"status": "READY"},
+            "analyst_estimates": {"status": "NOT_CONFIGURED"},
+        },
         "validation": {
             "errors": [],
             "warnings": [],
@@ -207,6 +216,29 @@ def test_market_reuse_allows_documented_two_session_lag() -> None:
     assert freshness_state_for_reuse(
         "market", {"lag_eligible_sessions": 3}
     ) == "STALE_DISABLED"
+
+
+def test_composition_copies_coverage_for_reused_groups(compose_module) -> None:
+    candidate = {"coverage": {"fundamentals": {"status": "READY_NEW"}}}
+    previous = {
+        "coverage": {
+            "security_master": {"status": "READY"},
+            "fundamentals": {"status": "READY"},
+            "insider_transactions": {"status": "READY"},
+            "analyst_estimates": {"status": "NOT_CONFIGURED"},
+        }
+    }
+
+    compose_module.merge_reused_coverage(
+        candidate, previous, {"identity", "insiders"}
+    )
+
+    assert candidate["coverage"] == {
+        "fundamentals": {"status": "READY_NEW"},
+        "security_master": {"status": "READY"},
+        "insider_transactions": {"status": "READY"},
+        "analyst_estimates": {"status": "NOT_CONFIGURED"},
+    }
 
 
 def test_insider_resolution_is_cik_first_and_share_class_constrained(

@@ -30,6 +30,44 @@ class CompositionError(RuntimeError):
     """Raised when no safe candidate/fallback composition can be assembled."""
 
 
+COVERAGE_BY_GROUP = {
+    "identity": "security_master",
+    "fundamentals": "fundamentals",
+    "filings_events": "filings_and_events",
+    "insiders": "insider_transactions",
+    "institutional": "institutional_ownership",
+    "short_interest": "short_interest",
+}
+
+
+def merge_reused_coverage(
+    candidate: dict[str, object],
+    previous: Mapping[str, object],
+    reused_groups: set[str],
+) -> None:
+    current = candidate.get("coverage")
+    coverage = copy.deepcopy(current) if isinstance(current, dict) else {}
+    previous_coverage = previous.get("coverage")
+    if not isinstance(previous_coverage, dict):
+        if reused_groups - {"market"}:
+            raise CompositionError("Fallback release has no enrichment coverage")
+        return
+    for group_id in reused_groups:
+        section = COVERAGE_BY_GROUP.get(group_id)
+        if section is not None:
+            if section not in previous_coverage:
+                raise CompositionError(
+                    f"Fallback release lacks coverage section: {section}"
+                )
+            coverage[section] = copy.deepcopy(previous_coverage[section])
+    if "analyst_estimates" not in coverage and "analyst_estimates" in previous_coverage:
+        coverage["analyst_estimates"] = copy.deepcopy(
+            previous_coverage["analyst_estimates"]
+        )
+    if coverage:
+        candidate["coverage"] = coverage
+
+
 def load_manifest(path: Path, label: str) -> dict[str, object]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -312,6 +350,7 @@ def compose_release(
     candidate["datasets"] = [
         selected_datasets[filename] for filename in sorted(selected_datasets)
     ]
+    merge_reused_coverage(candidate, previous, reused_groups)
     candidate["status"] = "READY"
     apply_dataset_groups(
         candidate,
