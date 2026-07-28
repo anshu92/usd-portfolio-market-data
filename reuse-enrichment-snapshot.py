@@ -24,7 +24,11 @@ from enrichment_contract import (
     sha256_file,
     write_parquet,
 )
-from reliability_contract import apply_dataset_groups, freshness_state_for_reuse
+from reliability_contract import (
+    FILE_TO_GROUP,
+    apply_dataset_groups,
+    freshness_state_for_reuse,
+)
 
 
 LEGACY_PRODUCTION_FILES = {
@@ -278,6 +282,11 @@ def reuse_snapshot(
     previous_release, previous_datasets = validate_previous_snapshot(
         previous_directory, previous
     )
+    previous_groups = {
+        str(record.get("group_id")): record
+        for record in previous.get("dataset_groups", [])
+        if isinstance(record, dict)
+    }
     coverage = previous.get("coverage")
     if not isinstance(coverage, dict):
         raise SnapshotReuseError("Previous manifest has no enrichment coverage")
@@ -348,7 +357,21 @@ def reuse_snapshot(
             enrichment_datasets.append(master_dataset)
         else:
             enrichment_release.append(copy.deepcopy(previous_release[filename]))
-            enrichment_datasets.append(copy.deepcopy(previous_datasets[filename]))
+            dataset = copy.deepcopy(previous_datasets[filename])
+            group_id = FILE_TO_GROUP[filename]
+            source_group_sha = str(
+                previous_groups.get(group_id, {}).get("group_sha256") or ""
+            )
+            dataset.update(
+                {
+                    "source_release_tag": source_tag,
+                    "source_release_immutable": True,
+                    "source_manifest_sha256": previous_manifest_sha256,
+                }
+            )
+            if source_group_sha:
+                dataset["source_group_sha256"] = source_group_sha
+            enrichment_datasets.append(dataset)
 
     current["release_files"] = (
         [copy.deepcopy(record) for record in current_release.values()]
@@ -422,6 +445,7 @@ def reuse_snapshot(
             "state": "READY_REUSED",
             "mode": "PINNED_IMMUTABLE_GROUP_REUSE",
             "source_release_tag": source_tag,
+            "source_release_immutable": True,
             "source_manifest_sha256": previous_manifest_sha256,
         }
     apply_dataset_groups(
@@ -430,11 +454,6 @@ def reuse_snapshot(
         group_overrides=group_overrides,
         candidate_group_failures=[],
     )
-    previous_groups = {
-        str(record.get("group_id")): record
-        for record in previous.get("dataset_groups", [])
-        if isinstance(record, dict)
-    }
     for record in current["dataset_groups"]:
         group_id = str(record.get("group_id") or "")
         if group_id not in reused_groups:
@@ -448,6 +467,16 @@ def reuse_snapshot(
                 f"Reused group digest differs from {source_tag}: {group_id}"
             )
         record["source_group_sha256"] = source_group_sha
+        for dataset in current["datasets"]:
+            if dataset.get("group_id") == group_id:
+                dataset.update(
+                    {
+                        "source_release_tag": source_tag,
+                        "source_release_immutable": True,
+                        "source_manifest_sha256": previous_manifest_sha256,
+                        "source_group_sha256": source_group_sha,
+                    }
+                )
         record["state"] = freshness_state_for_reuse(
             group_id, record["freshness"]
         )

@@ -133,6 +133,43 @@ def insider_cik_violation_count(
     )
 
 
+def verify_identity_references(
+    con: duckdb.DuckDBPyConnection, directory: Path, filenames: set[str]
+) -> None:
+    """Require every packaged dataset identity to join the packaged master."""
+    master = directory / "security-master.parquet"
+    if not master.is_file():
+        raise VerificationError("Release lacks security-master.parquet")
+    for filename in sorted(filenames):
+        path = directory / filename
+        if path.suffix != ".parquet" or filename == master.name:
+            continue
+        columns = {
+            str(column[0])
+            for column in con.execute(
+                "SELECT * FROM read_parquet(?) LIMIT 0", [str(path)]
+            ).description
+        }
+        if "security_id" not in columns:
+            continue
+        unknown = int(
+            con.execute(
+                """
+                SELECT count(*)
+                FROM read_parquet(?) dataset
+                LEFT JOIN read_parquet(?) master USING (security_id)
+                WHERE dataset.security_id IS NOT NULL
+                  AND master.security_id IS NULL
+                """,
+                [str(path), str(master)],
+            ).fetchone()[0]
+        )
+        if unknown:
+            raise VerificationError(
+                f"Unknown security_id in {filename}: {unknown} rows"
+            )
+
+
 def verify_enrichment(
     con: duckdb.DuckDBPyConnection,
     directory: Path,
@@ -480,6 +517,38 @@ def verify_dataset_groups(
                     raise VerificationError(f"Reused group lacks {key}: {group_id}")
             if record.get("source_group_sha256") != actual_digest:
                 raise VerificationError(f"Reused group bytes changed: {group_id}")
+        if "GROUP_REUSE" in str(record.get("mode") or ""):
+            if record.get("source_release_immutable") is not True:
+                raise VerificationError(
+                    f"Reused group lacks immutable release identity: {group_id}"
+                )
+            for filename in contract.files:
+                dataset = datasets[filename]
+                for key in (
+                    "source_release_tag",
+                    "source_manifest_sha256",
+                    "source_group_sha256",
+                ):
+                    if not dataset.get(key):
+                        raise VerificationError(
+                            f"Reused dataset lacks {key}: {filename}"
+                        )
+                if dataset.get("source_release_immutable") is not True:
+                    raise VerificationError(
+                        f"Reused dataset lacks immutable source release: {filename}"
+                    )
+                if dataset.get("source_release_tag") != record.get("source_release_tag"):
+                    raise VerificationError(
+                        f"Reused dataset release identity mismatch: {filename}"
+                    )
+                if dataset.get("source_manifest_sha256") != record.get("source_manifest_sha256"):
+                    raise VerificationError(
+                        f"Reused dataset manifest identity mismatch: {filename}"
+                    )
+                if dataset.get("source_group_sha256") != record.get("source_group_sha256"):
+                    raise VerificationError(
+                        f"Reused dataset group identity mismatch: {filename}"
+                    )
         if group_id == "market":
             lag = freshness.get("lag_eligible_sessions")
             if state == "READY_NEW":
@@ -515,6 +584,14 @@ def verify_dataset_groups(
                 not isinstance(lag, int) or lag > MARKET_READY_MAX_LAG_SESSIONS
             ):
                 raise VerificationError("READY_REUSED market group is too stale")
+            if state == "READY_REUSED" and float(
+                (manifest.get("validation") or {}).get(
+                    "latest_session_coverage", 0.0
+                )
+            ) < 0.95:
+                raise VerificationError(
+                    "READY_REUSED market group misses coverage threshold"
+                )
         if state in {"READY_NEW", "READY_REUSED", "READY_WITH_EXCLUSIONS"}:
             if record.get("validation_errors"):
                 raise VerificationError(f"Usable group has validation errors: {group_id}")
@@ -561,6 +638,31 @@ def verify_dataset_groups(
             or not isinstance(failure.get("diagnostics"), list)
         ):
             raise VerificationError("Invalid quarantined candidate diagnostics")
+    if require_production and failures:
+        raise VerificationError(
+            "Production manifest mixes released readiness with legacy quarantine state"
+        )
+
+    attempts = manifest.get("candidate_attempt_failures")
+    if not isinstance(attempts, list):
+        raise VerificationError("Manifest lacks candidate_attempt_failures")
+    seen_attempts: set[str] = set()
+    usable = {"READY_NEW", "READY_REUSED", "READY_WITH_EXCLUSIONS"}
+    for attempt in attempts:
+        if not isinstance(attempt, dict):
+            raise VerificationError("candidate_attempt_failures contains a non-object")
+        group_id = str(attempt.get("group_id") or "")
+        if (
+            group_id not in GROUPS
+            or group_id in seen_attempts
+            or attempt.get("attempt_state") != "QUARANTINED"
+            or not isinstance(attempt.get("diagnostics"), list)
+            or attempt.get("released_state") != groups[group_id].get("state")
+        ):
+            raise VerificationError("Invalid candidate-attempt diagnostics")
+        seen_attempts.add(group_id)
+        if group_id in CORE_GROUPS and attempt.get("released_state") not in usable:
+            raise VerificationError(f"Unresolved core-group quarantine: {group_id}")
 
 
 def verify(directory: Path, require_ready: bool, require_production: bool) -> dict[str, object]:
@@ -594,6 +696,10 @@ def verify(directory: Path, require_ready: bool, require_production: bool) -> di
             if not isinstance(record, dict):
                 raise VerificationError("release_files contains a non-object entry")
             verify_record(con, directory, record)
+        if (directory / "security-master.parquet").is_file():
+            verify_identity_references(con, directory, filenames)
+        elif require_production:
+            raise VerificationError("Production release lacks security-master.parquet")
         verify_enrichment(
             con, directory, manifest, require_production=require_production
         )

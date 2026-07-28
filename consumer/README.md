@@ -25,8 +25,9 @@ Use `dataset_groups`, not the package-wide `status`, to enable data-dependent be
 - `STALE_DISABLED` remains importable for audit, but every factor or archetype that
   depends on that group must be disabled.
 - `NOT_CONFIGURED` is valid only for declared optional groups.
-- `candidate_group_failures` is diagnostic evidence only. Never import quarantined
-  candidate bytes.
+- `candidate_attempt_failures` is diagnostic evidence about rejected build attempts;
+  its `released_state` must match the final group. `candidate_group_failures` must be
+  empty. Never import quarantined candidate bytes.
 
 Resolve dependencies transitively. A disabled `filings_events` group disables
 `insiders`, while ready `market`, `fundamentals`, `institutional`, and

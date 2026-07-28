@@ -108,7 +108,7 @@ jobs:
               "Validated recovery composition from a trusted same-repository production artifact.\n\n"
               f"- Cutoff: {manifest['cutoff_date']}\n"
               f"- Status: {manifest['status']}\n"
-              f"- Candidate group failures: {len(manifest.get('candidate_group_failures', []))}\n\n"
+              f"- Rejected candidate attempts: {len(manifest.get('candidate_attempt_failures', []))}\n\n"
               "Historical research only; see NOTICE.md for attribution.\n",
               encoding="utf-8",
           )

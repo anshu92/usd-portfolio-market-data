@@ -416,7 +416,7 @@ jobs:
               --out-dir dist \
               --source-tag "${{ steps.previous_enrichment.outputs.tag }}"
           fi
-          echo "failure_count=$(jq '.candidate_group_failures | length' dist/manifest.json)" >> "$GITHUB_OUTPUT"
+          echo "failure_count=$(jq '.candidate_attempt_failures | length' dist/manifest.json)" >> "$GITHUB_OUTPUT"
 
       - name: Verify build output
         run: |

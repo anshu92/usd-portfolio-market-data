@@ -369,6 +369,7 @@ def apply_dataset_groups(
     *,
     group_overrides: Mapping[str, Mapping[str, object]] | None = None,
     candidate_group_failures: Sequence[Mapping[str, object]] | None = None,
+    candidate_attempt_failures: Sequence[Mapping[str, object]] | None = None,
 ) -> dict[str, object]:
     """Finalize additive dataset and group identities after all bytes exist."""
     datasets = dataset_identity_records(manifest, directory)
@@ -434,6 +435,9 @@ def apply_dataset_groups(
     manifest["dataset_groups"] = records
     manifest["candidate_group_failures"] = [
         dict(value) for value in (candidate_group_failures or [])
+    ]
+    manifest["candidate_attempt_failures"] = [
+        dict(value) for value in (candidate_attempt_failures or [])
     ]
     return manifest
 

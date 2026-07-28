@@ -65,9 +65,15 @@ Active groups may have only these states:
 - `NOT_CONFIGURED`: permitted only for declared optional groups such as licensed
   analyst estimates.
 
-`QUARANTINED` describes a failed candidate group and can appear only under
-`candidate_group_failures`; quarantined candidate bytes belong only in a
-short-lived diagnostic artifact, never the production artifact.
+`QUARANTINED` describes an attempted candidate that failed validation and can
+appear only as `attempt_state` under `candidate_attempt_failures`. Each attempt
+record names the separately validated `released_state`. `candidate_group_failures`
+must be empty in production manifests; quarantined candidate bytes belong only in
+a short-lived diagnostic artifact, never the production artifact.
+
+Every dataset selected from a prior immutable release records the source release
+tag, immutable-release assertion, source-manifest SHA-256, and source-group
+SHA-256. The final group digest always describes the bytes actually released.
 
 The top-level manifest may remain `status: READY` for backward compatibility
 when `identity` and `market` are usable and all active bytes pass structural

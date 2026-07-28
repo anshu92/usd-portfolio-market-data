@@ -166,7 +166,9 @@ def test_failed_insiders_reuses_only_that_group_and_promotes_market(
     assert groups["insiders"]["state"] == "READY_REUSED"
     assert groups["insiders"]["group_sha256"] == previous_groups["insiders"]["group_sha256"]
     assert groups["insiders"]["source_group_sha256"] == previous_groups["insiders"]["group_sha256"]
-    assert [failure["group_id"] for failure in result["candidate_group_failures"]] == ["insiders"]
+    assert result["candidate_group_failures"] == []
+    assert [failure["group_id"] for failure in result["candidate_attempt_failures"]] == ["insiders"]
+    assert result["candidate_attempt_failures"][0]["released_state"] == "READY_REUSED"
     assert hashlib.sha256((output / "insider-transactions.parquet").read_bytes()).hexdigest() == hashlib.sha256((previous / "insider-transactions.parquet").read_bytes()).hexdigest()
     assert hashlib.sha256((output / "yahoo-ohlcv-320.parquet").read_bytes()).hexdigest() == hashlib.sha256((candidate / "yahoo-ohlcv-320.parquet").read_bytes()).hexdigest()
 
@@ -306,6 +308,100 @@ def test_historical_538_conflicts_and_13_null_ciks_are_all_detected(
         ) == 551
     finally:
         con.close()
+
+
+def test_market_security_ids_must_exist_in_packaged_master(
+    verify_module, tmp_path: Path
+):
+    release = tmp_path / "release"
+    _write_grouped_release(release)
+    prices = release / "yahoo-ohlcv-320.parquet"
+    con = duckdb.connect()
+    try:
+        source = str(prices).replace("'", "''")
+        target = str(release / "orphan.parquet").replace("'", "''")
+        con.execute(
+            f"COPY (SELECT * FROM read_parquet('{source}') UNION ALL "
+            "SELECT 'XNYS:ORPHAN','ORPHAN','ORPHAN',DATE '2026-07-24',"
+            "10,11,9,10,1,'fixture','market-rev','2026-07-25T00:00:00Z') "
+            f"TO '{target}' (FORMAT PARQUET)"
+        )
+        (release / "orphan.parquet").replace(prices)
+        with pytest.raises(
+            verify_module.VerificationError,
+            match="Unknown security_id in yahoo-ohlcv-320.parquet: 1 rows",
+        ):
+            verify_module.verify_identity_references(
+                con, release, {"yahoo-ohlcv-320.parquet"}
+            )
+    finally:
+        con.close()
+
+
+def test_market_fallback_filters_orphans_and_records_source_identity(
+    compose_module, tmp_path: Path
+):
+    previous = tmp_path / "previous"
+    _write_grouped_release(previous)
+    candidate = tmp_path / "candidate"
+    output = tmp_path / "output"
+    shutil.copytree(previous, candidate)
+    shutil.copytree(previous, output)
+    con = duckdb.connect()
+    try:
+        prices = previous / "yahoo-ohlcv-320.parquet"
+        target = previous / "market-with-orphan.parquet"
+        source_sql = str(prices).replace("'", "''")
+        target_sql = str(target).replace("'", "''")
+        con.execute(
+            f"COPY (SELECT * FROM read_parquet('{source_sql}') UNION ALL "
+            "SELECT 'XNYS:ORPHAN','ORPHAN','ORPHAN',DATE '2026-07-24',"
+            "10,11,9,10,1,'fixture','market-rev','2026-07-25T00:00:00Z') "
+            f"TO '{target_sql}' (FORMAT PARQUET)",
+        )
+        target.replace(prices)
+    finally:
+        con.close()
+    previous_manifest = json.loads((previous / "manifest.json").read_text())
+    release_records = {
+        record["file"]: record for record in previous_manifest["release_files"]
+    }
+    release_records[prices.name] = _file_record(prices, 2)
+    previous_manifest["release_files"] = list(release_records.values())
+    apply_dataset_groups(previous_manifest, previous)
+    (previous / "manifest.json").write_text(
+        json.dumps(previous_manifest, sort_keys=True), encoding="utf-8"
+    )
+
+    candidate_manifest = json.loads((candidate / "manifest.json").read_text())
+    candidate_manifest["status"] = "VALIDATION_FAILED"
+    candidate_manifest["validation"]["errors"] = ["candidate failed"]
+    (candidate / "manifest.json").write_text(
+        json.dumps(candidate_manifest, sort_keys=True), encoding="utf-8"
+    )
+
+    result = compose_module.compose_release(
+        candidate, previous, output, "market-data-20260725T000000Z"
+    )
+    groups = {record["group_id"]: record for record in result["dataset_groups"]}
+    datasets = {record["path"]: record for record in result["datasets"]}
+    assert groups["market"]["state"] == "READY_WITH_EXCLUSIONS"
+    assert groups["market"]["source_release_immutable"] is True
+    assert datasets["yahoo-ohlcv-320.parquet"]["source_release_tag"] == (
+        "market-data-20260725T000000Z"
+    )
+    assert datasets["yahoo-ohlcv-320.parquet"]["source_group_sha256"] == (
+        groups["market"]["source_group_sha256"]
+    )
+    check = duckdb.connect()
+    try:
+        ids = check.execute(
+            "SELECT DISTINCT security_id FROM read_parquet(?)",
+            [str(output / "yahoo-ohlcv-320.parquet")],
+        ).fetchall()
+    finally:
+        check.close()
+    assert ids == [("ARCX:VTI",)]
 
 
 def _pointer_fixture(directory: Path):

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import csv
 import json
 import os
 import shutil
@@ -200,6 +201,135 @@ def validate_group_files(
     return diagnostics
 
 
+def identity_orphan_counts(directory: Path, filenames: list[str]) -> dict[str, int]:
+    """Count dataset identities that are absent from the packaged security master."""
+    master = directory / "security-master.parquet"
+    if not master.is_file():
+        raise CompositionError("Final security master is unavailable")
+    counts: dict[str, int] = {}
+    con = duckdb.connect()
+    try:
+        for filename in filenames:
+            path = directory / filename
+            if path.suffix != ".parquet" or filename == master.name:
+                continue
+            columns = {
+                str(column[0])
+                for column in con.execute(
+                    "SELECT * FROM read_parquet(?) LIMIT 0", [str(path)]
+                ).description
+            }
+            if "security_id" not in columns:
+                continue
+            count = int(
+                con.execute(
+                    """
+                    SELECT count(*)
+                    FROM read_parquet(?) dataset
+                    LEFT JOIN read_parquet(?) master USING (security_id)
+                    WHERE dataset.security_id IS NOT NULL
+                      AND master.security_id IS NULL
+                    """,
+                    [str(path), str(master)],
+                ).fetchone()[0]
+            )
+            if count:
+                counts[filename] = count
+    finally:
+        con.close()
+    return counts
+
+
+def filter_market_orphans(directory: Path) -> dict[str, int]:
+    """Remove fallback histories that cannot join the selected identity group."""
+    filenames = ["yahoo-ohlcv-320.parquet", "yahoo-splits.parquet"]
+    counts = identity_orphan_counts(directory, filenames)
+    if not counts:
+        return {}
+    master = directory / "security-master.parquet"
+    con = duckdb.connect()
+    try:
+        for filename in counts:
+            source = directory / filename
+            target = source.with_suffix(source.suffix + ".identity.tmp")
+            source_sql = str(source).replace("'", "''")
+            master_sql = str(master).replace("'", "''")
+            target_sql = str(target).replace("'", "''")
+            con.execute(
+                f"""
+                COPY (
+                    SELECT dataset.*
+                    FROM read_parquet('{source_sql}') dataset
+                    SEMI JOIN read_parquet('{master_sql}') master USING (security_id)
+                ) TO '{target_sql}' (FORMAT PARQUET)
+                """,
+            )
+            os.replace(target, source)
+    finally:
+        con.close()
+    return counts
+
+
+def refreshed_release_record(
+    path: Path, prior: Mapping[str, object]
+) -> dict[str, object]:
+    record = copy.deepcopy(dict(prior))
+    con = duckdb.connect()
+    try:
+        rows = int(
+            con.execute("SELECT count(*) FROM read_parquet(?)", [str(path)]).fetchone()[0]
+        )
+    finally:
+        con.close()
+    record.update({"sha256": sha256_file(path), "bytes": path.stat().st_size, "rows": rows})
+    return record
+
+
+def recompute_market_readiness(directory: Path, manifest: dict[str, object]) -> None:
+    """Derive coverage from the final released identities and market bytes."""
+    admitted: set[str] = set()
+    tickers: dict[str, str] = {}
+    with (directory / "security-universe.csv").open(
+        newline="", encoding="utf-8-sig"
+    ) as handle:
+        for row in csv.DictReader(handle):
+            if str(row.get("universe_admission_status") or "").upper() not in {
+                "ADMITTED",
+                "ADMITTED_ETF",
+            }:
+                continue
+            security_id = str(row.get("security_id") or "")
+            admitted.add(security_id)
+            tickers[security_id] = str(row.get("ticker") or "").upper()
+    prices = directory / "yahoo-ohlcv-320.parquet"
+    con = duckdb.connect()
+    try:
+        observed = con.execute(
+            "SELECT max(session_date) FROM read_parquet(?)", [str(prices)]
+        ).fetchone()[0]
+        covered = {
+            str(row[0])
+            for row in con.execute(
+                "SELECT DISTINCT security_id FROM read_parquet(?) WHERE session_date = ?",
+                [str(prices), observed],
+            ).fetchall()
+        }
+    finally:
+        con.close()
+    coverage = len(covered & admitted) / len(admitted) if admitted else 0.0
+    validation = manifest.setdefault("validation", {})
+    if not isinstance(validation, dict):
+        raise CompositionError("Candidate validation section is invalid")
+    validation["latest_session_coverage"] = coverage
+    validation["benchmark_valid"] = any(
+        tickers.get(security_id) == "VTI" for security_id in covered & admitted
+    )
+    if coverage < 0.95:
+        raise CompositionError(
+            f"Final market latest-session coverage {coverage:.2%} is below 95.00%"
+        )
+
+
 def copy_atomic(source: Path, target: Path) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.with_suffix(target.suffix + ".compose.tmp")
@@ -239,6 +369,11 @@ def compose_release(
     previous_release = records_by_name(previous, "file", "release_files")
     candidate_datasets = records_by_name(candidate, "path", "datasets")
     previous_datasets = records_by_name(previous, "path", "datasets")
+    previous_groups = {
+        str(record.get("group_id")): record
+        for record in previous.get("dataset_groups", [])
+        if isinstance(record, dict)
+    }
 
     selected_release: dict[str, dict[str, object]] = {}
     selected_datasets: dict[str, dict[str, object]] = {}
@@ -287,7 +422,7 @@ def compose_release(
         failures.append(
             {
                 "group_id": group_id,
-                "state": "QUARANTINED",
+                "attempt_state": "QUARANTINED",
                 "diagnostics": diagnostics,
             }
         )
@@ -306,16 +441,45 @@ def compose_release(
             )
         for filename in group.files:
             copy_atomic(previous_directory / filename, output_directory / filename)
-            selected_release[filename] = copy.deepcopy(previous_release[filename])
+        orphan_counts = filter_market_orphans(output_directory) if group_id == "market" else {}
+        source_group_sha = str(previous_groups.get(group_id, {}).get("group_sha256") or "")
+        if not source_group_sha:
+            raise CompositionError(f"Fallback group lacks immutable identity: {group_id}")
+        for filename in group.files:
+            selected_release[filename] = (
+                refreshed_release_record(output_directory / filename, previous_release[filename])
+                if filename in orphan_counts
+                else copy.deepcopy(previous_release[filename])
+            )
             if filename in previous_datasets:
-                selected_datasets[filename] = copy.deepcopy(previous_datasets[filename])
+                dataset = copy.deepcopy(previous_datasets[filename])
+                dataset.update(
+                    {
+                        "source_release_tag": source_tag,
+                        "source_release_immutable": True,
+                        "source_manifest_sha256": previous_manifest_sha,
+                        "source_group_sha256": source_group_sha,
+                    }
+                )
+                selected_datasets[filename] = dataset
         reused_groups.add(group_id)
         overrides[group_id] = {
-            "state": "READY_REUSED",
-            "mode": "PINNED_IMMUTABLE_GROUP_REUSE",
+            "state": "READY_WITH_EXCLUSIONS" if orphan_counts else "READY_REUSED",
+            "mode": (
+                "FILTERED_PINNED_IMMUTABLE_GROUP_REUSE"
+                if orphan_counts
+                else "PINNED_IMMUTABLE_GROUP_REUSE"
+            ),
             "source_release_tag": source_tag,
+            "source_release_immutable": True,
             "source_manifest_sha256": previous_manifest_sha,
+            "source_group_sha256": source_group_sha,
+            "exclusions": [
+                {"file": filename, "reason": "UNKNOWN_SECURITY_ID", "rows": rows}
+                for filename, rows in sorted(orphan_counts.items())
+            ],
         }
+        failures[-1]["released_state"] = overrides[group_id]["state"]
         if group_id == "market":
             candidate["aggregate"] = copy.deepcopy(previous.get("aggregate"))
             candidate["splits"] = copy.deepcopy(previous.get("splits"))
@@ -350,19 +514,21 @@ def compose_release(
     candidate["datasets"] = [
         selected_datasets[filename] for filename in sorted(selected_datasets)
     ]
+    remaining_orphans = identity_orphan_counts(
+        output_directory, sorted(selected_release)
+    )
+    if remaining_orphans:
+        raise CompositionError(f"Final release contains unknown security IDs: {remaining_orphans}")
+    recompute_market_readiness(output_directory, candidate)
     merge_reused_coverage(candidate, previous, reused_groups)
     candidate["status"] = "READY"
     apply_dataset_groups(
         candidate,
         output_directory,
         group_overrides=overrides,
-        candidate_group_failures=failures,
+        candidate_group_failures=[],
+        candidate_attempt_failures=failures,
     )
-    previous_groups = {
-        str(record.get("group_id")): record
-        for record in previous.get("dataset_groups", [])
-        if isinstance(record, dict)
-    }
     for record in candidate["dataset_groups"]:
         group_id = str(record.get("group_id") or "")
         if group_id not in reused_groups:
@@ -371,12 +537,13 @@ def compose_release(
             previous_groups.get(group_id, {}).get("group_sha256")
             or record["group_sha256"]
         )
-        if source_digest != record["group_sha256"]:
+        if record["state"] == "READY_REUSED" and source_digest != record["group_sha256"]:
             raise CompositionError(f"Reused group digest changed: {group_id}")
         record["source_group_sha256"] = source_digest
-        record["state"] = freshness_state_for_reuse(
-            group_id, record["freshness"]
-        )
+        if record["state"] == "READY_REUSED":
+            record["state"] = freshness_state_for_reuse(
+                group_id, record["freshness"]
+            )
         if group_id in CORE_GROUPS and record["state"] == "STALE_DISABLED":
             raise CompositionError(f"Core fallback group is stale-disabled: {group_id}")
 
@@ -411,7 +578,7 @@ def main(argv: list[str] | None = None) -> int:
             {
                 "status": manifest["status"],
                 "candidate_group_failures": len(
-                    manifest["candidate_group_failures"]
+                    manifest["candidate_attempt_failures"]
                 ),
             },
             sort_keys=True,
