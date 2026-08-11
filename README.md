@@ -48,6 +48,9 @@ tag, verifies GitHub's SHA-256 digest for every asset, runs the production manif
 verifier, and uploads `validated-market-data-{tag}` as a 30-day workflow artifact. The
 artifact also contains `github-release.json` and `resolved-tag.txt` so the receiving
 consumer can independently revalidate the pinned release before atomic promotion.
+Every producer-side workflow upload is compressed at level 9 and rejects an input
+payload at or above 511 MiB, reserving 1 MiB of packaging headroom so the resulting
+artifact remains strictly below 512 MiB.
 After upload, a separate write-scoped job commits
 `consumer/latest-production-artifact.json` with the exact run, artifact, release,
 producer-commit, expiry, size, and digest values. Consumers must compare that pointer

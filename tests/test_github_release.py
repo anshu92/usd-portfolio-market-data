@@ -167,6 +167,18 @@ def test_production_publish_dispatches_consumer_export():
     assert "gh workflow run export-release-for-consumer.yml" in workflow
 
 
+def test_producer_workflow_artifacts_are_bounded_and_compressed():
+    workflows = Path(__file__).resolve().parents[1] / ".github/workflows"
+    combined = "\n".join(
+        path.read_text(encoding="utf-8") for path in sorted(workflows.glob("*.yml"))
+    )
+    upload_count = combined.count("actions/upload-artifact@")
+    assert upload_count == 4
+    assert combined.count("compression-level: 9") == upload_count
+    assert "compression-level: 0" not in combined
+    assert combined.count("verify-workflow-artifact-size.py") == upload_count
+
+
 def test_recovery_workflow_is_bounded_and_trusts_only_production_artifacts():
     workflow = (
         Path(__file__).resolve().parents[1]

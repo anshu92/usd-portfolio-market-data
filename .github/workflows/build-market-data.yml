@@ -457,8 +457,21 @@ jobs:
           )
           PY
 
-      - name: Upload seven-day diagnostic artifact
+      - name: Enforce diagnostic artifact size limit
+        id: diagnostic_artifact_size
         if: always()
+        shell: bash
+        run: |
+          python verify-workflow-artifact-size.py --allow-missing \
+            dist/*.parquet \
+            dist/security-universe.csv \
+            dist/manifest.json \
+            dist/unmatched-tickers.csv \
+            dist/NOTICE.md \
+            dist/release-notes.md
+
+      - name: Upload seven-day diagnostic artifact
+        if: always() && steps.diagnostic_artifact_size.outcome == 'success'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ steps.inputs.outputs.artifact_name }}
@@ -471,17 +484,22 @@ jobs:
             dist/release-notes.md
           if-no-files-found: warn
           retention-days: 7
-          compression-level: 0
+          compression-level: 9
+
+      - name: Enforce quarantined artifact size limit
+        id: quarantined_artifact_size
+        if: always() && steps.inputs.outputs.mode == 'full' && steps.group_composition.outputs.failure_count != '0'
+        run: python verify-workflow-artifact-size.py "$RUNNER_TEMP/candidate-release"
 
       - name: Upload quarantined candidate bytes
-        if: always() && steps.inputs.outputs.mode == 'full' && steps.group_composition.outputs.failure_count != '0'
+        if: always() && steps.inputs.outputs.mode == 'full' && steps.group_composition.outputs.failure_count != '0' && steps.quarantined_artifact_size.outcome == 'success'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: quarantined-candidates-${{ github.run_id }}
           path: ${{ runner.temp }}/candidate-release
           if-no-files-found: warn
           retention-days: 7
-          compression-level: 0
+          compression-level: 9
 
   publish:
     needs: build
