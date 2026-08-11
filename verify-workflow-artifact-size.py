@@ -4,20 +4,29 @@
 from __future__ import annotations
 
 import argparse
+import tempfile
+import zipfile
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, NamedTuple
 
 
 MAX_ARTIFACT_BYTES = 512 * 1024 * 1024
 PACKAGING_HEADROOM_BYTES = 1024 * 1024
-MAX_INPUT_BYTES = MAX_ARTIFACT_BYTES - PACKAGING_HEADROOM_BYTES
+MAX_PREVIEW_BYTES = MAX_ARTIFACT_BYTES - PACKAGING_HEADROOM_BYTES
 
 
 class ArtifactSizeError(RuntimeError):
     """Raised when workflow artifact inputs are unsafe or too large."""
 
 
-def artifact_input_size(paths: Iterable[Path], allow_missing: bool = False) -> int:
+class ArtifactSize(NamedTuple):
+    input_bytes: int
+    preview_bytes: int
+
+
+def artifact_input_files(
+    paths: Iterable[Path], allow_missing: bool = False
+) -> dict[Path, int]:
     files: dict[Path, int] = {}
     for path in paths:
         if path.is_symlink():
@@ -36,18 +45,38 @@ def artifact_input_size(paths: Iterable[Path], allow_missing: bool = False) -> i
                 )
             if candidate.is_file():
                 files[candidate.resolve()] = candidate.stat().st_size
-    return sum(files.values())
+    return files
+
+
+def compressed_preview_size(files: Iterable[Path]) -> int:
+    with tempfile.TemporaryFile() as preview:
+        with zipfile.ZipFile(
+            preview,
+            mode="w",
+            compression=zipfile.ZIP_DEFLATED,
+            compresslevel=9,
+            allowZip64=True,
+        ) as archive:
+            for index, path in enumerate(sorted(files), start=1):
+                archive.write(path, arcname=f"{index:04d}-{path.name}")
+        return preview.tell()
 
 
 def verify_artifact_inputs(
     paths: Iterable[Path], allow_missing: bool = False
-) -> int:
-    size = artifact_input_size(paths, allow_missing=allow_missing)
-    if size >= MAX_INPUT_BYTES:
+) -> ArtifactSize:
+    files = artifact_input_files(paths, allow_missing=allow_missing)
+    size = ArtifactSize(
+        input_bytes=sum(files.values()),
+        preview_bytes=compressed_preview_size(files),
+    )
+    if size.preview_bytes >= MAX_PREVIEW_BYTES:
         raise ArtifactSizeError(
-            f"Workflow artifact inputs total {size:,} bytes; they must be less than "
-            f"{MAX_INPUT_BYTES:,} bytes to reserve {PACKAGING_HEADROOM_BYTES:,} bytes "
-            f"and keep the packaged artifact below {MAX_ARTIFACT_BYTES:,} bytes"
+            f"Compressed workflow artifact preview totals {size.preview_bytes:,} "
+            f"bytes from {size.input_bytes:,} input bytes; the preview must be less "
+            f"than {MAX_PREVIEW_BYTES:,} bytes to reserve "
+            f"{PACKAGING_HEADROOM_BYTES:,} bytes and keep the uploaded artifact below "
+            f"{MAX_ARTIFACT_BYTES:,} bytes"
         )
     return size
 
@@ -66,8 +95,9 @@ def main() -> int:
     except ArtifactSizeError as exc:
         parser.error(str(exc))
     print(
-        f"Workflow artifact inputs: {size:,} bytes "
-        f"(limit with packaging headroom: {MAX_INPUT_BYTES - 1:,} bytes)"
+        f"Workflow artifact inputs: {size.input_bytes:,} bytes; "
+        f"compressed preview: {size.preview_bytes:,} bytes "
+        f"(preview limit with packaging headroom: {MAX_PREVIEW_BYTES - 1:,} bytes)"
     )
     return 0
 

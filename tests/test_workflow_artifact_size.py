@@ -20,22 +20,25 @@ def load_module():
 def test_accepts_inputs_below_limit_and_deduplicates_paths(tmp_path: Path):
     module = load_module()
     payload = tmp_path / "payload.bin"
-    payload.write_bytes(b"artifact")
+    payload.write_bytes(b"artifact" * 1_000)
 
-    assert module.verify_artifact_inputs([tmp_path, payload]) == len(b"artifact")
+    size = module.verify_artifact_inputs([tmp_path, payload])
+    assert size.input_bytes == len(b"artifact" * 1_000)
+    assert size.preview_bytes < size.input_bytes
 
 
-def test_rejects_inputs_without_packaging_headroom(tmp_path: Path):
+def test_rejects_preview_without_packaging_headroom(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
     module = load_module()
     payload = tmp_path / "payload.bin"
-    with payload.open("wb") as handle:
-        handle.truncate(module.MAX_INPUT_BYTES - 1)
-    assert module.verify_artifact_inputs([payload]) == module.MAX_INPUT_BYTES - 1
+    payload.write_bytes(b"artifact")
 
-    with payload.open("wb") as handle:
-        handle.truncate(module.MAX_INPUT_BYTES)
+    monkeypatch.setattr(
+        module, "compressed_preview_size", lambda _: module.MAX_PREVIEW_BYTES
+    )
 
-    with pytest.raises(module.ArtifactSizeError, match="packaged artifact below"):
+    with pytest.raises(module.ArtifactSizeError, match="uploaded artifact below"):
         module.verify_artifact_inputs([payload])
 
 
@@ -45,4 +48,6 @@ def test_missing_inputs_require_explicit_best_effort_mode(tmp_path: Path):
 
     with pytest.raises(module.ArtifactSizeError, match="does not exist"):
         module.verify_artifact_inputs([missing])
-    assert module.verify_artifact_inputs([missing], allow_missing=True) == 0
+    size = module.verify_artifact_inputs([missing], allow_missing=True)
+    assert size.input_bytes == 0
+    assert size.preview_bytes > 0
