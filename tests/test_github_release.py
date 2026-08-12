@@ -94,6 +94,24 @@ def test_rejects_unexpected_download(github_release_module, tmp_path: Path):
         github_release_module.verify_downloads(tmp_path, assets)
 
 
+def test_validates_a_nonempty_downloaded_release_subset(
+    github_release_module, tmp_path: Path
+):
+    metadata = release_metadata(github_release_module, tmp_path)
+    _, assets = github_release_module.validate_metadata(metadata)
+    for path in tuple(tmp_path.iterdir()):
+        if path.name not in {"manifest.json", "security-universe.csv"}:
+            path.unlink()
+    github_release_module.verify_downloads(tmp_path, assets, allow_subset=True)
+
+    (tmp_path / "manifest.json").unlink()
+    (tmp_path / "security-universe.csv").unlink()
+    with pytest.raises(
+        github_release_module.ReleaseMetadataError, match="subset is empty"
+    ):
+        github_release_module.verify_downloads(tmp_path, assets, allow_subset=True)
+
+
 def test_export_workflow_is_read_only_and_sha_pinned():
     workflow = (
         Path(__file__).resolve().parents[1]
@@ -165,6 +183,30 @@ def test_production_publish_dispatches_consumer_export():
     ).read_text(encoding="utf-8")
     assert "actions: write" in workflow
     assert "gh workflow run export-release-for-consumer.yml" in workflow
+    assert "gh workflow run build-decision-support.yml" in workflow
+    assert '-f source_tag="$TAG"' in workflow
+
+
+def test_decision_support_workflows_are_pinned_and_least_privilege():
+    workflows = Path(__file__).resolve().parents[1] / ".github/workflows"
+    build = (workflows / "build-decision-support.yml").read_text(encoding="utf-8")
+    pointer = (workflows / "publish-decision-support-pointer.yml").read_text(
+        encoding="utf-8"
+    )
+    assert "permissions:\n  contents: read" in build
+    assert "contents: write" not in build
+    assert "sec-company-facts.parquet" not in build
+    assert "institutional-holdings-13f.parquet" not in build
+    assert "verify-decision-support.py --dist dist" in build
+    assert "workflow_run:" in pointer
+    assert '.path == ".github/workflows/build-decision-support.yml"' in pointer
+    assert "actions: read\n      contents: write" in pointer
+    assert "verify-decision-support-pointer.py" in pointer
+    assert "consumer/latest-decision-support-artifact.json" in pointer
+    for line in (build + pointer).splitlines():
+        if "uses:" in line:
+            reference = line.split("uses:", 1)[1].split("#", 1)[0].strip()
+            assert re_full_sha_reference(reference), reference
 
 
 def test_producer_workflow_artifacts_are_bounded_and_compressed():
@@ -173,7 +215,7 @@ def test_producer_workflow_artifacts_are_bounded_and_compressed():
         path.read_text(encoding="utf-8") for path in sorted(workflows.glob("*.yml"))
     )
     upload_count = combined.count("actions/upload-artifact@")
-    assert upload_count == 4
+    assert upload_count == 5
     assert combined.count("compression-level: 9") == upload_count
     assert "compression-level: 0" not in combined
     assert combined.count("verify-workflow-artifact-size.py") == upload_count

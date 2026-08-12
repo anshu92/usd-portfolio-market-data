@@ -58,6 +58,32 @@ against the Actions artifact API and then revalidate the downloaded contents; th
 pointer is discovery metadata, not a substitute for validation. Successful production
 publication automatically dispatches a fresh consumer export.
 
+## Compact decision-support stream
+
+Routine V5 phases must not download or import the complete historical release. After a
+production tag is published, `build-decision-support.yml` downloads a bounded source
+set pinned to that immutable tag and produces:
+
+- `decision-support.sqlite.zst`, a pre-indexed read-only SQLite database;
+- `decision-support-manifest.json`, which binds every byte to the source release and
+  dataset-group identities; and
+- seven canonical JSON phase packs under `phase-packs/` for Sunday, pre-open,
+  execution research, exception monitoring, terminal review, accounting, and Saturday
+  replay.
+
+The compact database contains recent raw-close research history and current derived
+evidence, not executable quotes or dividend-adjusted prices. Phase packs expose missing
+or stale capabilities as `BLOCKED` or `DEGRADED`; they never invent an input. Live
+quotes, halt/LULD state, broker eligibility, portfolio state, cash, lots,
+confirmations, and final decisions remain consumer-owned.
+
+See [DECISION_SUPPORT_CONTRACT.md](DECISION_SUPPORT_CONTRACT.md) for the exact source
+identity, phase-state, validation, live-snapshot, and failure contract.
+
+`publish-decision-support-pointer.yml` validates the completed Actions artifact and
+commits `consumer/latest-decision-support-artifact.json`. The full historical release
+and its existing pointer remain unchanged for replay and audit consumers.
+
 The manifest reports each enrichment domain independently. Analyst estimates remain
 absent until a licensed provider is configured and are explicitly reported as
 `NOT_CONFIGURED`; this disables estimate-only components, not unrelated archetypes.

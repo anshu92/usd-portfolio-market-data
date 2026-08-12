@@ -77,3 +77,37 @@ Archetype readiness is evaluated by subset:
 Missing analyst estimates may lower conviction only for estimate-specific components.
 They must not erase confirmed guidance, earnings or filing events, price drift, growth,
 valuation, or other ready inputs.
+
+## Routine decision-support import
+
+Routine V5 work should resolve `latest-decision-support-artifact.json`, verify its
+Actions run/artifact and immutable source-release identity with
+`verify-decision-support-pointer.py`, and then run:
+
+```bash
+python verify-decision-support.py --dist staging/decision-support
+zstd -d staging/decision-support/decision-support.sqlite.zst \
+  -o staging/decision-support/decision-support.sqlite
+```
+
+Open the database read-only and immutable:
+
+```text
+file:/absolute/path/decision-support.sqlite?mode=ro&immutable=1
+```
+
+Read the phase pack matching the current V5 phase before querying evidence. `BLOCKED`
+means at least one producer-required capability is unavailable or too stale;
+`DEGRADED` means only optional capabilities are unavailable. A listed
+`CONSUMER_REQUIRED` capability, such as `execution_snapshot`, must be fetched at the
+actual cutoff and is never satisfied by the historical OHLCV tables.
+
+Quote, halt/LULD, and broker integrations must emit the provider-neutral live-snapshot
+schema and pass `python verify-live-snapshot.py --snapshot live-snapshot.json`. The
+validator rejects stale or crossed quotes, future timestamps, unknown halt/LULD state,
+broker ineligibility, invalid bands, and private account or portfolio fields. A blocked
+live snapshot must never fall back to producer OHLCV for execution.
+
+The compact stream is not a replacement for the canonical release. Saturday replay,
+audit, raw SEC facts, detailed 13F holdings, and history beyond the recent hot window
+must continue to use the pinned full release.

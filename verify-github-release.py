@@ -80,18 +80,26 @@ def validate_metadata(
     return tag, assets
 
 
-def verify_downloads(directory: Path, assets: dict[str, dict[str, object]]) -> None:
+def verify_downloads(
+    directory: Path,
+    assets: dict[str, dict[str, object]],
+    *,
+    allow_subset: bool = False,
+) -> None:
     if not directory.is_dir():
         raise ReleaseMetadataError(f"Release directory is missing: {directory}")
     entries = {entry.name for entry in directory.iterdir()}
-    missing = set(EXPECTED_ASSETS) - entries
+    downloaded_assets = entries - EXPORT_METADATA_FILES
+    if allow_subset and not downloaded_assets:
+        raise ReleaseMetadataError("Downloaded asset subset is empty")
+    missing = set() if allow_subset else set(EXPECTED_ASSETS) - entries
     unexpected = entries - set(EXPECTED_ASSETS) - EXPORT_METADATA_FILES
     if missing or unexpected:
         raise ReleaseMetadataError(
             "Downloaded file set mismatch: "
             f"missing={sorted(missing)}, unexpected={sorted(unexpected)}"
         )
-    for name in EXPECTED_ASSETS:
+    for name in sorted(downloaded_assets if allow_subset else EXPECTED_ASSETS):
         path = directory / name
         if path.is_symlink() or not path.is_file():
             raise ReleaseMetadataError(f"Downloaded asset is not a regular file: {name}")
@@ -108,21 +116,36 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--metadata", required=True)
     parser.add_argument("--dist")
+    parser.add_argument(
+        "--allow-subset",
+        action="store_true",
+        help="Verify every downloaded file while allowing omitted release assets",
+    )
     args = parser.parse_args(argv)
     try:
         metadata = json.loads(Path(args.metadata).read_text(encoding="utf-8"))
         if not isinstance(metadata, dict):
             raise ReleaseMetadataError("Release metadata root is not an object")
         tag, assets = validate_metadata(metadata)
+        verified_count = 0
         if args.dist:
-            verify_downloads(Path(args.dist), assets)
+            verify_downloads(
+                Path(args.dist), assets, allow_subset=args.allow_subset
+            )
+            verified_count = len(
+                {
+                    entry.name
+                    for entry in Path(args.dist).iterdir()
+                    if entry.name not in EXPORT_METADATA_FILES
+                }
+            )
     except (json.JSONDecodeError, OSError, ReleaseMetadataError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     print(
         json.dumps(
             {
-                "assets_verified": len(assets) if args.dist else 0,
+                "assets_verified": verified_count,
                 "immutable": True,
                 "tag": tag,
             },

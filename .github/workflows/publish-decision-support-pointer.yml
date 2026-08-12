@@ -1,0 +1,180 @@
+name: Publish decision-support artifact pointer
+
+on:
+  workflow_run:
+    workflows: ["Build decision-support artifact"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: "Successful Build decision-support artifact run"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-decision-support-pointer
+  cancel-in-progress: false
+
+jobs:
+  publish_pointer:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Check out trusted validators
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.13.14"
+          cache: pip
+          cache-dependency-path: requirements-market-data.txt
+
+      - name: Install reviewed dependencies
+        run: python -m pip install --disable-pip-version-check --require-hashes -r requirements-market-data.txt
+
+      - name: Require Zstandard CLI
+        run: zstd --version
+
+      - name: Resolve trusted source run and artifact
+        id: artifact
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ github.event.workflow_run.id || inputs.source_run_id }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_RUN_ID" =~ ^[0-9]+$ ]] || { echo "source_run_id must be numeric" >&2; exit 2; }
+          gh api \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}" \
+            > "$RUNNER_TEMP/run.json"
+          jq -e --arg repo "$GITHUB_REPOSITORY" '
+            .head_repository.full_name == $repo and
+            .head_branch == "main" and
+            .path == ".github/workflows/build-decision-support.yml" and
+            .event == "workflow_dispatch" and
+            .status == "completed" and
+            .conclusion == "success"
+          ' "$RUNNER_TEMP/run.json" >/dev/null
+          gh api \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}/artifacts" \
+            > "$RUNNER_TEMP/artifacts.json"
+          artifact_count="$(jq '[.artifacts[] | select(.name | startswith("decision-support-market-data-"))] | length' "$RUNNER_TEMP/artifacts.json")"
+          if [[ "$artifact_count" != "1" ]]; then
+            echo "Expected exactly one decision-support artifact, found $artifact_count" >&2
+            exit 2
+          fi
+          artifact_id="$(jq -r '.artifacts[] | select(.name | startswith("decision-support-market-data-")) | .id' "$RUNNER_TEMP/artifacts.json")"
+          artifact_name="$(jq -r '.artifacts[] | select(.name | startswith("decision-support-market-data-")) | .name' "$RUNNER_TEMP/artifacts.json")"
+          gh api \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}" \
+            > "$RUNNER_TEMP/artifact.json"
+          echo "artifact_name=$artifact_name" >> "$GITHUB_OUTPUT"
+          echo "run_id=$SOURCE_RUN_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Download exact completed-run artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ steps.artifact.outputs.artifact_name }}
+          path: staging/decision-support
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.artifact.outputs.run_id }}
+          github-token: ${{ github.token }}
+          digest-mismatch: error
+
+      - name: Verify bytes and resolve immutable source release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python verify-decision-support.py --dist staging/decision-support
+          source_tag="$(jq -r '.source_release.tag' staging/decision-support/decision-support-manifest.json)"
+          gh api \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/${GITHUB_REPOSITORY}/releases/tags/${source_tag}" \
+            > "$RUNNER_TEMP/release.json"
+          python verify-github-release.py --metadata "$RUNNER_TEMP/release.json"
+
+      - name: Build and verify exact decision-support pointer
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_tag="$(jq -r '.source_release.tag' staging/decision-support/decision-support-manifest.json)"
+          source_manifest_sha256="$(jq -r '.source_release.manifest_sha256' staging/decision-support/decision-support-manifest.json)"
+          decision_support_manifest_sha256="$(sha256sum staging/decision-support/decision-support-manifest.json | awk '{print $1}')"
+          jq -n \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg source_tag "$source_tag" \
+            --arg source_manifest_sha256 "$source_manifest_sha256" \
+            --arg decision_support_manifest_sha256 "$decision_support_manifest_sha256" \
+            --slurpfile artifact "$RUNNER_TEMP/artifact.json" \
+            --slurpfile run "$RUNNER_TEMP/run.json" \
+            '{
+              schema_version: "1.0.0",
+              repository: $repository,
+              source_release_tag: $source_tag,
+              source_manifest_sha256: $source_manifest_sha256,
+              workflow_run_id: $run[0].id,
+              artifact_id: $artifact[0].id,
+              artifact_name: $artifact[0].name,
+              artifact_sha256: ($artifact[0].digest | sub("^sha256:"; "")),
+              artifact_size_bytes: $artifact[0].size_in_bytes,
+              artifact_expires_at: $artifact[0].expires_at,
+              producer_commit: $run[0].head_sha,
+              decision_support_manifest_sha256: $decision_support_manifest_sha256,
+              source_release_immutable: true,
+              generated_at_utc: (now | todateiso8601)
+            }' > "$RUNNER_TEMP/latest-decision-support-artifact.json"
+          python verify-decision-support-pointer.py \
+            --pointer "$RUNNER_TEMP/latest-decision-support-artifact.json" \
+            --artifact-metadata "$RUNNER_TEMP/artifact.json" \
+            --run-metadata "$RUNNER_TEMP/run.json" \
+            --release-metadata "$RUNNER_TEMP/release.json" \
+            --artifact-dir staging/decision-support
+
+      - name: Commit validated pointer
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          pointer_path="consumer/latest-decision-support-artifact.json"
+          source_tag="$(jq -r '.source_release_tag' "$RUNNER_TEMP/latest-decision-support-artifact.json")"
+          current_sha="$(gh api \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/${GITHUB_REPOSITORY}/contents/${pointer_path}?ref=main" \
+            --jq '.sha' 2>/dev/null || true)"
+          content="$(base64 -w 0 "$RUNNER_TEMP/latest-decision-support-artifact.json")"
+          arguments=(
+            --method PUT
+            -H 'Accept: application/vnd.github+json'
+            -H 'X-GitHub-Api-Version: 2026-03-10'
+            "repos/${GITHUB_REPOSITORY}/contents/${pointer_path}"
+            -f branch=main
+            -f content="$content"
+            -f message="Update decision-support pointer for ${source_tag}"
+          )
+          if [[ -n "$current_sha" ]]; then
+            arguments+=(-f sha="$current_sha")
+          fi
+          gh api "${arguments[@]}"
+

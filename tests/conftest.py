@@ -62,6 +62,23 @@ def github_release_module():
     return load_script("verify_github_release", "verify-github-release.py")
 
 
+@pytest.fixture(scope="session")
+def decision_builder_module():
+    return load_script("build_decision_support", "build-decision-support.py")
+
+
+@pytest.fixture(scope="session")
+def decision_verify_module():
+    return load_script("verify_decision_support", "verify-decision-support.py")
+
+
+@pytest.fixture(scope="session")
+def decision_pointer_module():
+    return load_script(
+        "verify_decision_support_pointer", "verify-decision-support-pointer.py"
+    )
+
+
 def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 

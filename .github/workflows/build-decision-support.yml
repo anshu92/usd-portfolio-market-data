@@ -1,0 +1,105 @@
+name: Build decision-support artifact
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_tag:
+        description: "Immutable market-data release tag used as the only source"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: decision-support-${{ inputs.source_tag }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out producer
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.13.14"
+          cache: pip
+          cache-dependency-path: requirements-market-data.txt
+
+      - name: Install reviewed dependencies
+        run: python -m pip install --disable-pip-version-check --require-hashes -r requirements-market-data.txt
+
+      - name: Require Zstandard CLI
+        run: zstd --version
+
+      - name: Resolve immutable source release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_TAG: ${{ inputs.source_tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p staging/source
+          gh api \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/${GITHUB_REPOSITORY}/releases/tags/${SOURCE_TAG}" \
+            > staging/github-release.json
+          python verify-github-release.py --metadata staging/github-release.json
+
+      - name: Download the bounded decision-support source set
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_TAG: ${{ inputs.source_tag }}
+        run: |
+          set -euo pipefail
+          for asset in \
+            manifest.json \
+            security-universe.csv \
+            security-master.parquet \
+            yahoo-ohlcv-320.parquet \
+            fundamental-factors.parquet \
+            corporate-events.parquet \
+            earnings-and-guidance-events.parquet \
+            insider-signals.parquet \
+            institutional-ownership-signals.parquet \
+            finra-short-interest.parquet
+          do
+            gh release download "$SOURCE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --pattern "$asset" \
+              --dir staging/source
+          done
+          python verify-github-release.py \
+            --metadata staging/github-release.json \
+            --dist staging/source \
+            --allow-subset
+
+      - name: Build compact read model and phase packs
+        run: |
+          python build-decision-support.py \
+            --release-dir staging/source \
+            --source-tag "${{ inputs.source_tag }}" \
+            --out-dir dist
+
+      - name: Verify decision-support artifact
+        run: python verify-decision-support.py --dist dist
+
+      - name: Enforce compact artifact size limit
+        run: python verify-workflow-artifact-size.py dist
+
+      - name: Upload validated decision-support artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: decision-support-${{ inputs.source_tag }}
+          path: dist
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 9
