@@ -9,11 +9,41 @@ from pathlib import Path
 
 
 SCHEMA_VERSION = "1.0.0"
+CONTRACT_VERSION = "1.1.0"
 DATABASE_FILENAME = "decision-support.sqlite.zst"
 MANIFEST_FILENAME = "decision-support-manifest.json"
 PHASE_PACK_DIRECTORY = "phase-packs"
+CANDIDATE_FUNNEL_FILENAME = "candidate-funnel.parquet"
+ACTIONABILITY_MATRIX_FILENAME = "actionability-matrix.json"
+EVIDENCE_PACKETS_FILENAME = "evidence-packets.jsonl.zst"
 RECENT_MARKET_SESSIONS = 64
+BENCHMARK_MINIMUM_SESSIONS = 140
+BENCHMARK_MINIMUM_WEEKLY_OBSERVATIONS = 26
 MAX_COMPRESSED_DATABASE_BYTES = 50 * 1024 * 1024
+TASK_TIMEZONE = "America/Toronto"
+EXCHANGE_TIMEZONE = "America/New_York"
+EXPECTED_REPOSITORY = "anshu92/usd-portfolio-market-data"
+EXPECTED_WORKFLOW_PATH = ".github/workflows/build-decision-support.yml"
+EXPECTED_WORKFLOW_ID = 332931733
+EXPECTED_BRANCH = "main"
+EXPECTED_EVENTS = ("workflow_dispatch", "schedule")
+
+OPERATING_MODES = (
+    "ARTIFACT_VALID",
+    "BENCHMARK_ONLY_SAFE",
+    "CHALLENGER_RESEARCH_READY",
+    "LIVE_SNAPSHOT_REQUIRED",
+    "CHALLENGER_BLOCKED",
+)
+
+VALIDATOR_FILES = (
+    "decision_support_contract.py",
+    "build-decision-support.py",
+    "verify-decision-support.py",
+    "verify-decision-support-pointer.py",
+    "live_snapshot_contract.py",
+    "verify-live-snapshot.py",
+)
 
 USABLE_GROUP_STATES = {
     "READY_NEW",
@@ -32,6 +62,7 @@ REQUIRED_SOURCE_FILES = (
     "insider-signals.parquet",
     "institutional-ownership-signals.parquet",
     "finra-short-interest.parquet",
+    "sec-filings.parquet",
 )
 
 OPTIONAL_SOURCE_FILES = (
@@ -56,6 +87,23 @@ EXPECTED_TABLES = (
     "analyst_estimates_latest",
     "distributions",
     "benchmark_total_returns",
+    "primary_filings_latest",
+    "evidence",
+    "candidate_funnel",
+    "actionability_matrix",
+)
+
+CANDIDATE_FUNNEL_SCHEMA = (
+    ("candidate_id", "VARCHAR"),
+    ("security_id", "VARCHAR"),
+    ("phase_id", "VARCHAR"),
+    ("funnel_state", "VARCHAR"),
+    ("candidate_rank", "BIGINT"),
+    ("rejection_codes_json", "VARCHAR"),
+    ("evidence_ids_json", "VARCHAR"),
+    ("known_at_utc", "TIMESTAMP"),
+    ("revision", "VARCHAR"),
+    ("source_retrieved_at_utc", "TIMESTAMP"),
 )
 
 PRIVATE_SCHEMA_TOKENS = {
@@ -66,6 +114,11 @@ PRIVATE_SCHEMA_TOKENS = {
     "portfolio",
     "tax_lot",
     "trade_order",
+    "account_number",
+    "available_cash",
+    "tax_lots",
+    "open_orders",
+    "filled_quantity",
 }
 
 
@@ -87,7 +140,9 @@ CAPABILITIES = {
         "point_in_time_expectations", "analyst_estimates", 25 * 60
     ),
     "rapid_event_news": CapabilityContract("rapid_event_news", "news_events", 20 * 60),
-    "macro_industry": CapabilityContract("macro_industry", "macro_industry", 24 * 60 * 60),
+    "macro_industry": CapabilityContract(
+        "macro_industry", "macro_industry", 24 * 60 * 60
+    ),
     "etf_exposure": CapabilityContract("etf_exposure", "etf_exposure", 24 * 60 * 60),
     "certified_total_returns": CapabilityContract(
         "certified_total_returns", "total_returns", 60 * 60
@@ -99,8 +154,12 @@ CAPABILITIES = {
     "survivorship_history": CapabilityContract(
         "survivorship_history", "survivorship_history"
     ),
-    "execution_snapshot": CapabilityContract(
-        "execution_snapshot", None, external=True
+    "execution_snapshot": CapabilityContract("execution_snapshot", None, external=True),
+    "primary_evidence": CapabilityContract(
+        "primary_evidence", "filings_events", 20 * 60
+    ),
+    "candidate_funnel": CapabilityContract(
+        "candidate_funnel", "candidate_funnel", 15 * 60
     ),
 }
 
@@ -116,64 +175,97 @@ class PhaseContract:
 
 PHASES = {
     "sunday": PhaseContract(
-        "sunday",
-        ("identity", "historical_market", "current_catalysts"),
-        ("point_in_time_expectations", "macro_industry", "etf_exposure"),
-        (),
-        ("SUNDAY_CONFIGURED_CUTOFF",),
+        phase_id="sunday",
+        required_capabilities=(
+            "identity",
+            "historical_market",
+            "certified_total_returns",
+            "funded_benchmark_inputs",
+        ),
+        optional_capabilities=(
+            "current_catalysts",
+            "point_in_time_expectations",
+            "macro_industry",
+            "etf_exposure",
+            "candidate_funnel",
+        ),
+        delivery_targets=("SUNDAY_17:30",),
     ),
     "pre_open": PhaseContract(
-        "pre_open",
-        (
+        phase_id="pre_open",
+        required_capabilities=(
             "identity",
             "historical_market",
             "current_catalysts",
             "point_in_time_expectations",
             "rapid_event_news",
+            "primary_evidence",
         ),
-        ("macro_industry", "etf_exposure"),
-        (),
-        ("08:10",),
+        optional_capabilities=("macro_industry", "etf_exposure", "candidate_funnel"),
+        delivery_targets=("08:10",),
     ),
     "execution_research": PhaseContract(
-        "execution_research",
-        (
+        phase_id="execution_research",
+        required_capabilities=(
             "identity",
             "historical_market",
             "current_catalysts",
             "point_in_time_expectations",
+            "primary_evidence",
         ),
-        ("rapid_event_news", "macro_industry", "etf_exposure"),
-        ("execution_snapshot",),
-        ("ACTUAL_DECISION_CUTOFF",),
+        optional_capabilities=(
+            "rapid_event_news",
+            "macro_industry",
+            "etf_exposure",
+            "candidate_funnel",
+        ),
+        external_capabilities=("execution_snapshot",),
+        delivery_targets=("09:38",),
     ),
     "exception_monitoring": PhaseContract(
-        "exception_monitoring",
-        ("identity", "current_catalysts", "rapid_event_news"),
-        ("point_in_time_expectations",),
-        ("execution_snapshot",),
-        ("09:55", "15:25"),
+        phase_id="exception_monitoring",
+        required_capabilities=(
+            "identity",
+            "current_catalysts",
+            "rapid_event_news",
+            "primary_evidence",
+        ),
+        optional_capabilities=("point_in_time_expectations", "candidate_funnel"),
+        external_capabilities=("execution_snapshot",),
+        delivery_targets=("09:55", "15:25"),
     ),
     "terminal_review": PhaseContract(
-        "terminal_review",
-        ("identity", "historical_market", "current_catalysts"),
-        ("point_in_time_expectations", "rapid_event_news"),
-        (),
-        ("XNYS_CLOSE+00:20",),
+        phase_id="terminal_review",
+        required_capabilities=(
+            "identity",
+            "historical_market",
+            "current_catalysts",
+            "primary_evidence",
+        ),
+        optional_capabilities=(
+            "point_in_time_expectations",
+            "rapid_event_news",
+            "candidate_funnel",
+        ),
+        delivery_targets=("XNYS_CLOSE+00:20",),
     ),
     "accounting": PhaseContract(
-        "accounting",
-        ("identity", "certified_total_returns", "funded_benchmark_inputs"),
-        (),
-        (),
-        ("XNYS_CLOSE+00:45",),
+        phase_id="accounting",
+        required_capabilities=(
+            "identity",
+            "certified_total_returns",
+            "funded_benchmark_inputs",
+        ),
+        delivery_targets=("XNYS_CLOSE+00:45",),
     ),
     "saturday_replay": PhaseContract(
-        "saturday_replay",
-        ("identity", "canonical_replay", "survivorship_history"),
-        (),
-        (),
-        ("SATURDAY_08:30",),
+        phase_id="saturday_replay",
+        required_capabilities=(
+            "identity",
+            "canonical_replay",
+            "survivorship_history",
+        ),
+        delivery_targets=("SATURDAY_08:30",),
     ),
 }
 

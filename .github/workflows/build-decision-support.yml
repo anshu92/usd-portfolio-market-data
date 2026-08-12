@@ -1,18 +1,37 @@
 name: Build decision-support artifact
 
 on:
+  schedule:
+    - cron: "5 8 * * 1-5"
+      timezone: "America/Toronto"
+    - cron: "30 9 * * 1-5"
+      timezone: "America/Toronto"
+    - cron: "50 9 * * 1-5"
+      timezone: "America/Toronto"
+    - cron: "20 15 * * 1-5"
+      timezone: "America/Toronto"
+    - cron: "15 17 * * 0"
+      timezone: "America/Toronto"
+    - cron: "5 15 * * 5"
+      timezone: "America/Toronto"
+    - cron: "15 16 * * 1-5"
+      timezone: "America/Toronto"
+    - cron: "40 16 * * 1-5"
+      timezone: "America/Toronto"
+    - cron: "30 7 * * 6"
+      timezone: "America/Toronto"
   workflow_dispatch:
     inputs:
       source_tag:
         description: "Immutable market-data release tag used as the only source"
-        required: true
+        required: false
         type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: decision-support-${{ inputs.source_tag }}
+  group: decision-support-${{ inputs.source_tag || 'scheduled' }}
   cancel-in-progress: false
 
 jobs:
@@ -38,11 +57,32 @@ jobs:
       - name: Require Zstandard CLI
         run: zstd --version
 
+      - name: Resolve pinned source tag
+        id: source
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_SOURCE_TAG: ${{ inputs.source_tag }}
+        run: |
+          set -euo pipefail
+          source_tag="$REQUESTED_SOURCE_TAG"
+          if [[ -z "$source_tag" ]]; then
+            source_tag="$(gh api \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "repos/${GITHUB_REPOSITORY}/releases/latest" --jq '.tag_name')"
+          fi
+          [[ "$source_tag" =~ ^market-data-[0-9]{8}T[0-9]{6}Z$ ]] || {
+            echo "Invalid source tag: $source_tag" >&2
+            exit 2
+          }
+          echo "tag=$source_tag" >> "$GITHUB_OUTPUT"
+
       - name: Resolve immutable source release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          SOURCE_TAG: ${{ inputs.source_tag }}
+          SOURCE_TAG: ${{ steps.source.outputs.tag }}
         run: |
           set -euo pipefail
           mkdir -p staging/source
@@ -57,7 +97,7 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          SOURCE_TAG: ${{ inputs.source_tag }}
+          SOURCE_TAG: ${{ steps.source.outputs.tag }}
         run: |
           set -euo pipefail
           for asset in \
@@ -70,12 +110,27 @@ jobs:
             earnings-and-guidance-events.parquet \
             insider-signals.parquet \
             institutional-ownership-signals.parquet \
-            finra-short-interest.parquet
+            finra-short-interest.parquet \
+            sec-filings.parquet
           do
             gh release download "$SOURCE_TAG" \
               --repo "$GITHUB_REPOSITORY" \
               --pattern "$asset" \
               --dir staging/source
+          done
+          for asset in \
+            analyst-estimates.parquet \
+            distributions.parquet \
+            benchmark-total-returns.parquet
+          do
+            if jq -e --arg name "$asset" '.assets[] | select(.name == $name)' \
+              staging/github-release.json >/dev/null
+            then
+              gh release download "$SOURCE_TAG" \
+                --repo "$GITHUB_REPOSITORY" \
+                --pattern "$asset" \
+                --dir staging/source
+            fi
           done
           python verify-github-release.py \
             --metadata staging/github-release.json \
@@ -86,8 +141,9 @@ jobs:
         run: |
           python build-decision-support.py \
             --release-dir staging/source \
-            --source-tag "${{ inputs.source_tag }}" \
-            --out-dir dist
+            --source-tag "${{ steps.source.outputs.tag }}" \
+            --out-dir dist \
+            --producer-commit "$GITHUB_SHA"
 
       - name: Verify decision-support artifact
         run: python verify-decision-support.py --dist dist
@@ -98,7 +154,7 @@ jobs:
       - name: Upload validated decision-support artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: decision-support-${{ inputs.source_tag }}
+          name: decision-support-${{ steps.source.outputs.tag }}-${{ github.run_id }}
           path: dist
           if-no-files-found: error
           retention-days: 30

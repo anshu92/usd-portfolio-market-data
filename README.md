@@ -67,6 +67,8 @@ set pinned to that immutable tag and produces:
 - `decision-support.sqlite.zst`, a pre-indexed read-only SQLite database;
 - `decision-support-manifest.json`, which binds every byte to the source release and
   dataset-group identities; and
+- `candidate-funnel.parquet`, `actionability-matrix.json`, and compressed evidence
+  packets with stable evidence IDs and direct primary-document locators; and
 - seven canonical JSON phase packs under `phase-packs/` for Sunday, pre-open,
   execution research, exception monitoring, terminal review, accounting, and Saturday
   replay.
@@ -76,6 +78,13 @@ evidence, not executable quotes or dividend-adjusted prices. Phase packs expose 
 or stale capabilities as `BLOCKED` or `DEGRADED`; they never invent an input. Live
 quotes, halt/LULD state, broker eligibility, portfolio state, cash, lots,
 confirmations, and final decisions remain consumer-owned.
+
+Phase packs separately expose artifact, benchmark-only, challenger, and live-snapshot
+operating modes. They bind explicit data/session cutoffs, validity windows, source
+watermarks, deterministic rejection codes, and both the Toronto task timezone and New
+York exchange timezone. The producer workflow runs after certified releases and on
+timezone-aware cadence backstops; consumers still enforce timestamps because GitHub
+cron is not an execution-time SLO.
 
 See [DECISION_SUPPORT_CONTRACT.md](DECISION_SUPPORT_CONTRACT.md) for the exact source
 identity, phase-state, validation, live-snapshot, and failure contract.

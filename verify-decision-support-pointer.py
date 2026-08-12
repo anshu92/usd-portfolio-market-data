@@ -4,12 +4,24 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import re
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from decision_support_contract import MANIFEST_FILENAME, SCHEMA_VERSION, sha256_file
+from decision_support_contract import (
+    CONTRACT_VERSION,
+    EXPECTED_BRANCH,
+    EXPECTED_EVENTS,
+    EXPECTED_REPOSITORY,
+    EXPECTED_WORKFLOW_ID,
+    EXPECTED_WORKFLOW_PATH,
+    VALIDATOR_FILES,
+    canonical_json,
+)
 
 
 REQUIRED_FIELDS = {
@@ -17,13 +29,25 @@ REQUIRED_FIELDS = {
     "artifact_name",
     "artifact_sha256",
     "artifact_size_bytes",
+    "artifact_expires_at",
     "decision_support_manifest_sha256",
     "generated_at_utc",
+    "repository",
+    "workflow_id",
+    "workflow_path",
+    "workflow_branch",
+    "workflow_event",
+    "validator_contract_version",
+    "validator_set_sha256",
+    "promotion_key",
     "producer_commit",
     "source_manifest_sha256",
     "source_release_tag",
+    "source_release_immutable",
     "workflow_run_id",
 }
+SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
+COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}")
 
 
 class DecisionSupportPointerError(RuntimeError):
@@ -66,6 +90,29 @@ def verify_pointer(
         )
     if run.get("status") != "completed" or run.get("conclusion") != "success":
         raise DecisionSupportPointerError("Decision-support run did not succeed")
+    head_repository = run.get("head_repository")
+    if (
+        not isinstance(head_repository, dict)
+        or head_repository.get("full_name") != EXPECTED_REPOSITORY
+    ):
+        raise DecisionSupportPointerError("Workflow repository is not trusted")
+    run_identity = {
+        "repository": EXPECTED_REPOSITORY,
+        "workflow_id": EXPECTED_WORKFLOW_ID,
+        "workflow_path": EXPECTED_WORKFLOW_PATH,
+        "workflow_branch": EXPECTED_BRANCH,
+        "workflow_event": str(run.get("event") or ""),
+    }
+    if (
+        int(run.get("workflow_id", -1)) != EXPECTED_WORKFLOW_ID
+        or run.get("path") != EXPECTED_WORKFLOW_PATH
+        or run.get("head_branch") != EXPECTED_BRANCH
+        or run.get("event") not in EXPECTED_EVENTS
+    ):
+        raise DecisionSupportPointerError("Workflow run identity is not trusted")
+    for key, value in run_identity.items():
+        if pointer.get(key) != value:
+            raise DecisionSupportPointerError(f"Pointer mismatch: {key}")
     workflow_run = artifact.get("workflow_run")
     if not isinstance(workflow_run, dict):
         raise DecisionSupportPointerError("Artifact lacks workflow_run identity")
@@ -76,8 +123,18 @@ def verify_pointer(
         "artifact_name": str(artifact.get("name") or ""),
         "artifact_sha256": digest,
         "artifact_size_bytes": int(artifact.get("size_in_bytes", -1)),
+        "artifact_expires_at": str(artifact.get("expires_at") or ""),
         "producer_commit": str(run.get("head_sha") or ""),
     }
+    if (
+        expected["workflow_run_id"] <= 0
+        or expected["artifact_id"] <= 0
+        or SHA256_PATTERN.fullmatch(str(expected["artifact_sha256"])) is None
+        or COMMIT_PATTERN.fullmatch(str(expected["producer_commit"])) is None
+    ):
+        raise DecisionSupportPointerError(
+            "Invalid workflow/artifact cryptographic identity"
+        )
     for key, value in expected.items():
         if pointer.get(key) != value:
             raise DecisionSupportPointerError(f"Pointer mismatch: {key}")
@@ -98,14 +155,27 @@ def verify_pointer(
         )
 
     source_tag = str(pointer.get("source_release_tag") or "")
-    if pointer.get("artifact_name") != f"decision-support-{source_tag}":
+    if (
+        pointer.get("artifact_name")
+        != f"decision-support-{source_tag}-{expected['workflow_run_id']}"
+    ):
         raise DecisionSupportPointerError("Artifact name does not match source tag")
+    if pointer.get("promotion_key") != f"{source_tag}/{expected['artifact_id']}":
+        raise DecisionSupportPointerError(
+            "Promotion key does not bind source tag and artifact ID"
+        )
     if release.get("tag_name") != source_tag:
         raise DecisionSupportPointerError("Source release tag mismatch")
     if release.get("draft") is not False or release.get("prerelease") is not False:
-        raise DecisionSupportPointerError("Source release is not published production data")
+        raise DecisionSupportPointerError(
+            "Source release is not published production data"
+        )
     if release.get("immutable") is not True:
         raise DecisionSupportPointerError("Source release is not immutable")
+    if pointer.get("source_release_immutable") is not True:
+        raise DecisionSupportPointerError(
+            "Pointer does not assert immutable source release"
+        )
 
     manifest_path = artifact_directory / MANIFEST_FILENAME
     manifest_sha = sha256_file(manifest_path)
@@ -114,11 +184,44 @@ def verify_pointer(
     manifest = load_json(manifest_path, "decision-support manifest")
     source = manifest.get("source_release")
     if not isinstance(source, dict):
-        raise DecisionSupportPointerError("Decision-support manifest lacks source identity")
+        raise DecisionSupportPointerError(
+            "Decision-support manifest lacks source identity"
+        )
     if source.get("tag") != source_tag:
         raise DecisionSupportPointerError("Embedded source release tag mismatch")
     if source.get("manifest_sha256") != pointer.get("source_manifest_sha256"):
         raise DecisionSupportPointerError("Embedded source manifest SHA-256 mismatch")
+    validator = manifest.get("validator_identity")
+    if not isinstance(validator, dict):
+        raise DecisionSupportPointerError(
+            "Decision-support manifest lacks validator identity"
+        )
+    if validator.get("producer_commit") != expected["producer_commit"]:
+        raise DecisionSupportPointerError(
+            "Validator commit does not match workflow commit"
+        )
+    if (
+        pointer.get("validator_contract_version") != CONTRACT_VERSION
+        or validator.get("contract_version") != CONTRACT_VERSION
+    ):
+        raise DecisionSupportPointerError("Validator contract version mismatch")
+    if pointer.get("validator_set_sha256") != validator.get("validator_set_sha256"):
+        raise DecisionSupportPointerError("Validator set SHA-256 mismatch")
+    validator_root = Path(__file__).resolve().parent
+    expected_validator_files = [
+        {"path": filename, "sha256": sha256_file(validator_root / filename)}
+        for filename in VALIDATOR_FILES
+    ]
+    expected_validator_set_sha256 = hashlib.sha256(
+        canonical_json(expected_validator_files)
+    ).hexdigest()
+    if (
+        validator.get("files") != expected_validator_files
+        or validator.get("validator_set_sha256") != expected_validator_set_sha256
+    ):
+        raise DecisionSupportPointerError(
+            "Validator identity does not match checked-out code"
+        )
 
 
 def main(argv: list[str] | None = None) -> int:

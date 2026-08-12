@@ -90,6 +90,26 @@ zstd -d staging/decision-support/decision-support.sqlite.zst \
   -o staging/decision-support/decision-support.sqlite
 ```
 
+Download by the pointer's numeric `artifact_id`, not by artifact name. Stage the
+validated bytes under the collision-safe promotion key
+`${source_release_tag}/${artifact_id}`. Never overwrite a prior build from the same
+source tag.
+
+Before a phase is used, enforce its active UTC window and status programmatically:
+
+```bash
+python verify-decision-support.py \
+  --dist staging/decision-support \
+  --phase pre_open \
+  --as-of "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+```
+
+This command checks all bytes first, then requires `as-of` to be in one of the pack's
+`[not_before_utc, expires_at_utc)` windows. It fails for `BLOCKED`; `DEGRADED` also
+fails unless the caller explicitly supplies `--allow-degraded`. Independently compare
+the task session to `valid_for_session` and treat `data_cutoff_utc` and each source
+watermark as the maximum facts known—not as build time.
+
 Open the database read-only and immutable:
 
 ```text
@@ -102,11 +122,40 @@ means at least one producer-required capability is unavailable or too stale;
 `CONSUMER_REQUIRED` capability, such as `execution_snapshot`, must be fetched at the
 actual cutoff and is never satisfied by the historical OHLCV tables.
 
+Use `operating_modes` rather than one aggregate boolean: `BENCHMARK_ONLY_SAFE` permits
+only the certified benchmark path, `CHALLENGER_RESEARCH_READY` permits challenger
+research, `LIVE_SNAPSHOT_REQUIRED` still gates execution, and `CHALLENGER_BLOCKED`
+requires candidate-specific rejection. Empty `candidate-funnel.parquet` and empty
+security actionability are intentional while the selector capability is
+`NOT_CONFIGURED`.
+
 Quote, halt/LULD, and broker integrations must emit the provider-neutral live-snapshot
 schema and pass `python verify-live-snapshot.py --snapshot live-snapshot.json`. The
 validator rejects stale or crossed quotes, future timestamps, unknown halt/LULD state,
 broker ineligibility, invalid bands, and private account or portfolio fields. A blocked
 live snapshot must never fall back to producer OHLCV for execution.
+
+The live contract is a strict allowlist. Adapters must supply canonical symbol,
+exchange MIC, currency, SIP/direct NBBO feed identity, entitlement scope,
+request/response IDs, broker observation time, and spread thresholds. Undeclared
+fields—including account, cash, lot, order, fill, or position variants—fail validation.
+
+After validation, promote with an atomic same-filesystem rename. For example, create a
+temporary symlink to the immutable promotion directory and use `os.replace`:
+
+```python
+import os
+from pathlib import Path
+
+cache = Path("/var/lib/v5/decision-support")
+target = cache / source_release_tag / str(artifact_id)
+temporary = cache / f".current.{os.getpid()}"
+temporary.symlink_to(target, target_is_directory=True)
+os.replace(temporary, cache / "current")
+```
+
+Do not use a multi-step unlink/relink sequence; readers must see either the previous
+validated artifact or the new one.
 
 The compact stream is not a replacement for the canonical release. Saturday replay,
 audit, raw SEC facts, detailed 13F holdings, and history beyond the recent hot window

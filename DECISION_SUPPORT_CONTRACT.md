@@ -21,6 +21,8 @@ A valid artifact contains exactly:
 
 - `decision-support.sqlite.zst`;
 - `decision-support-manifest.json`; and
+- `candidate-funnel.parquet`, `actionability-matrix.json`, and
+  `evidence-packets.jsonl.zst`; and
 - one canonical JSON pack for each phase under `phase-packs/`.
 
 The compressed database must not exceed 50 MiB. It contains a maximum of 64 recent
@@ -36,6 +38,8 @@ certified total-return requirement.
 Consumers must validate the compressed and uncompressed SHA-256 identities, SQLite
 integrity, exact table set, row counts, foreign keys, recent-history bound, capability
 snapshot, and phase packs before opening the database with `mode=ro&immutable=1`.
+The manifest also binds the validator contract version, exact producer commit, every
+validator-file digest, and a digest of that validator set.
 
 ## Capability and phase states
 
@@ -51,23 +55,48 @@ when only optional capabilities are unavailable, and `READY` otherwise. External
 consumer requirements do not make a producer pack structurally invalid, but the
 consumer cannot complete that phase until it validates the named external snapshot.
 
-Delivery targets are expressed in `America/New_York`: pre-open by 08:10, exception
+The status is supplemented by ordered operating modes: `ARTIFACT_VALID`,
+`BENCHMARK_ONLY_SAFE`, `CHALLENGER_RESEARCH_READY`, `LIVE_SNAPSHOT_REQUIRED`, and
+`CHALLENGER_BLOCKED`. Missing challenger inputs do not suppress a separately certified
+benchmark lane. Candidate-level actionability is empty and explicitly rejected until
+an approved selector is configured.
+
+Task delivery targets are expressed in `America/Toronto`; exchange sessions and closes
+are calculated in `America/New_York`: pre-open by 08:10, exception
 monitoring by 09:55 and 15:25, terminal review at XNYS close +20 minutes, accounting at
 XNYS close +45 minutes, and Saturday replay by 08:30. GitHub's scheduled trigger time
-is not evidence that a target was met; consumers use the pack's actual generation,
-cutoff, source observation, and freshness values.
+is not evidence that a target was met. Consumers must enforce `built_at_utc`,
+`data_cutoff_utc`, `valid_for_session`, `phase_decision_cutoff_utc`, `not_before_utc`,
+`expires_at_utc`, and every source watermark.
 
 ## Live execution snapshot
 
-The producer publishes only the provider-neutral `1.0.0` live-snapshot contract and
+The producer publishes schema `1.0.0`, contract `1.1.0` for provider-neutral live
+snapshots and
 validator. Provider and broker adapters run in the consumer environment with
 consumer-owned credentials. A snapshot binds quotes, halt/LULD state, and broker
 eligibility to one actual cutoff.
 
-The validator fails stale, crossed, non-positive, or future quotes; unknown or stale
-halt/LULD state; invalid bands; broker ineligibility; response-time inconsistencies;
-duplicate securities; and private account or portfolio keys. A blocked snapshot may
-not fall back to producer OHLCV.
+The strict allowlist binds canonical symbol, exchange, currency, provider/feed,
+entitlement, request/response IDs, quote type, spread policy, and independent quote,
+market-status, and broker ages per security. It rejects delayed/proprietary feeds,
+identity mismatches, stale/crossed/non-positive/future quotes, unknown halt/LULD state,
+invalid bands, broker ineligibility, response-time inconsistencies, duplicate
+securities, and every undeclared field. A blocked security may not fall back to
+producer OHLCV.
+
+## Publication and promotion
+
+The compact workflow is dispatched after each certified source release and has
+timezone-aware cadence backstops for weekday 08:05, Sunday 17:15, Friday 15:05, and
+Saturday 07:30 in `America/Toronto`. Scheduled triggers are not action-time SLOs.
+
+Artifacts are named `decision-support-${SOURCE_TAG}-${RUN_ID}` and downloaded by
+artifact ID. The publisher checks out and runs validators from the exact source-run
+commit. Its pointer binds repository, workflow ID/path, branch, event, commit,
+validator identity, artifact identity, and the collision-safe promotion key
+`${SOURCE_TAG}/${ARTIFACT_ID}`. Pointer publication is monotonic by source tag and then
+artifact ID; an older or identical completed run cannot replace the current pointer.
 
 ## Private-state boundary
 
