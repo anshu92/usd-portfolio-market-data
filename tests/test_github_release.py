@@ -194,7 +194,11 @@ def test_decision_support_workflows_are_pinned_and_least_privilege():
         encoding="utf-8"
     )
     assert "permissions:\n  contents: read" in build
+    assert "request_pointer_publication:" in build
     assert "contents: write" not in build
+    assert build.count("actions: write") == 1
+    assert "gh workflow run publish-decision-support-pointer.yml" in build
+    assert 'source_run_id="$GITHUB_RUN_ID"' in build
     assert "sec-company-facts.parquet" not in build
     assert "institutional-holdings-13f.parquet" not in build
     assert "verify-decision-support.py --dist dist" in build
