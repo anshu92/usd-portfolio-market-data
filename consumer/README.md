@@ -106,7 +106,10 @@ python verify-decision-support.py \
 
 This command checks all bytes first, then requires `as-of` to be in one of the pack's
 `[not_before_utc, expires_at_utc)` windows. It fails for `BLOCKED`; `DEGRADED` also
-fails unless the caller explicitly supplies `--allow-degraded`. Independently compare
+fails unless the caller explicitly supplies `--allow-degraded`. It also recomputes
+every required capability's age from `observed_at` and `maximum_age_seconds`, so a
+statically `READY` pack fails if an input was not yet known or has expired at the
+decision instant. Independently compare
 the task session to `valid_for_session` and treat `data_cutoff_utc` and each source
 watermark as the maximum facts known—not as build time.
 

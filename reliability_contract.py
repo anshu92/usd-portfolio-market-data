@@ -87,6 +87,12 @@ GROUPS: dict[str, GroupContract] = {
         ("identity",),
         optional=True,
     ),
+    "total_returns": GroupContract(
+        "total_returns",
+        ("distributions.parquet", "benchmark-total-returns.parquet"),
+        ("identity", "market"),
+        optional=True,
+    ),
 }
 FILE_TO_GROUP = {
     filename: group.group_id for group in GROUPS.values() for filename in group.files
@@ -97,12 +103,16 @@ LEGACY_PRIMARY_KEYS: dict[str, tuple[str, ...]] = {
     "unmatched-tickers.csv": ("security_id",),
     "yahoo-ohlcv-320.parquet": ("security_id", "session_date"),
     "yahoo-splits.parquet": ("security_id", "event_date", "split_factor"),
+    "distributions.parquet": ("distribution_id",),
+    "benchmark-total-returns.parquet": ("security_id", "session_date"),
 }
 LEGACY_SOURCES = {
     "security-universe.csv": "Nasdaq Trader Symbol Directory",
     "unmatched-tickers.csv": "Derived identifier reconciliation",
     "yahoo-ohlcv-320.parquet": "defeatbeta/yahoo-finance-data and Yahoo Finance Chart API",
     "yahoo-splits.parquet": "defeatbeta/yahoo-finance-data and Yahoo Finance Chart API",
+    "distributions.parquet": "Yahoo Finance Chart API",
+    "benchmark-total-returns.parquet": "Yahoo Finance Chart API",
 }
 
 
@@ -276,8 +286,6 @@ def group_file_identities(
     output = []
     for filename in sorted(group.files):
         if filename not in datasets:
-            if group.optional:
-                continue
             raise ReliabilityContractError(
                 f"Group {group.group_id} lacks dataset identity for {filename}"
             )
@@ -331,6 +339,25 @@ def default_freshness(
                 if isinstance(lag, int) and lag <= MARKET_READY_MAX_LAG_SESSIONS
                 else "STALE"
             ),
+        }
+    if group_id == "total_returns":
+        benchmark = manifest.get("benchmark_total_returns") or {}
+        expected = benchmark.get("expected_latest_xnys_session")
+        observed = benchmark.get("maximum_session")
+        retrieved = benchmark.get("source_retrieved_at_utc")
+        ready = (
+            benchmark.get("status") == "CERTIFIED"
+            and expected is not None
+            and observed == expected
+            and retrieved is not None
+        )
+        return {
+            "clock": "XNYS_ELIGIBLE_SESSIONS",
+            "expected": expected,
+            "observed": observed,
+            "lag_eligible_sessions": 0 if ready else None,
+            "source_retrieved_at_utc": retrieved,
+            "state": "READY" if ready else "STALE",
         }
     observed_values = [
         _parse_timestamp(item.get("source_retrieval_time")) for item in group_datasets

@@ -43,6 +43,11 @@ holdings.
 
 Release assets are intended only for historical research and education. They are not a
 live quote feed, do not represent executable prices, and do not claim that raw close is
-an adjusted or total-return series. Database licensing may not cover every right in the
-individual contents, trademarks, or upstream service terms; downstream users remain
-responsible for determining whether their use and redistribution are permitted.
+an adjusted or total-return series. When present, `distributions.parquet` and
+`benchmark-total-returns.parquet` are derived from a separately retrieved Yahoo Finance
+Chart response whose SHA-256, retrieval time, event lineage, and reconciliation result
+are recorded in the manifest. Those optional VTI benchmark rows do not turn the raw
+OHLCV lane into adjusted or executable prices. Database licensing may not cover every
+right in the individual contents, trademarks, or upstream service terms; downstream
+users remain responsible for determining whether their use and redistribution are
+permitted.

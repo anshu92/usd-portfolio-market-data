@@ -205,9 +205,11 @@ datasets, and manifest generation; large writes also emit million-row progress r
 ## Automation and publication
 
 Pull requests run only offline fixtures with read-only permissions. The production
-workflow runs the bounded market path at 20:17 America/New_York on weekdays, refreshes
-official enrichment sources at 08:17 America/New_York each Saturday, and can also be
-dispatched:
+workflow runs a pre-open backstop at 07:15 and a terminal-close build at 16:16
+America/New_York on weekdays, starts the full official-source refresh at 02:00
+America/New_York each Saturday, and can also be dispatched. GitHub cron is a start
+trigger, not an action-time SLO; consumers must inspect source watermarks and phase
+windows rather than assuming a scheduled trigger ran on time:
 
 - `smoke` is fixed to AAPL, MSFT, BRK.B, NVDA, and TSM with 30 sessions and never
   publishes;
@@ -217,9 +219,17 @@ dispatched:
 - scheduled builds publish only when the same variable is true;
 - weekday scheduled builds reuse the latest fully validated immutable enrichment
   snapshot and Yahoo Chart history baseline, then replace the prior 14 calendar days
-  of Chart-backed observations with a fresh Yahoo delta. This keeps ETF/ADR history
-  complete while retaining current-session freshness within the 24-minute build
-  budget plus a 5-minute publish budget;
+  for every admitted symbol with a fresh Yahoo Chart delta. Fresh Chart observations
+  deterministically win overlapping bulk-source rows. This keeps ETF/ADR history
+  complete and lets the current-session gate evaluate the whole universe within the
+  35-minute build budget plus a 10-minute publish budget. The pre-open run requires
+  the prior completed session; the terminal-close run requires the same-day completed
+  session, including the 13:00 close on XNYS early-close days;
+- full builds attempt a source-backed VTI distribution and total-return lane. It is
+  published as `CERTIFIED` only when adjusted-close returns reconcile to the canonical
+  raw-close series and cash events, reaches the expected XNYS session, and supplies at
+  least 140 sessions and 26 weekly observations. Failure omits both optional assets and
+  leaves accounting and benchmark-only gates blocked;
 - Saturday scheduled builds set `refresh_enrichment=true` and perform the slower
   official SEC/FINRA rebuild with a six-hour ceiling; this weekly cadence captures SEC
   filing/fundamental changes and FINRA's semi-monthly updates without paying the
@@ -227,7 +237,7 @@ dispatched:
 - a manual `refresh_enrichment=true` run remains available for bootstrapping, recovery,
   or an out-of-cycle source update.
 
-The normal daily path therefore has at most 29 minutes of job execution. It downloads
+The normal daily path therefore has at most 45 minutes of job execution. It downloads
 the previous release by its immutable tag, verifies GitHub asset digests and the full
 production contract, copies the enrichment assets without changing their source
 clocks, and then verifies the newly assembled release again. If the fresh symbol

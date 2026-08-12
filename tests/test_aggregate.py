@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -394,14 +395,35 @@ def test_chart_delta_replaces_overlapping_cached_observation(
            'Yahoo Finance Chart API', 'old-sha', '2024-01-10T00:00:00Z')
         ) AS t(source_symbol, session_date, open, high, low, close, volume,
                source_dataset, source_revision, observed_at_utc)""")
+        con.execute("INSERT INTO price_source VALUES "
+                    "('MAGS', DATE '2024-01-10', 10, 11, 9, 10.5, 1000, "
+                    "'immutable fixture', 'immutable-sha', '2024-01-09T00:00:00Z')")
         con.execute("CREATE TEMP TABLE split_source(source_symbol VARCHAR, event_date DATE, split_factor VARCHAR, source_dataset VARCHAR, source_revision VARCHAR, observed_at_utc VARCHAR)")
         con.execute("CREATE TEMP TABLE price_dedup AS SELECT DISTINCT * FROM price_source")
         con.execute("CREATE TEMP TABLE split_dedup AS SELECT DISTINCT * FROM split_source")
         aggregate_module.supplement_missing_yahoo_chart_history(
             con, cutoff=aggregate_module.parse_date("2024-01-10"), workers=1,
-            lookback_days=14,
+            lookback_days=14, refresh_all=True,
         )
-        assert con.execute("SELECT close, volume, count(*) FROM price_source GROUP BY ALL").fetchall() == [(11.5, 1001, 1)]
+        assert con.execute(
+            "SELECT source_dataset, close FROM price_source ORDER BY source_dataset"
+        ).fetchall() == [
+            ("Yahoo Finance Chart API", 11.5),
+            ("immutable fixture", 10.5),
+        ]
+        aggregate_module.prepare_price_candidates(
+            con,
+            sessions=1,
+            expected_session=aggregate_module.parse_date("2024-01-10"),
+            maximum_security_staleness_sessions=5,
+            maximum_source_gap_days=14,
+            source_reuse_price_ratio=4.0,
+            systemic_invalid_session_rate=0.01,
+            minimum_systemic_session_securities=100,
+        )
+        assert con.execute(
+            "SELECT source_dataset, close FROM price_candidate"
+        ).fetchall() == [("Yahoo Finance Chart API", 11.5)]
     finally:
         con.close()
 
@@ -663,6 +685,14 @@ def test_freshness_warning_and_holiday_calendar(
     assert aggregate_module.expected_latest_session(
         aggregate_module.parse_date("2024-01-15")
     ).isoformat() == "2024-01-12"
+    assert aggregate_module.expected_latest_session(
+        aggregate_module.parse_date("2026-11-27"),
+        datetime(2026, 11, 27, 17, 59, tzinfo=timezone.utc),
+    ).isoformat() == "2026-11-25"
+    assert aggregate_module.expected_latest_session(
+        aggregate_module.parse_date("2026-11-27"),
+        datetime(2026, 11, 27, 18, 1, tzinfo=timezone.utc),
+    ).isoformat() == "2026-11-27"
 
     con = duckdb.connect()
     stale_prices = tmp_path / "stale.parquet"

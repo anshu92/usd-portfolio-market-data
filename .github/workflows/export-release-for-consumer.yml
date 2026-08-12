@@ -91,6 +91,19 @@ jobs:
               --pattern "$asset" \
               --dir staging/release
           done
+          for asset in \
+            distributions.parquet \
+            benchmark-total-returns.parquet
+          do
+            if jq -e --arg name "$asset" '.assets[] | select(.name == $name)' \
+              staging/github-release.json >/dev/null
+            then
+              gh release download "$TAG" \
+                --repo "$GITHUB_REPOSITORY" \
+                --pattern "$asset" \
+                --dir staging/release
+            fi
+          done
 
       - name: Validate GitHub asset digests
         run: |

@@ -7,6 +7,7 @@ import argparse
 import csv
 import hashlib
 import json
+import math
 import re
 import sys
 from pathlib import Path
@@ -35,6 +36,47 @@ PRODUCTION_FILES = {
     "unmatched-tickers.csv",
     "NOTICE.md",
 } | set(CONTRACTS)
+OPTIONAL_PRODUCTION_FILES = {
+    "distributions.parquet",
+    "benchmark-total-returns.parquet",
+}
+BENCHMARK_MINIMUM_SESSIONS = 140
+BENCHMARK_MINIMUM_WEEKLY_OBSERVATIONS = 26
+BENCHMARK_RAW_CLOSE_RELATIVE_TOLERANCE = 1e-4
+BENCHMARK_TOTAL_RETURN_RECONCILIATION_TOLERANCE = 1e-4
+BENCHMARK_RETURN_COLUMNS = (
+    "security_id",
+    "benchmark_id",
+    "session_date",
+    "price_return",
+    "distribution_return",
+    "total_return",
+    "total_return_index",
+    "certification_status",
+    "distribution_lineage_sha256",
+    "corporate_action_lineage_sha256",
+    "known_at_utc",
+    "revision",
+    "source_locator",
+    "source_revision",
+    "source_retrieved_at_utc",
+)
+BENCHMARK_DISTRIBUTION_COLUMNS = (
+    "security_id",
+    "ex_date",
+    "record_date",
+    "pay_date",
+    "cash_amount",
+    "currency",
+    "distribution_type",
+    "distribution_id",
+    "known_at_utc",
+    "revision",
+    "source_locator",
+    "source_revision",
+    "source_publication_date",
+    "source_retrieved_at_utc",
+)
 ACCESSION_PATTERN = re.compile(r"^[0-9]{10}-[0-9]{2}-[0-9]{6}$")
 
 
@@ -168,6 +210,245 @@ def verify_identity_references(
             raise VerificationError(
                 f"Unknown security_id in {filename}: {unknown} rows"
             )
+
+
+def verify_benchmark_total_returns(
+    con: duckdb.DuckDBPyConnection,
+    directory: Path,
+    manifest: dict[str, object],
+) -> None:
+    returns_path = directory / "benchmark-total-returns.parquet"
+    distributions_path = directory / "distributions.parquet"
+    present = (returns_path.is_file(), distributions_path.is_file())
+    if not any(present):
+        return
+    if not all(present):
+        raise VerificationError("Benchmark total-return lane is incomplete")
+    return_columns = tuple(
+        str(column[0])
+        for column in con.execute(
+            "SELECT * FROM read_parquet(?) LIMIT 0", [str(returns_path)]
+        ).description
+    )
+    distribution_columns = tuple(
+        str(column[0])
+        for column in con.execute(
+            "SELECT * FROM read_parquet(?) LIMIT 0", [str(distributions_path)]
+        ).description
+    )
+    if return_columns != BENCHMARK_RETURN_COLUMNS:
+        raise VerificationError("Benchmark total-return schema mismatch")
+    if distribution_columns != BENCHMARK_DISTRIBUTION_COLUMNS:
+        raise VerificationError("Benchmark distribution schema mismatch")
+    stats = con.execute(
+        """
+        SELECT count(*), count(DISTINCT session_date),
+               count(DISTINCT date_trunc('week', session_date)),
+               min(session_date), max(session_date),
+               count(DISTINCT security_id), count(DISTINCT benchmark_id),
+               count(*) - count(DISTINCT (security_id, session_date)),
+               count(*) FILTER (
+                 WHERE certification_status <> 'CERTIFIED'
+                    OR price_return IS NULL OR NOT isfinite(price_return)
+                    OR distribution_return IS NULL OR NOT isfinite(distribution_return)
+                    OR total_return IS NULL OR NOT isfinite(total_return)
+                    OR total_return <= -1
+                    OR abs(total_return - price_return - distribution_return) > 0.0001
+                    OR total_return_index IS NULL OR NOT isfinite(total_return_index)
+                    OR total_return_index <= 0
+                    OR NOT regexp_full_match(distribution_lineage_sha256, '[0-9a-f]{64}')
+                    OR NOT regexp_full_match(corporate_action_lineage_sha256, '[0-9a-f]{64}')
+                    OR known_at_utc IS NULL OR revision IS NULL
+                    OR source_locator IS NULL OR source_revision IS NULL
+                    OR source_retrieved_at_utc IS NULL
+               )
+        FROM read_parquet(?)
+        """,
+        [str(returns_path)],
+    ).fetchone()
+    if int(stats[0] or 0) != int(stats[1] or 0):
+        raise VerificationError("Benchmark total-return keys are not unique")
+    if int(stats[1] or 0) < BENCHMARK_MINIMUM_SESSIONS:
+        raise VerificationError(
+            "Benchmark total-return history is shorter than 140 sessions"
+        )
+    if int(stats[2] or 0) < BENCHMARK_MINIMUM_WEEKLY_OBSERVATIONS:
+        raise VerificationError(
+            "Benchmark total-return history is shorter than 26 weeks"
+        )
+    if int(stats[5] or 0) != 1 or int(stats[6] or 0) != 1:
+        raise VerificationError("Benchmark total-return lane is not single-benchmark")
+    if int(stats[7] or 0) or int(stats[8] or 0):
+        raise VerificationError("Benchmark total-return lane has invalid rows")
+    index_errors = int(
+        con.execute(
+            """
+            WITH ordered AS (
+              SELECT security_id, session_date, total_return, total_return_index,
+                     lag(total_return_index) OVER (
+                       PARTITION BY security_id ORDER BY session_date
+                     ) AS previous_index
+              FROM read_parquet(?)
+            )
+            SELECT count(*) FROM ordered
+            WHERE previous_index IS NOT NULL
+              AND abs(total_return_index / previous_index - 1 - total_return) > 1e-10
+            """,
+            [str(returns_path)],
+        ).fetchone()[0]
+    )
+    if index_errors:
+        raise VerificationError("Benchmark total-return index does not compound")
+    expected = str(
+        (manifest.get("validation") or {}).get("expected_latest_xnys_session") or ""
+    )
+    market_maximum = str((manifest.get("aggregate") or {}).get("max_date") or "")
+    if str(stats[4]) != expected or str(stats[4]) != market_maximum:
+        raise VerificationError(
+            "Benchmark total-return lane is not current with market data"
+        )
+    distribution_stats = con.execute(
+        """
+        SELECT count(*), count(*) - count(DISTINCT distribution_id),
+               count(*) FILTER (
+                 WHERE security_id IS NULL OR ex_date IS NULL
+                    OR cash_amount IS NULL OR NOT isfinite(cash_amount)
+                    OR cash_amount <= 0 OR currency <> 'USD'
+                    OR distribution_type <> 'CASH_DIVIDEND'
+                    OR distribution_id IS NULL OR known_at_utc IS NULL
+                    OR revision IS NULL OR source_locator IS NULL
+                    OR source_revision IS NULL OR source_retrieved_at_utc IS NULL
+               )
+        FROM read_parquet(?)
+        """,
+        [str(distributions_path)],
+    ).fetchone()
+    if int(distribution_stats[0] or 0) < 1:
+        raise VerificationError("Benchmark distribution lane is empty")
+    if int(distribution_stats[1] or 0) or int(distribution_stats[2] or 0):
+        raise VerificationError("Benchmark distribution lane has invalid rows")
+    distribution_errors = int(
+        con.execute(
+            """
+            WITH prices AS (
+              SELECT security_id, session_date, close,
+                     lag(close) OVER (
+                       PARTITION BY security_id ORDER BY session_date
+                     ) AS previous_close
+              FROM read_parquet(?)
+            ), cash AS (
+              SELECT security_id, ex_date, sum(cash_amount) AS cash_amount
+              FROM read_parquet(?) GROUP BY security_id, ex_date
+            )
+            SELECT count(*)
+            FROM read_parquet(?) returns
+            JOIN prices USING (security_id, session_date)
+            LEFT JOIN cash
+              ON cash.security_id = returns.security_id
+             AND cash.ex_date = returns.session_date
+            WHERE prices.previous_close IS NOT NULL
+              AND abs(returns.distribution_return
+                      - coalesce(cash.cash_amount, 0) / prices.previous_close) > 0.0001
+            """,
+            [
+                str(directory / "yahoo-ohlcv-320.parquet"),
+                str(distributions_path),
+                str(returns_path),
+            ],
+        ).fetchone()[0]
+    )
+    if distribution_errors:
+        raise VerificationError(
+            "Benchmark distribution returns do not reconcile to cash events"
+        )
+    certification = manifest.get("benchmark_total_returns")
+    if (
+        not isinstance(certification, dict)
+        or certification.get("status") != "CERTIFIED"
+    ):
+        raise VerificationError("Benchmark certification metadata is missing")
+    identity = con.execute(
+        "SELECT min(security_id), min(benchmark_id), "
+        "count(DISTINCT source_locator), count(DISTINCT source_revision) "
+        "FROM read_parquet(?)",
+        [str(returns_path)],
+    ).fetchone()
+    if (
+        certification.get("certification_method")
+        != "YAHOO_ADJUSTED_CLOSE_RECONCILED_TO_CANONICAL_RAW_CLOSE_AND_CASH_EVENTS"
+        or certification.get("security_id") != identity[0]
+        or certification.get("benchmark_id") != identity[1]
+        or certification.get("currency") != "USD"
+        or int(identity[2] or 0) != 1
+        or int(identity[3] or 0) != 1
+        or not re.fullmatch(
+            r"[0-9a-f]{64}", str(certification.get("source_revision") or "")
+        )
+    ):
+        raise VerificationError("Benchmark certification identity is invalid")
+    provenance_errors = int(
+        con.execute(
+            """
+            SELECT
+              (SELECT count(*) FROM read_parquet(?)
+               WHERE source_locator <> ? OR source_revision <> ? OR revision <> ?)
+              +
+              (SELECT count(*) FROM read_parquet(?)
+               WHERE source_locator <> ? OR source_revision <> ? OR revision <> ?)
+            """,
+            [
+                str(returns_path),
+                certification.get("source_locator"),
+                certification.get("source_revision"),
+                certification.get("source_revision"),
+                str(distributions_path),
+                certification.get("source_locator"),
+                certification.get("source_revision"),
+                certification.get("source_revision"),
+            ],
+        ).fetchone()[0]
+    )
+    if provenance_errors:
+        raise VerificationError("Benchmark row provenance does not match certification")
+    expected_metadata = {
+        "maximum_session": str(stats[4]),
+        "expected_latest_xnys_session": expected,
+        "sessions": int(stats[1]),
+        "weekly_observations": int(stats[2]),
+        "distributions": int(distribution_stats[0]),
+    }
+    if any(certification.get(key) != value for key, value in expected_metadata.items()):
+        raise VerificationError(
+            "Benchmark certification metadata does not match its assets"
+        )
+    measured_thresholds = {
+        "maximum_raw_close_relative_error": (
+            BENCHMARK_RAW_CLOSE_RELATIVE_TOLERANCE
+        ),
+        "maximum_total_return_reconciliation_error": (
+            BENCHMARK_TOTAL_RETURN_RECONCILIATION_TOLERANCE
+        ),
+    }
+    for key, maximum in measured_thresholds.items():
+        value = certification.get(key)
+        if (
+            not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or float(value) > maximum
+        ):
+            raise VerificationError(f"Benchmark certification exceeds {key}")
+    expected_thresholds = {
+        "minimum_sessions": BENCHMARK_MINIMUM_SESSIONS,
+        "minimum_weekly_observations": BENCHMARK_MINIMUM_WEEKLY_OBSERVATIONS,
+        "maximum_raw_close_relative_error": (
+            BENCHMARK_RAW_CLOSE_RELATIVE_TOLERANCE
+        ),
+        "maximum_total_return_reconciliation_error": (
+            BENCHMARK_TOTAL_RETURN_RECONCILIATION_TOLERANCE
+        ),
+    }
+    if certification.get("thresholds") != expected_thresholds:
+        raise VerificationError("Benchmark certification thresholds are invalid")
 
 
 def verify_enrichment(
@@ -684,11 +965,14 @@ def verify(directory: Path, require_ready: bool, require_production: bool) -> di
     filenames = {str(record.get("file")) for record in records if isinstance(record, dict)}
     if len(filenames) != len(records):
         raise VerificationError("release_files contains duplicate filenames")
-    if require_production and filenames != PRODUCTION_FILES:
-        raise VerificationError(
-            f"Production file set mismatch: expected={sorted(PRODUCTION_FILES)}, "
-            f"actual={sorted(filenames)}"
-        )
+    if require_production:
+        missing = PRODUCTION_FILES - filenames
+        unexpected = filenames - PRODUCTION_FILES - OPTIONAL_PRODUCTION_FILES
+        if missing or unexpected:
+            raise VerificationError(
+                "Production file set mismatch: "
+                f"missing={sorted(missing)}, unexpected={sorted(unexpected)}"
+            )
 
     con = duckdb.connect()
     try:
@@ -700,6 +984,7 @@ def verify(directory: Path, require_ready: bool, require_production: bool) -> di
             verify_identity_references(con, directory, filenames)
         elif require_production:
             raise VerificationError("Production release lacks security-master.parquet")
+        verify_benchmark_total_returns(con, directory, manifest)
         verify_enrichment(
             con, directory, manifest, require_production=require_production
         )

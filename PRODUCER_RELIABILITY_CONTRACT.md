@@ -44,8 +44,15 @@ copied independently from a different release.
 | `institutional` | `institutional-holdings-13f.parquet`, `institutional-ownership-signals.parquet` | `identity` |
 | `short_interest` | `finra-short-interest.parquet` | `identity` |
 | `analyst_estimates` | `analyst-estimates.parquet`, when licensed | `identity`; optional |
+| `total_returns` | `distributions.parquet`, `benchmark-total-returns.parquet` | `identity`, `market`; optional and all-or-none |
 
 `NOTICE.md` is release-level metadata.
+
+The `total_returns` group is `READY_NEW` only when its VTI source response reaches the
+market group's expected completed XNYS session, raw closes reconcile to the canonical
+market bytes, cash distributions reconcile to adjusted-close returns, and coverage is
+at least 140 sessions and 26 weekly observations. Otherwise both optional files are
+omitted and benchmark/accounting capabilities remain blocked.
 
 Every referenced `security_id` must exist in the active `security-master`
 contained by the same composite. Historical master rows may be retained to

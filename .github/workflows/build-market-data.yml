@@ -40,9 +40,14 @@ on:
         default: false
         type: boolean
   schedule:
-    - cron: "17 20 * * 1-5"
+    # Pre-open backstop: publish the prior completed XNYS session before 08:10.
+    - cron: "15 7 * * 1-5"
       timezone: "America/New_York"
-    - cron: "17 8 * * 6"
+    # Terminal-close build: begins after the regular XNYS close.
+    - cron: "16 16 * * 1-5"
+      timezone: "America/New_York"
+    # Leave the full source refresh enough headroom to finish before 08:30 Saturday.
+    - cron: "0 2 * * 6"
       timezone: "America/New_York"
 
 concurrency:
@@ -52,9 +57,9 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    # Only the weekday reuse path is bounded to 24 minutes. Saturday source refreshes
+    # Only the weekday reuse paths are tightly bounded. Saturday source refreshes
     # retain the larger budget because SEC normalization is intentionally off-path.
-    timeout-minutes: ${{ github.event_name == 'schedule' && github.event.schedule == '17 20 * * 1-5' && 24 || 360 }}
+    timeout-minutes: ${{ github.event_name == 'schedule' && github.event.schedule != '0 2 * * 6' && 35 || 360 }}
     permissions:
       contents: read
     outputs:
@@ -113,8 +118,9 @@ jobs:
             cutoff="$market_today"
             requested_publish="${RELEASES_ENABLED:-false}"
             allow_drift="false"
-            if [[ "$EVENT_SCHEDULE" == "17 8 * * 6" ]]; then
+            if [[ "$EVENT_SCHEDULE" == "0 2 * * 6" ]]; then
               refresh_enrichment="true"
+              reuse_chart_history="true"
             else
               refresh_enrichment="false"
               reuse_chart_history="true"
@@ -287,7 +293,8 @@ jobs:
           if [[ "$MODE" == "full" ]]; then
             args+=(
               --yahoo-chart-supplement
-              --yahoo-chart-workers 4
+              --yahoo-chart-refresh-all
+              --yahoo-chart-workers 8
               --benchmark-ticker VTI
               --require-benchmark
             )
@@ -418,6 +425,14 @@ jobs:
           fi
           echo "failure_count=$(jq '.candidate_attempt_failures | length' dist/manifest.json)" >> "$GITHUB_OUTPUT"
 
+      - name: Build certified benchmark total-return lane
+        if: steps.inputs.outputs.mode == 'full'
+        continue-on-error: true
+        run: |
+          python build-benchmark-total-returns.py \
+            --release-dir dist \
+            --benchmark-ticker VTI
+
       - name: Verify build output
         run: |
           args=(--dist dist --require-ready)
@@ -505,7 +520,7 @@ jobs:
     needs: build
     if: needs.build.outputs.publish == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: ${{ github.event_name == 'schedule' && github.event.schedule == '17 20 * * 1-5' && 5 || 15 }}
+    timeout-minutes: ${{ github.event_name == 'schedule' && github.event.schedule != '0 2 * * 6' && 10 || 15 }}
     permissions:
       actions: write
       contents: write
@@ -543,7 +558,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          gh release create "$TAG" \
+          assets=(
             dist/NOTICE.md \
             dist/corporate-events.parquet \
             dist/earnings-and-guidance-events.parquet \
@@ -561,7 +576,17 @@ jobs:
             dist/security-universe.csv \
             dist/unmatched-tickers.csv \
             dist/yahoo-ohlcv-320.parquet \
-            dist/yahoo-splits.parquet \
+            dist/yahoo-splits.parquet
+          )
+          for optional in \
+            dist/distributions.parquet \
+            dist/benchmark-total-returns.parquet
+          do
+            if [[ -f "$optional" ]]; then
+              assets+=("$optional")
+            fi
+          done
+          gh release create "$TAG" "${assets[@]}" \
             --draft \
             --title "Portfolio market data $TAG" \
             --notes-file dist/release-notes.md

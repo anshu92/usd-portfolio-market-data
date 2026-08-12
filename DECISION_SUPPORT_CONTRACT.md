@@ -111,6 +111,9 @@ latency result must state whether artifact discovery, network download, decompre
 integrity/schema validation, phase evaluation, database open, and consumer query time
 are included. A post-download verifier measurement includes Zstandard decompression
 when `verify-decision-support.py` performs it, but excludes discovery and download.
+The `--phase`/`--as-of` gate also recomputes required-capability age from `observed_at`
+and `maximum_age_seconds`; a statically `READY` pack becomes unusable when an input is
+future-dated at the decision instant or has expired.
 
 Contract v1.1 is structurally production-grade but operationally integration-only
 while every phase is `BLOCKED`. The first operational acceptance milestone is a

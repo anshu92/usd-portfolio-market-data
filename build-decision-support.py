@@ -379,7 +379,8 @@ def benchmark_lane_status(release_dir: Path) -> dict[str, object]:
                         OR NOT regexp_full_match(corporate_action_lineage_sha256, '[0-9a-f]{64}')
                         OR known_at_utc IS NULL OR revision IS NULL
                         OR source_locator IS NULL
-                   )
+                   ),
+                   max(session_date)
             FROM read_parquet(?)
             """,
             [str(returns_path)],
@@ -406,9 +407,26 @@ def benchmark_lane_status(release_dir: Path) -> dict[str, object]:
             + int(stats[5] or 0)
             + int(distribution_invalid or 0)
         )
+        source_manifest = load_manifest(release_dir / "manifest.json")
+        expected_session = str(
+            (source_manifest.get("validation") or {}).get(
+                "expected_latest_xnys_session"
+            )
+            or ""
+        )
+        market_session = str(
+            (source_manifest.get("aggregate") or {}).get("max_date") or ""
+        )
+        observed_session = normalize_sqlite_value(stats[6])
         if invalid_rows:
             state = "INVALID"
             reason = f"Certified total-return lane has {invalid_rows} invalid rows"
+        elif observed_session != expected_session or observed_session != market_session:
+            state = "STALE"
+            reason = (
+                "Certified total-return lane is not current with the source market "
+                f"session: observed={observed_session}, expected={expected_session}"
+            )
         elif sessions < BENCHMARK_MINIMUM_SESSIONS:
             state = "INSUFFICIENT_HISTORY"
             reason = (
@@ -452,7 +470,12 @@ def source_watermarks(
                 "capability_state": capability.get("state"),
                 "clock": freshness.get("clock"),
                 "expected": freshness.get("expected"),
-                "observed": capability.get("observed_at"),
+                "observed": freshness.get("observed")
+                if freshness
+                else capability.get("observed_at"),
+                "source_retrieved_at_utc": capability.get("observed_at")
+                if source_group == "total_returns"
+                else freshness.get("source_retrieved_at_utc"),
                 "freshness_state": freshness.get("state"),
                 "source_release_tag": group.get("source_release_tag")
                 if group
@@ -611,7 +634,9 @@ def phase_valid_session(phase_id: str, data_session: date) -> str:
 
 
 def capability_records(
-    groups: Mapping[str, Mapping[str, object]], release_dir: Path
+    groups: Mapping[str, Mapping[str, object]],
+    release_dir: Path,
+    as_of: datetime | None = None,
 ) -> dict[str, dict[str, object]]:
     output: dict[str, dict[str, object]] = {}
     benchmark = benchmark_lane_status(release_dir)
@@ -634,7 +659,34 @@ def capability_records(
         }:
             state = str(benchmark["state"])
             reason = benchmark["reason"]
-            freshness: Mapping[str, object] = {}
+            freshness_value = group.get("freshness") if group else None
+            freshness = freshness_value if isinstance(freshness_value, dict) else {}
+            group_state = str(group.get("state") or "") if group else ""
+            if state == "READY" and group_state not in USABLE_GROUP_STATES:
+                state = group_state or "NOT_CONFIGURED"
+                reason = "Certified total-return source group is not usable"
+            if state == "READY" and as_of is not None:
+                observed = benchmark.get("observed_at")
+                try:
+                    observed_at = datetime.fromisoformat(
+                        str(observed).replace("Z", "+00:00")
+                    )
+                except ValueError:
+                    state = "UNKNOWN_FRESHNESS"
+                    reason = "Certified total-return lane has no valid retrieval time"
+                else:
+                    if observed_at.tzinfo is None:
+                        observed_at = observed_at.replace(tzinfo=timezone.utc)
+                    age_seconds = (as_of - observed_at).total_seconds()
+                    maximum_age = contract.maximum_age_seconds
+                    if age_seconds < 0:
+                        state = "INVALID"
+                        reason = (
+                            "Certified total-return retrieval time is in the future"
+                        )
+                    elif maximum_age is not None and age_seconds > maximum_age:
+                        state = "STALE"
+                        reason = f"Source age exceeds {maximum_age} seconds"
         elif capability_id == "candidate_funnel":
             state = "NOT_CONFIGURED"
             reason = "Approved selector/candidate-funnel producer is not configured"
@@ -1553,7 +1605,7 @@ def build(args: argparse.Namespace) -> dict[str, object]:
     source_manifest_sha256 = sha256_file(source_manifest_path)
     source_files = validate_source_files(release_dir, source_manifest)
     groups = group_records(source_manifest)
-    capabilities = capability_records(groups, release_dir)
+    capabilities = capability_records(groups, release_dir, as_of=generated)
     valid_session_date = source_session(source_manifest)
     valid_session = valid_session_date.isoformat()
     calendar = xcals.get_calendar("XNYS")

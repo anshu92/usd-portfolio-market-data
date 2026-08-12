@@ -364,7 +364,10 @@ def prepare_price_candidates(
                  p.source_dataset, p.source_revision, p.observed_at_utc,
                  row_number() OVER (
                    PARTITION BY a.security_id, p.session_date
-                   ORDER BY a.priority, p.source_symbol
+                   ORDER BY a.priority, p.source_symbol,
+                            CASE WHEN p.source_dataset = 'Yahoo Finance Chart API'
+                                 THEN 0 ELSE 1 END,
+                            p.observed_at_utc DESC, p.source_revision
                  ) AS alias_rank
           FROM price_dedup p
           JOIN aliases a ON p.source_symbol = a.source_symbol
@@ -669,22 +672,31 @@ def append_previous_chart_history(
 
 
 def supplement_missing_yahoo_chart_history(
-    con: duckdb.DuckDBPyConnection, *, cutoff: date, workers: int, lookback_days: int
+    con: duckdb.DuckDBPyConnection,
+    *,
+    cutoff: date,
+    workers: int,
+    lookback_days: int,
+    refresh_all: bool = False,
 ) -> dict[str, object]:
     """Fill source-symbol gaps from Yahoo's chart endpoint with row provenance.
 
-    This is deliberately an opt-in supplement.  Each response is independently
-    hashed, and only aliases absent from the immutable snapshot are requested.
+    This is deliberately opt-in. Each response is independently hashed. The normal
+    supplement requests only aliases absent from the immutable snapshot; refresh-all
+    requests every admitted security's aliases for a current-session delta.
     """
-    missing = [
-        (str(row[0]), str(row[1])) for row in con.execute(
-            """
-            SELECT DISTINCT a.security_id, a.source_symbol FROM aliases a
+    selection = "" if refresh_all else """
             WHERE NOT EXISTS (
                     SELECT 1 FROM price_source p
                     WHERE p.source_symbol = a.source_symbol
                       AND p.source_dataset != 'Yahoo Finance Chart API'
                   )
+    """
+    missing = [
+        (str(row[0]), str(row[1])) for row in con.execute(
+            f"""
+            SELECT DISTINCT a.security_id, a.source_symbol FROM aliases a
+            {selection}
             ORDER BY a.security_id, a.priority
             """
         ).fetchall()
@@ -780,7 +792,14 @@ def supplement_missing_yahoo_chart_history(
     con.execute("CREATE TEMP TABLE price_dedup AS SELECT DISTINCT * FROM price_source")
     con.execute("DROP TABLE split_dedup")
     con.execute("CREATE TEMP TABLE split_dedup AS SELECT DISTINCT * FROM split_source")
-    return {"requested": len(requested), "responses": response_records, "failures": failures, "price_rows": len(price_records), "split_rows": len(split_records)}
+    return {
+        "mode": "ALL_ADMITTED_CURRENT_DELTA" if refresh_all else "MISSING_HISTORY_ONLY",
+        "requested": len(requested),
+        "responses": response_records,
+        "failures": failures,
+        "price_rows": len(price_records),
+        "split_rows": len(split_records),
+    }
 
 
 def repair_invalid_yahoo_chart_rows(
@@ -1085,6 +1104,7 @@ def build(args: argparse.Namespace) -> tuple[dict[str, object], int]:
                 cutoff=cutoff,
                 workers=args.yahoo_chart_workers,
                 lookback_days=args.yahoo_chart_lookback_days,
+                refresh_all=args.yahoo_chart_refresh_all,
             )
             repair_report = repair_invalid_yahoo_chart_rows(
                 con,
@@ -1579,6 +1599,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--yahoo-chart-workers", type=int, default=2)
     parser.add_argument("--yahoo-chart-lookback-days", type=int, default=730)
+    parser.add_argument(
+        "--yahoo-chart-refresh-all",
+        action="store_true",
+        help="Refresh the recent Chart window for every admitted security",
+    )
     parser.add_argument("--observed-at", help="RFC3339 UTC timestamp; defaults to now")
     args = parser.parse_args(argv)
 
@@ -1598,6 +1623,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--yahoo-chart-workers must be in [1, 16]")
     if args.yahoo_chart_lookback_days <= 0:
         parser.error("--yahoo-chart-lookback-days must be positive")
+    if args.yahoo_chart_refresh_all and not args.yahoo_chart_supplement:
+        parser.error("--yahoo-chart-refresh-all requires --yahoo-chart-supplement")
     if not (0 < args.systemic_invalid_session_rate <= 1):
         parser.error("--systemic-invalid-session-rate must be in (0, 1]")
     for name in ("minimum_coverage", "minimum_adequate_history_coverage"):

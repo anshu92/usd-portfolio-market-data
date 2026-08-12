@@ -38,7 +38,10 @@ OPERATING_MODES = (
 
 VALIDATOR_FILES = (
     "decision_support_contract.py",
+    "reliability_contract.py",
+    "build-benchmark-total-returns.py",
     "build-decision-support.py",
+    "verify-release.py",
     "verify-decision-support.py",
     "verify-decision-support-pointer.py",
     "live_snapshot_contract.py",

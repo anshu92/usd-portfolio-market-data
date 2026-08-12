@@ -986,14 +986,32 @@ def evaluate_phase_at(
         None,
     )
     reasons = list(pack.get("rejection_codes") or [])
+    freshness_reasons: list[str] = []
     if active_window is None:
         reasons.append("PHASE_WINDOW_NOT_ACTIVE")
     if pack.get("status") == "DEGRADED" and not allow_degraded:
         reasons.append("DEGRADED_NOT_ALLOWED")
+    for capability in pack.get("required_capabilities") or []:
+        if not isinstance(capability, dict) or capability.get("state") != "READY":
+            continue
+        maximum_age = capability.get("maximum_age_seconds")
+        observed = capability.get("observed_at")
+        if not isinstance(maximum_age, int) or maximum_age < 0 or not observed:
+            continue
+        observed_at = parse_utc(observed, f"{capability.get('capability_id')}.observed_at")
+        age_seconds = (instant - observed_at).total_seconds()
+        capability_id = str(capability.get("capability_id") or "UNKNOWN").upper()
+        if age_seconds < 0:
+            freshness_reasons.append(
+                f"CAPABILITY_{capability_id}_NOT_KNOWN_AT_AS_OF"
+            )
+        elif age_seconds > maximum_age:
+            freshness_reasons.append(f"CAPABILITY_{capability_id}_STALE_AT_AS_OF")
+    reasons.extend(freshness_reasons)
     usable = active_window is not None and (
         pack.get("status") == "READY"
         or (pack.get("status") == "DEGRADED" and allow_degraded)
-    )
+    ) and not freshness_reasons
     return {
         "status": "USABLE" if usable else "BLOCKED",
         "phase_id": phase_id,

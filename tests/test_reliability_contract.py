@@ -10,7 +10,7 @@ import duckdb
 import pytest
 
 from enrichment_contract import CONTRACTS, write_parquet
-from reliability_contract import apply_dataset_groups
+from reliability_contract import ReliabilityContractError, apply_dataset_groups
 
 
 def _file_record(path: Path, rows: int) -> dict[str, object]:
@@ -218,6 +218,27 @@ def test_market_reuse_allows_documented_two_session_lag() -> None:
     assert freshness_state_for_reuse(
         "market", {"lag_eligible_sessions": 3}
     ) == "STALE_DISABLED"
+
+
+def test_optional_group_must_be_absent_or_complete(tmp_path: Path) -> None:
+    release = tmp_path / "release"
+    manifest = _write_grouped_release(release)
+    distributions = release / "distributions.parquet"
+    con = duckdb.connect()
+    try:
+        con.execute(
+            "CREATE TABLE distributions(security_id VARCHAR, distribution_id VARCHAR)"
+        )
+        con.execute("COPY distributions TO ? (FORMAT PARQUET)", [str(distributions)])
+    finally:
+        con.close()
+    manifest["release_files"].append(_file_record(distributions, 0))
+
+    with pytest.raises(
+        ReliabilityContractError,
+        match="total_returns lacks dataset identity for benchmark-total-returns.parquet",
+    ):
+        apply_dataset_groups(manifest, release)
 
 
 def test_composition_copies_coverage_for_reused_groups(compose_module) -> None:

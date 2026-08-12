@@ -462,18 +462,23 @@ def test_official_archive_registry_and_workflow_headers() -> None:
     assert "Accept-Encoding: gzip, deflate" in workflow
     assert "--compressed" in workflow
     assert "refresh_enrichment" in workflow
-    assert 'cron: "17 8 * * 6"' in workflow
+    assert 'cron: "15 7 * * 1-5"' in workflow
+    assert 'cron: "16 16 * * 1-5"' in workflow
+    assert 'cron: "0 2 * * 6"' in workflow
     assert 'EVENT_SCHEDULE: ${{ github.event.schedule }}' in workflow
-    assert 'if [[ "$EVENT_SCHEDULE" == "17 8 * * 6" ]]' in workflow
-    assert "github.event.schedule == '17 20 * * 1-5' && 24 || 360" in workflow
-    assert "github.event.schedule == '17 20 * * 1-5' && 5 || 15" in workflow
+    assert 'if [[ "$EVENT_SCHEDULE" == "0 2 * * 6" ]]' in workflow
+    assert 'refresh_enrichment="true"\n              reuse_chart_history="true"' in workflow
+    assert "github.event.schedule != '0 2 * * 6' && 35 || 360" in workflow
+    assert "github.event.schedule != '0 2 * * 6' && 10 || 15" in workflow
     assert "reuse-enrichment-snapshot.py" in workflow
     assert '--current-manifest dist/manifest.json' in workflow
     assert "reuse_chart_history" in workflow
     assert "Download validated Yahoo Chart history baseline" in workflow
     assert "--previous-aggregate" in workflow
-    assert "--yahoo-chart-workers 4" in workflow
+    assert "--yahoo-chart-refresh-all" in workflow
+    assert "--yahoo-chart-workers 8" in workflow
     assert "--yahoo-chart-lookback-days 14" in workflow
+    assert "python build-benchmark-total-returns.py" in workflow
     assert "continue-on-error: ${{ steps.inputs.outputs.mode == 'full' }}" in workflow
     assert 'candidate="$RUNNER_TEMP/candidate-release"' in workflow
     assert "python compose-release.py" in workflow

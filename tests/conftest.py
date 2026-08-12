@@ -79,6 +79,13 @@ def decision_pointer_module():
     )
 
 
+@pytest.fixture(scope="session")
+def benchmark_builder_module():
+    return load_script(
+        "build_benchmark_total_returns", "build-benchmark-total-returns.py"
+    )
+
+
 def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
