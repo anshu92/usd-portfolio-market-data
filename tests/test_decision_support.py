@@ -9,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import duckdb
 
 from decision_support_contract import (
     ACTIONABILITY_MATRIX_FILENAME,
@@ -127,6 +128,56 @@ def test_build_is_deterministic_for_identical_inputs(
     assert (first / MANIFEST_FILENAME).read_bytes() == (
         second / MANIFEST_FILENAME
     ).read_bytes()
+
+
+def test_evidence_index_keeps_latest_revision_for_duplicate_event_ids(
+    decision_builder_module, decision_verify_module, tmp_path: Path
+):
+    release = source_release(tmp_path)
+    events = release / "corporate-events.parquet"
+    connection = duckdb.connect()
+    replacement = release / "corporate-events-revised.parquet"
+    try:
+        connection.execute(
+            "CREATE TABLE revised AS SELECT * FROM read_parquet(?)", [str(events)]
+        )
+        columns = [row[0] for row in connection.execute("DESCRIBE revised").fetchall()]
+        base = {column: None for column in columns}
+        base.update(
+            {
+                "event_id": "duplicate-event",
+                "security_id": "ARCX:VTI",
+                "event_type": "CORPORATE_ACTION",
+                "announcement_datetime_utc": "2026-07-24T12:00:00Z",
+                "effective_date": "2026-07-24",
+                "source_document_url": "https://www.sec.gov/Archives/duplicate",
+                "headline": "Older revision",
+                "source_retrieved_at_utc": "2026-07-24T12:01:00Z",
+            }
+        )
+        newer = dict(base)
+        newer["headline"] = "Newer revision"
+        newer["source_retrieved_at_utc"] = "2026-07-24T12:02:00Z"
+        placeholders = ",".join("?" for _ in columns)
+        connection.executemany(
+            f"INSERT INTO revised VALUES ({placeholders})",
+            [[row[column] for column in columns] for row in (base, newer)],
+        )
+        connection.execute("COPY revised TO ? (FORMAT PARQUET)", [str(replacement)])
+    finally:
+        connection.close()
+    replacement.replace(events)
+    manifest = json.loads((release / "manifest.json").read_text())
+    for record in manifest["release_files"]:
+        if record["file"] == events.name:
+            record["bytes"] = events.stat().st_size
+            record["sha256"] = hashlib.sha256(events.read_bytes()).hexdigest()
+            record["rows"] = 2
+    (release / "manifest.json").write_text(json.dumps(manifest, sort_keys=True))
+
+    output = tmp_path / "decision"
+    build_artifact(decision_builder_module, release, output)
+    assert decision_verify_module.verify(output)["status"] == "VALID"
 
 
 def test_verifier_rejects_tampered_phase_pack(

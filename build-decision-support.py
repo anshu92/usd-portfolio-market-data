@@ -1379,6 +1379,11 @@ def build_database(
               AND coalesce(effective_date, source_event_date, source_filing_date)
                 BETWEEN cast(? AS DATE) - INTERVAL 180 DAY
                     AND cast(? AS DATE) + INTERVAL 365 DAY
+            QUALIFY row_number() OVER (
+              PARTITION BY event_id
+              ORDER BY source_retrieved_at_utc DESC NULLS LAST,
+                       announcement_datetime_utc DESC NULLS LAST
+            ) = 1
             UNION ALL
             SELECT 'earnings-event:' || event_id, security_id, 'EARNINGS_EVENT',
                    coalesce(event_datetime_utc,
@@ -1399,6 +1404,11 @@ def build_database(
               AND coalesce(event_date, source_event_date, source_filing_date)
                 BETWEEN cast(? AS DATE) - INTERVAL 180 DAY
                     AND cast(? AS DATE) + INTERVAL 365 DAY
+            QUALIFY row_number() OVER (
+              PARTITION BY event_id
+              ORDER BY source_retrieved_at_utc DESC NULLS LAST,
+                       event_datetime_utc DESC NULLS LAST
+            ) = 1
             ORDER BY evidence_id
         """
         row_counts["evidence"] = copy_query(
