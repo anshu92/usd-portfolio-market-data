@@ -1338,7 +1338,7 @@ def build_database(
         )
 
         evidence_query = """
-            SELECT 'sec-filing:' || accession_number AS evidence_id,
+            SELECT 'sec-filing:' || security_id || ':' || accession_number AS evidence_id,
                    security_id, 'SEC_FILING' AS evidence_kind,
                    coalesce(acceptance_datetime_utc,
                             source_acceptance_datetime_utc,
@@ -1356,13 +1356,14 @@ def build_database(
                            source_acceptance_datetime_utc,
                            source_retrieved_at_utc) IS NOT NULL
             QUALIFY row_number() OVER (
-              PARTITION BY security_id, form
+              PARTITION BY security_id, accession_number
               ORDER BY acceptance_datetime_utc DESC NULLS LAST,
                        source_retrieved_at_utc DESC NULLS LAST,
                        accession_number DESC
             ) = 1
             UNION ALL
-            SELECT 'corporate-event:' || event_id, security_id, 'CORPORATE_EVENT',
+            SELECT 'corporate-event:' || security_id || ':' || event_id,
+                   security_id, 'CORPORATE_EVENT',
                    coalesce(announcement_datetime_utc,
                             source_acceptance_datetime_utc,
                             source_retrieved_at_utc),
@@ -1380,12 +1381,13 @@ def build_database(
                 BETWEEN cast(? AS DATE) - INTERVAL 180 DAY
                     AND cast(? AS DATE) + INTERVAL 365 DAY
             QUALIFY row_number() OVER (
-              PARTITION BY event_id
+              PARTITION BY security_id, event_id
               ORDER BY source_retrieved_at_utc DESC NULLS LAST,
                        announcement_datetime_utc DESC NULLS LAST
             ) = 1
             UNION ALL
-            SELECT 'earnings-event:' || event_id, security_id, 'EARNINGS_EVENT',
+            SELECT 'earnings-event:' || security_id || ':' || event_id,
+                   security_id, 'EARNINGS_EVENT',
                    coalesce(event_datetime_utc,
                             source_acceptance_datetime_utc,
                             source_retrieved_at_utc),
@@ -1405,7 +1407,7 @@ def build_database(
                 BETWEEN cast(? AS DATE) - INTERVAL 180 DAY
                     AND cast(? AS DATE) + INTERVAL 365 DAY
             QUALIFY row_number() OVER (
-              PARTITION BY event_id
+              PARTITION BY security_id, event_id
               ORDER BY source_retrieved_at_utc DESC NULLS LAST,
                        event_datetime_utc DESC NULLS LAST
             ) = 1
