@@ -98,6 +98,43 @@ validator identity, artifact identity, and the collision-safe promotion key
 `${SOURCE_TAG}/${ARTIFACT_ID}`. Pointer publication is monotonic by source tag and then
 artifact ID; an older or identical completed run cannot replace the current pointer.
 
+## Operational-readiness reporting
+
+A successful producer/publisher run must be described as **“artifact build, integrity
+validation, and pointer publication succeeded.”** It must not be described as a
+successful phase, decision, or production-ready V5 workflow unless at least one phase
+pack is independently usable at its actual cutoff.
+
+Every reported byte count must name both the object and representation, for example
+“compressed `decision-support.sqlite.zst` bytes” or “decompressed SQLite bytes.” Every
+latency result must state whether artifact discovery, network download, decompression,
+integrity/schema validation, phase evaluation, database open, and consumer query time
+are included. A post-download verifier measurement includes Zstandard decompression
+when `verify-decision-support.py` performs it, but excludes discovery and download.
+
+Contract v1.1 is structurally production-grade but operationally integration-only
+while every phase is `BLOCKED`. The first operational acceptance milestone is a
+scheduled phase that passes its actual `--phase`/`--as-of` gate using current,
+source-backed inputs.
+
+Data-availability work proceeds in this order:
+
+1. automated publication with market data current through the expected XNYS session;
+2. certified distribution-adjusted benchmark returns with at least 140 sessions and
+   26 weekly observations;
+3. rapid SEC filings, current catalysts, and licensed news;
+4. point-in-time expectations and revision history;
+5. populated deterministic candidate, actionability, primary-document, and evidence
+   packet lanes; and
+6. effective-dated universe membership, delistings, and survivorship-aware replay.
+
+For every phase that changes from unavailable to usable, the producer publishes a
+proof bundle containing the producer run ID, artifact ID and promotion key, source
+watermarks, old and new phase states, the exact `--phase`/`--as-of` result, coverage
+counts, end-to-end consumer latency with scope, and rollback plus failure-injection
+results. Holiday and XNYS early-close cases are mandatory before production-readiness
+is declared.
+
 ## Private-state boundary
 
 Portfolio holdings, positions, cash, tax lots, account identifiers, orders,

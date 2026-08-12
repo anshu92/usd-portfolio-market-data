@@ -110,6 +110,14 @@ fails unless the caller explicitly supplies `--allow-degraded`. Independently co
 the task session to `valid_for_session` and treat `data_cutoff_utc` and each source
 watermark as the maximum facts known—not as build time.
 
+Report a successful publication as “artifact build, integrity validation, and pointer
+publication succeeded.” This does not mean a phase is usable. Size metrics must say
+whether they refer to the compressed `.zst`, the decompressed SQLite database, or the
+Actions artifact archive. Timing metrics must enumerate their scope. In particular,
+`verify-decision-support.py` performs and therefore includes decompression in its local
+runtime, but a verifier run started after download excludes discovery and network
+transfer time.
+
 Open the database read-only and immutable:
 
 ```text
@@ -156,6 +164,26 @@ os.replace(temporary, cache / "current")
 
 Do not use a multi-step unlink/relink sequence; readers must see either the previous
 validated artifact or the new one.
+
+## Phase-readiness proof bundle
+
+The first production acceptance milestone is at least one scheduled phase that is
+genuinely usable with current source-backed data. Until then, contract v1.1 is an
+integration baseline only. When a phase first becomes usable, require a proof bundle
+with:
+
+- producer run, artifact, commit, validator-set, and promotion identities;
+- source watermarks and the prior-to-current phase status transition;
+- the exact successful `--phase` and `--as-of` evaluation;
+- security, candidate, evidence, and benchmark coverage counts as applicable;
+- end-to-end discovery, download, validation/decompression, open, and query latency;
+- rollback and missing/stale/corrupt-input failure-injection results; and
+- holiday and XNYS early-close acceptance results.
+
+Do not accept a proof bundle that synthesizes an unavailable lane, substitutes OHLCV
+for execution or certified total returns, or weakens a capability gate. Missing
+challenger data must result in candidate-specific rejection or
+`BENCHMARK_ONLY_SAFE`; unusable benchmark/accounting data remains blocked.
 
 The compact stream is not a replacement for the canonical release. Saturday replay,
 audit, raw SEC facts, detailed 13F holdings, and history beyond the recent hot window
