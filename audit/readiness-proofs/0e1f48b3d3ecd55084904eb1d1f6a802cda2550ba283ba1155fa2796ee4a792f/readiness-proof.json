@@ -1,0 +1,430 @@
+{
+  "benchmark": {
+    "certified_at_utc": "2026-08-13T02:10:58Z",
+    "coverage": {
+      "ratio": 1.0,
+      "required": 3,
+      "valid": 3
+    },
+    "expected_session": "2026-08-12",
+    "observed_session": "2026-08-12",
+    "reconciliation": {
+      "corporate_action_reconciliation": "PASS",
+      "distribution_reconciliation": "PASS",
+      "maximum_return_reconciliation_error": 0.0001,
+      "minimum_sessions": 140,
+      "minimum_weekly_observations": 26,
+      "required_current_session_coverage": 1.0
+    },
+    "required_tickers": [
+      "VTI",
+      "SPY",
+      "BIL"
+    ],
+    "securities": [
+      {
+        "benchmark_role": "FUNDED_EQUITY_BENCHMARK",
+        "cash_distributions": 5,
+        "currency": "USD",
+        "maximum_return_reconciliation_error": 5.3534391213656135e-05,
+        "maximum_session": "2026-08-12",
+        "minimum_session": "2025-05-05",
+        "security_id": "ARCX:VTI",
+        "sessions": 320,
+        "source_locator": "https://query2.finance.yahoo.com/v8/finance/chart/VTI?period1=1708732800&period2=1786579200&interval=1d&events=div%2Csplits&includeAdjustedClose=true",
+        "source_retrieved_at_utc": "2026-08-13T02:10:58Z",
+        "source_revision": "1389bd7bbefb457acb1f332757cfc470f647cb644f3e7bcc4e5eb5be35fac280",
+        "splits": 0,
+        "ticker": "VTI",
+        "weekly_observations": 67
+      },
+      {
+        "benchmark_role": "US_EQUITY_REFERENCE",
+        "cash_distributions": 5,
+        "currency": "USD",
+        "maximum_return_reconciliation_error": 3.9060675173742485e-05,
+        "maximum_session": "2026-08-12",
+        "minimum_session": "2025-05-05",
+        "security_id": "ARCX:SPY",
+        "sessions": 320,
+        "source_locator": "https://query2.finance.yahoo.com/v8/finance/chart/SPY?period1=1708732800&period2=1786579200&interval=1d&events=div%2Csplits&includeAdjustedClose=true",
+        "source_retrieved_at_utc": "2026-08-13T02:10:58Z",
+        "source_revision": "433cf0da4eb6cba9001cac1a7cdebb62b0dd6dd605da876f391f9047c031fb2d",
+        "splits": 0,
+        "ticker": "SPY",
+        "weekly_observations": 67
+      },
+      {
+        "benchmark_role": "CASH_REFERENCE",
+        "cash_distributions": 15,
+        "currency": "USD",
+        "maximum_return_reconciliation_error": 1.5472764294212002e-06,
+        "maximum_session": "2026-08-12",
+        "minimum_session": "2025-05-05",
+        "security_id": "ARCX:BIL",
+        "sessions": 320,
+        "source_locator": "https://query2.finance.yahoo.com/v8/finance/chart/BIL?period1=1708732800&period2=1786579200&interval=1d&events=div%2Csplits&includeAdjustedClose=true",
+        "source_retrieved_at_utc": "2026-08-13T02:10:58Z",
+        "source_revision": "374fe56d62f2a1c360a9b84e7e094578ac32fabe2fd906ac9bed91d1821c6cb3",
+        "splits": 0,
+        "ticker": "BIL",
+        "weekly_observations": 67
+      }
+    ],
+    "source_retrieved_at_utc": "2026-08-13T02:10:58Z"
+  },
+  "canonical_release": {
+    "benchmark_asset_ids": {
+      "benchmark-certification.json": 512352038,
+      "benchmark-distributions.parquet": 512352031,
+      "benchmark-total-returns.parquet": 512352034
+    },
+    "manifest_sha256": "f17b9a2329b33ef0b9042d7a49cae518d9d8fef039272805bde6281ecdb966f3",
+    "producer_commit": "db39512687480cb17bfb6d4aae11abe488b3a131",
+    "producer_workflow_run_id": 31658728378,
+    "release_id": 369628730,
+    "tag": "market-data-20260813T014609Z"
+  },
+  "capabilities": {
+    "benchmark_identity": {
+      "capability_id": "benchmark_identity",
+      "coverage": 1.0,
+      "expected_coverage": 1.0,
+      "identity_subset_sha256": "35de5cd7207a70291f5d6674e21a9756f543dda36f1232ad9213bffe40fce062",
+      "maximum_age_seconds": 86400,
+      "maximum_session": "2026-08-12",
+      "minimum_sessions": 140,
+      "minimum_weekly_observations": 26,
+      "observed_at": "2026-08-13T02:10:58Z",
+      "reason": null,
+      "securities": 3,
+      "sessions": 320,
+      "source_group": "total_returns",
+      "state": "READY",
+      "weekly_observations": 67
+    },
+    "benchmark_market_current": {
+      "capability_id": "benchmark_market_current",
+      "coverage": 1.0,
+      "expected_coverage": 1.0,
+      "identity_subset_sha256": "35de5cd7207a70291f5d6674e21a9756f543dda36f1232ad9213bffe40fce062",
+      "maximum_age_seconds": 3600,
+      "maximum_session": "2026-08-12",
+      "minimum_sessions": 140,
+      "minimum_weekly_observations": 26,
+      "observed_at": "2026-08-13T02:10:58Z",
+      "reason": null,
+      "securities": 3,
+      "sessions": 320,
+      "source_group": "total_returns",
+      "state": "READY",
+      "weekly_observations": 67
+    },
+    "broad_market_current": {
+      "capability_id": "broad_market_current",
+      "maximum_age_seconds": null,
+      "observed_at": "2026-08-10",
+      "reason": "Market group is not current through its expected completed session",
+      "source_group": "market",
+      "state": "STALE"
+    },
+    "certified_total_returns": {
+      "capability_id": "certified_total_returns",
+      "coverage": 1.0,
+      "expected_coverage": 1.0,
+      "identity_subset_sha256": "35de5cd7207a70291f5d6674e21a9756f543dda36f1232ad9213bffe40fce062",
+      "maximum_age_seconds": 3600,
+      "maximum_session": "2026-08-12",
+      "minimum_sessions": 140,
+      "minimum_weekly_observations": 26,
+      "observed_at": "2026-08-13T02:10:58Z",
+      "reason": null,
+      "securities": 3,
+      "sessions": 320,
+      "source_group": "total_returns",
+      "state": "READY",
+      "weekly_observations": 67
+    },
+    "funded_benchmark_inputs": {
+      "capability_id": "funded_benchmark_inputs",
+      "coverage": 1.0,
+      "expected_coverage": 1.0,
+      "identity_subset_sha256": "35de5cd7207a70291f5d6674e21a9756f543dda36f1232ad9213bffe40fce062",
+      "maximum_age_seconds": 3600,
+      "maximum_session": "2026-08-12",
+      "minimum_sessions": 140,
+      "minimum_weekly_observations": 26,
+      "observed_at": "2026-08-13T02:10:58Z",
+      "reason": null,
+      "securities": 3,
+      "sessions": 320,
+      "source_group": "total_returns",
+      "state": "READY",
+      "weekly_observations": 67
+    }
+  },
+  "consumer_latency": {
+    "artifact_discovery_seconds": 0.82224595,
+    "artifact_download_seconds": 0.818906592,
+    "decompression_seconds": 0.3189061169999974,
+    "download_included": false,
+    "download_seconds": null,
+    "integrity_schema_validation_seconds_excluding_decompression": 1.8046806370000041,
+    "total_post_download_seconds": 2.1235867540000015
+  },
+  "decision_support": {
+    "artifact_digest": "sha256:efa73f4540a16859215af0c794203c791a4bb5b0ed118b4f45f261c22460c41b",
+    "artifact_id": 9165995215,
+    "artifact_name": "decision-support-market-data-20260813T014609Z-31660327172",
+    "pointer_promotion_key": "market-data-20260813T014609Z/9165995215",
+    "pointer_publication_run_id": 31660503890,
+    "producer_commit": "02062ac9c24945d98cea12708ea384ff0e13ddc5",
+    "validator_set_sha256": "9a41518c1585d8987a56d3816e33f514cc15fb3ce1fa9b5025d72e0f17c3adde",
+    "workflow_run_id": 31660327172
+  },
+  "exact_validator_result": {
+    "database_bytes": 39694826,
+    "database_representation": "COMPRESSED_ZSTANDARD",
+    "decompressed_database_bytes": 311939072,
+    "latency": {
+      "decompression_seconds": 0.3189061169999974,
+      "download_included": false,
+      "download_seconds": null,
+      "integrity_schema_validation_seconds_excluding_decompression": 1.8046806370000041,
+      "total_post_download_seconds": 2.1235867540000015
+    },
+    "phase_evaluation": {
+      "active_window_id": "ACCOUNTING",
+      "as_of_utc": "2026-08-13T02:45:00Z",
+      "decision_mode": "BENCHMARK_ONLY_SAFE",
+      "phase_id": "accounting",
+      "rejection_codes": [],
+      "status": "USABLE"
+    },
+    "phase_packs": 7,
+    "source_release_tag": "market-data-20260813T014609Z",
+    "status": "VALID"
+  },
+  "generated_at_utc": "2026-08-13T02:21:42.585139Z",
+  "phase": "accounting",
+  "phase_transition": {
+    "from": "BLOCKED",
+    "operating_mode": "BENCHMARK_ONLY_SAFE",
+    "to": "READY"
+  },
+  "schema_version": "1.0.0",
+  "source_watermarks": [
+    {
+      "capability_id": "benchmark_identity",
+      "capability_state": "READY",
+      "clock": "XNYS_ELIGIBLE_SESSIONS",
+      "expected": "2026-08-12",
+      "freshness_state": "READY",
+      "group_sha256": "b592b003278a76e1a2e2da97f10fd459a7be380522431c01345c76322fc3e1e8",
+      "observed": "2026-08-12",
+      "source_group": "total_returns",
+      "source_release_tag": null,
+      "source_retrieved_at_utc": "2026-08-13T02:10:58Z"
+    },
+    {
+      "capability_id": "benchmark_market_current",
+      "capability_state": "READY",
+      "clock": "XNYS_ELIGIBLE_SESSIONS",
+      "expected": "2026-08-12",
+      "freshness_state": "READY",
+      "group_sha256": "b592b003278a76e1a2e2da97f10fd459a7be380522431c01345c76322fc3e1e8",
+      "observed": "2026-08-12",
+      "source_group": "total_returns",
+      "source_release_tag": null,
+      "source_retrieved_at_utc": "2026-08-13T02:10:58Z"
+    },
+    {
+      "capability_id": "broad_market_current",
+      "capability_state": "STALE",
+      "clock": "XNYS_ELIGIBLE_SESSIONS",
+      "expected": "2026-08-12",
+      "freshness_state": "READY",
+      "group_sha256": "6ab6b96dcda244c99b586ed81cfcf57be111d67070a0653fd433d9f864c7b118",
+      "observed": "2026-08-10",
+      "source_group": "market",
+      "source_release_tag": "market-data-20260812T210509Z",
+      "source_retrieved_at_utc": null
+    },
+    {
+      "capability_id": "candidate_funnel",
+      "capability_state": "NOT_CONFIGURED",
+      "clock": null,
+      "expected": null,
+      "freshness_state": null,
+      "group_sha256": null,
+      "observed": null,
+      "source_group": "candidate_funnel",
+      "source_release_tag": null,
+      "source_retrieved_at_utc": null
+    },
+    {
+      "capability_id": "canonical_replay",
+      "capability_state": "READY",
+      "clock": "XNYS_ELIGIBLE_SESSIONS",
+      "expected": "2026-08-12",
+      "freshness_state": "READY",
+      "group_sha256": "6ab6b96dcda244c99b586ed81cfcf57be111d67070a0653fd433d9f864c7b118",
+      "observed": "2026-08-10",
+      "source_group": "market",
+      "source_release_tag": "market-data-20260812T210509Z",
+      "source_retrieved_at_utc": null
+    },
+    {
+      "capability_id": "certified_total_returns",
+      "capability_state": "READY",
+      "clock": "XNYS_ELIGIBLE_SESSIONS",
+      "expected": "2026-08-12",
+      "freshness_state": "READY",
+      "group_sha256": "b592b003278a76e1a2e2da97f10fd459a7be380522431c01345c76322fc3e1e8",
+      "observed": "2026-08-12",
+      "source_group": "total_returns",
+      "source_release_tag": null,
+      "source_retrieved_at_utc": "2026-08-13T02:10:58Z"
+    },
+    {
+      "capability_id": "current_catalysts",
+      "capability_state": "STALE",
+      "clock": "SOURCE_RETRIEVAL_TIME",
+      "expected": "2026-08-13T01:46:17.798857Z",
+      "freshness_state": "READY",
+      "group_sha256": "db5fba1acfe8ea51e6ca2e1eee2d005e20f299f85963ae7981fb48b7edbed108",
+      "observed": "2026-08-08T13:42:38.400072Z",
+      "source_group": "filings_events",
+      "source_release_tag": "market-data-20260812T210509Z",
+      "source_retrieved_at_utc": null
+    },
+    {
+      "capability_id": "etf_exposure",
+      "capability_state": "NOT_CONFIGURED",
+      "clock": null,
+      "expected": null,
+      "freshness_state": null,
+      "group_sha256": null,
+      "observed": null,
+      "source_group": "etf_exposure",
+      "source_release_tag": null,
+      "source_retrieved_at_utc": null
+    },
+    {
+      "capability_id": "execution_snapshot",
+      "capability_state": "CONSUMER_REQUIRED",
+      "clock": null,
+      "expected": null,
+      "freshness_state": null,
+      "group_sha256": null,
+      "observed": null,
+      "source_group": null,
+      "source_release_tag": null,
+      "source_retrieved_at_utc": null
+    },
+    {
+      "capability_id": "funded_benchmark_inputs",
+      "capability_state": "READY",
+      "clock": "XNYS_ELIGIBLE_SESSIONS",
+      "expected": "2026-08-12",
+      "freshness_state": "READY",
+      "group_sha256": "b592b003278a76e1a2e2da97f10fd459a7be380522431c01345c76322fc3e1e8",
+      "observed": "2026-08-12",
+      "source_group": "total_returns",
+      "source_release_tag": null,
+      "source_retrieved_at_utc": "2026-08-13T02:10:58Z"
+    },
+    {
+      "capability_id": "historical_market",
+      "capability_state": "STALE",
+      "clock": "XNYS_ELIGIBLE_SESSIONS",
+      "expected": "2026-08-12",
+      "freshness_state": "READY",
+      "group_sha256": "6ab6b96dcda244c99b586ed81cfcf57be111d67070a0653fd433d9f864c7b118",
+      "observed": "2026-08-10",
+      "source_group": "market",
+      "source_release_tag": "market-data-20260812T210509Z",
+      "source_retrieved_at_utc": null
+    },
+    {
+      "capability_id": "identity",
+      "capability_state": "STALE",
+      "clock": "SOURCE_RETRIEVAL_TIME",
+      "expected": "2026-08-13T01:46:17.798857Z",
+      "freshness_state": "REUSED_WITH_PENALTY",
+      "group_sha256": "f9bf5abf6c78619c5eb478cca774414ec9906f527cef601884c9baec8966c006",
+      "observed": "2026-08-11T15:16:47.444256Z",
+      "source_group": "identity",
+      "source_release_tag": "market-data-20260812T210509Z",
+      "source_retrieved_at_utc": null
+    },
+    {
+      "capability_id": "macro_industry",
+      "capability_state": "NOT_CONFIGURED",
+      "clock": null,
+      "expected": null,
+      "freshness_state": null,
+      "group_sha256": null,
+      "observed": null,
+      "source_group": "macro_industry",
+      "source_release_tag": null,
+      "source_retrieved_at_utc": null
+    },
+    {
+      "capability_id": "point_in_time_expectations",
+      "capability_state": "NOT_CONFIGURED",
+      "clock": "NOT_CONFIGURED",
+      "expected": null,
+      "freshness_state": "NOT_CONFIGURED",
+      "group_sha256": null,
+      "observed": null,
+      "source_group": "analyst_estimates",
+      "source_release_tag": null,
+      "source_retrieved_at_utc": null
+    },
+    {
+      "capability_id": "primary_evidence",
+      "capability_state": "STALE",
+      "clock": "SOURCE_RETRIEVAL_TIME",
+      "expected": "2026-08-13T01:46:17.798857Z",
+      "freshness_state": "READY",
+      "group_sha256": "db5fba1acfe8ea51e6ca2e1eee2d005e20f299f85963ae7981fb48b7edbed108",
+      "observed": "2026-08-08T13:42:38.400072Z",
+      "source_group": "filings_events",
+      "source_release_tag": "market-data-20260812T210509Z",
+      "source_retrieved_at_utc": null
+    },
+    {
+      "capability_id": "rapid_event_news",
+      "capability_state": "NOT_CONFIGURED",
+      "clock": null,
+      "expected": null,
+      "freshness_state": null,
+      "group_sha256": null,
+      "observed": null,
+      "source_group": "news_events",
+      "source_release_tag": null,
+      "source_retrieved_at_utc": null
+    },
+    {
+      "capability_id": "survivorship_history",
+      "capability_state": "NOT_CONFIGURED",
+      "clock": null,
+      "expected": null,
+      "freshness_state": null,
+      "group_sha256": null,
+      "observed": null,
+      "source_group": "survivorship_history",
+      "source_release_tag": null,
+      "source_retrieved_at_utc": null
+    }
+  ],
+  "status": "PHASE_USABLE_PROOF",
+  "tests": {
+    "early_close_calendar": "PASS",
+    "holiday_calendar": "PASS",
+    "rollback_carried_forward_lane": "PASS",
+    "stale_source_quarantine": "PASS",
+    "unreconciled_return_quarantine": "PASS"
+  }
+}
