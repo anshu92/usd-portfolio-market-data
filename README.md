@@ -309,9 +309,10 @@ and rollback tests; measures discovery, download, decompression, and validation
 separately; and publishes `readiness-proof.json` as a 90-day artifact.
 After acceptance, the proof workflow requests `Publish durable readiness proof` for
 that exact proof run. The durable workflow revalidates the proof and original decision
-artifact, attaches the unchanged proof plus its SHA-256 sidecar to an immutable
-non-latest release, and verifies that the canonical `market-data-*` release remains
-latest. The Actions proof artifact is temporary and is not the permanent audit record.
+artifact, attaches the unchanged proof plus its SHA-256 sidecar to a durable
+SHA-addressed Git path in one atomic content-addressed commit, then verifies those
+exact commit bytes and confirms canonical release discovery is unchanged. The Actions
+proof artifact is temporary and is not the permanent audit record.
 
 Before enabling scheduled publication, run one manual `full` workflow with
 `refresh_enrichment=true`, validate its artifact, and publish it as the immutable

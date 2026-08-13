@@ -185,14 +185,6 @@ jobs:
       - name: Build content-addressed durable bundle
         id: bundle
         shell: bash
-        env:
-          PHASE: ${{ inputs.phase }}
-          DECISION_RUN_ID: ${{ inputs.decision_run_id }}
-          PROOF_RUN_ID: ${{ inputs.proof_run_id }}
-          AS_OF_UTC: ${{ steps.evidence.outputs.as_of }}
-          PHASE_DECISION_CUTOFF_UTC: ${{ steps.evidence.outputs.cutoff }}
-          NOT_BEFORE_UTC: ${{ steps.evidence.outputs.not_before }}
-          EXPIRES_AT_UTC: ${{ steps.evidence.outputs.expires }}
         run: |
           set -euo pipefail
           mkdir -p durable
@@ -201,78 +193,103 @@ jobs:
           printf '%s  readiness-proof.json\n' "$proof_sha" \
             > durable/readiness-proof.json.sha256
           (cd durable && sha256sum -c readiness-proof.json.sha256)
-          tag="readiness-proof-${PHASE}-${DECISION_RUN_ID}"
-          python - "$proof_sha" <<'PY'
-          import os
-          import sys
-          from pathlib import Path
-
-          digest = sys.argv[1]
-          notes = f"""Immutable phase-readiness audit proof.
-
-          - Phase: `{os.environ['PHASE']}`
-          - Proof SHA-256: `{digest}`
-          - Proof workflow run: `{os.environ['PROOF_RUN_ID']}`
-          - Decision workflow run: `{os.environ['DECISION_RUN_ID']}`
-          - Validation `as_of_utc`: `{os.environ['AS_OF_UTC']}`
-          - `phase_decision_cutoff_utc`: `{os.environ['PHASE_DECISION_CUTOFF_UTC']}`
-          - Inclusive phase window: `{os.environ['NOT_BEFORE_UTC']}` through `{os.environ['EXPIRES_AT_UTC']}`
-
-          The decision artifact recorded by this proof is retained for audit/replay only.
-          Routine consumers must resolve the current discovery pointer and validate its captured
-          artifact at their actual as-of time.
-          """
-          Path("durable/release-notes.md").write_text(notes, encoding="utf-8")
-          PY
           echo "proof_sha=$proof_sha" >> "$GITHUB_OUTPUT"
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
-      - name: Publish or reverify immutable non-latest release
+      - name: Publish or reverify atomic content-addressed Git record
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.bundle.outputs.tag }}
           PROOF_SHA: ${{ steps.bundle.outputs.proof_sha }}
-          DECISION_COMMIT: ${{ steps.decision.outputs.commit }}
         run: |
           set -euo pipefail
-          if gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" \
-            > "$RUNNER_TEMP/durable-release.json" 2>/dev/null
+          record_dir="audit/readiness-proofs/${PROOF_SHA}"
+          proof_path="${record_dir}/readiness-proof.json"
+          sidecar_path="${record_dir}/readiness-proof.json.sha256"
+          if gh api "repos/${GITHUB_REPOSITORY}/contents/${proof_path}?ref=main" \
+            > "$RUNNER_TEMP/existing-proof.json" 2>/dev/null
           then
-            mkdir -p "$RUNNER_TEMP/existing-release"
-            gh release download "$TAG" \
-              --repo "$GITHUB_REPOSITORY" \
-              --dir "$RUNNER_TEMP/existing-release"
+            gh api "repos/${GITHUB_REPOSITORY}/contents/${sidecar_path}?ref=main" \
+              > "$RUNNER_TEMP/existing-sidecar.json"
+            jq -r '.content' "$RUNNER_TEMP/existing-proof.json" | base64 -d \
+              > "$RUNNER_TEMP/existing-readiness-proof.json"
+            jq -r '.content' "$RUNNER_TEMP/existing-sidecar.json" | base64 -d \
+              > "$RUNNER_TEMP/existing-readiness-proof.json.sha256"
             cmp durable/readiness-proof.json \
-              "$RUNNER_TEMP/existing-release/readiness-proof.json"
+              "$RUNNER_TEMP/existing-readiness-proof.json"
             cmp durable/readiness-proof.json.sha256 \
-              "$RUNNER_TEMP/existing-release/readiness-proof.json.sha256"
+              "$RUNNER_TEMP/existing-readiness-proof.json.sha256"
+            durable_commit="$(gh api \
+              "repos/${GITHUB_REPOSITORY}/commits?path=${proof_path}&per_page=1" \
+              --jq '.[0].sha')"
           else
-            gh release create "$TAG" \
-              durable/readiness-proof.json \
-              durable/readiness-proof.json.sha256 \
-              --repo "$GITHUB_REPOSITORY" \
-              --target "$DECISION_COMMIT" \
-              --title "Durable ${TAG}" \
-              --notes-file durable/release-notes.md \
-              --latest=false
-            gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" \
-              > "$RUNNER_TEMP/durable-release.json"
+            proof_blob="$(base64 -w0 durable/readiness-proof.json | \
+              jq -R '{content: ., encoding: "base64"}' | \
+              gh api --method POST \
+                "repos/${GITHUB_REPOSITORY}/git/blobs" \
+                --input - --jq '.sha')"
+            sidecar_blob="$(base64 -w0 durable/readiness-proof.json.sha256 | \
+              jq -R '{content: ., encoding: "base64"}' | \
+              gh api --method POST \
+                "repos/${GITHUB_REPOSITORY}/git/blobs" \
+                --input - --jq '.sha')"
+            published=false
+            for attempt in 1 2 3 4; do
+              base_commit="$(gh api \
+                "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" \
+                --jq '.object.sha')"
+              base_tree="$(gh api \
+                "repos/${GITHUB_REPOSITORY}/git/commits/${base_commit}" \
+                --jq '.tree.sha')"
+              tree_sha="$(jq -n \
+                --arg base_tree "$base_tree" \
+                --arg proof_path "$proof_path" \
+                --arg proof_blob "$proof_blob" \
+                --arg sidecar_path "$sidecar_path" \
+                --arg sidecar_blob "$sidecar_blob" \
+                '{
+                  base_tree: $base_tree,
+                  tree: [
+                    {path: $proof_path, mode: "100644", type: "blob", sha: $proof_blob},
+                    {path: $sidecar_path, mode: "100644", type: "blob", sha: $sidecar_blob}
+                  ]
+                }' | gh api --method POST \
+                  "repos/${GITHUB_REPOSITORY}/git/trees" \
+                  --input - --jq '.sha')"
+              durable_commit="$(jq -n \
+                --arg message "Preserve readiness proof ${PROOF_SHA}" \
+                --arg tree "$tree_sha" \
+                --arg parent "$base_commit" \
+                '{message: $message, tree: $tree, parents: [$parent]}' | \
+                gh api --method POST \
+                  "repos/${GITHUB_REPOSITORY}/git/commits" \
+                  --input - --jq '.sha')"
+              if jq -n --arg sha "$durable_commit" \
+                '{sha: $sha, force: false}' | \
+                gh api --method PATCH \
+                  "repos/${GITHUB_REPOSITORY}/git/refs/heads/main" \
+                  --input - >/dev/null
+              then
+                published=true
+                break
+              fi
+            done
+            [[ "$published" == "true" ]] || {
+              echo "Could not atomically publish proof after four main-ref races" >&2
+              exit 2
+            }
           fi
-          jq -e --arg tag "$TAG" --arg proof_digest "sha256:${PROOF_SHA}" '
-            .tag_name == $tag and
-            .draft == false and
-            .prerelease == false and
-            .immutable == true and
-            ([.assets[].name] | sort) == [
-              "readiness-proof.json",
-              "readiness-proof.json.sha256"
-            ] and
-            (.assets[] | select(.name == "readiness-proof.json") | .digest) == $proof_digest
-          ' "$RUNNER_TEMP/durable-release.json" >/dev/null
+          gh api \
+            "repos/${GITHUB_REPOSITORY}/contents/${proof_path}?ref=${durable_commit}" \
+            --jq '.content' | base64 -d > "$RUNNER_TEMP/published-proof.json"
+          gh api \
+            "repos/${GITHUB_REPOSITORY}/contents/${sidecar_path}?ref=${durable_commit}" \
+            --jq '.content' | base64 -d > "$RUNNER_TEMP/published-proof.json.sha256"
+          cmp durable/readiness-proof.json "$RUNNER_TEMP/published-proof.json"
+          cmp durable/readiness-proof.json.sha256 \
+            "$RUNNER_TEMP/published-proof.json.sha256"
           latest_tag="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq '.tag_name')"
           [[ "$latest_tag" =~ ^market-data-[0-9]{8}T[0-9]{6}Z$ ]] || {
-            echo "Durable proof displaced the canonical latest release" >&2
+            echo "Durable proof changed canonical release discovery" >&2
             exit 2
           }
-          echo "Durable proof release: https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}"
+          echo "Durable proof commit: https://github.com/${GITHUB_REPOSITORY}/commit/${durable_commit}"

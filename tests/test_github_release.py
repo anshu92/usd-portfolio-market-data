@@ -218,7 +218,7 @@ def test_decision_support_workflows_are_pinned_and_least_privilege():
             assert re_full_sha_reference(reference), reference
 
 
-def test_durable_readiness_proof_is_immutable_content_addressed_and_non_latest():
+def test_durable_readiness_proof_is_atomically_content_addressed():
     workflows = Path(__file__).resolve().parents[1] / ".github/workflows"
     workflow = (
         workflows / "publish-durable-readiness-proof.yml"
@@ -231,9 +231,12 @@ def test_durable_readiness_proof_is_immutable_content_addressed_and_non_latest()
     assert "digest-mismatch: error" in workflow
     assert "readiness-proof.json.sha256" in workflow
     assert "sha256sum -c readiness-proof.json.sha256" in workflow
-    assert "--latest=false" in workflow
-    assert ".immutable == true" in workflow
-    assert "Routine consumers must resolve the current discovery pointer" in workflow
+    assert "audit/readiness-proofs/${PROOF_SHA}" in workflow
+    assert '"repos/${GITHUB_REPOSITORY}/git/blobs"' in workflow
+    assert '"repos/${GITHUB_REPOSITORY}/git/trees"' in workflow
+    assert '"repos/${GITHUB_REPOSITORY}/git/commits"' in workflow
+    assert '"repos/${GITHUB_REPOSITORY}/git/refs/heads/main"' in workflow
+    assert "{sha: $sha, force: false}" in workflow
     assert "request_durable_publication:" in proof_workflow
     assert "gh workflow run publish-durable-readiness-proof.yml" in proof_workflow
     assert "actions: write" in proof_workflow
