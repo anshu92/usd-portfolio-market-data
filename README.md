@@ -225,11 +225,12 @@ windows rather than assuming a scheduled trigger ran on time:
   35-minute build budget plus a 10-minute publish budget. The pre-open run requires
   the prior completed session; the terminal-close run requires the same-day completed
   session, including the 13:00 close on XNYS early-close days;
-- full builds attempt a source-backed VTI distribution and total-return lane. It is
-  published as `CERTIFIED` only when adjusted-close returns reconcile to the canonical
-  raw-close series and cash events, reaches the expected XNYS session, and supplies at
-  least 140 sessions and 26 weekly observations. Failure omits both optional assets and
-  leaves accounting and benchmark-only gates blocked;
+- full builds attempt an independent, source-backed VTI/SPY/BIL benchmark lane. It is
+  published only when all three securities reach the expected XNYS session with 100%
+  coverage, adjusted-close returns reconcile to raw closes, splits, and cash events,
+  and each supplies at least 140 sessions and 26 weekly observations. Failure
+  quarantines the attempt, omits all three optional benchmark assets, and leaves
+  accounting and benchmark-only gates blocked;
 - Saturday scheduled builds set `refresh_enrichment=true` and perform the slower
   official SEC/FINRA rebuild with a six-hour ceiling; this weekly cadence captures SEC
   filing/fundamental changes and FINRA's semi-monthly updates without paying the
@@ -245,6 +246,34 @@ directory contains a new admission, `security-master.parquet` adds an explicit
 `UNMAPPED_DAILY_ADMISSION` row; the next Saturday or manual enrichment refresh resolves
 its SEC mapping. Historical master rows are retained so older point-in-time enrichment
 rows remain referentially valid.
+
+### Calendar-aware production dispatch
+
+Run `dispatch-producer-phase.py` from an external scheduler. It derives deadlines from
+the XNYS calendar (including holidays and early closes), emits stable idempotency keys,
+and sends the `producer_phase_deadline` repository event. Plan accounting attempts with:
+
+```bash
+python dispatch-producer-phase.py plan --phase accounting --session 2026-08-12
+```
+
+At each planned time, invoke `dispatch` with exactly one `--attempt` and a token in
+`GITHUB_TOKEN`. Correction attempts skip themselves when the latest immutable release
+already contains a complete certification for that session. Workflow concurrency is
+scoped to phase and expected session, preventing overlapping attempts. GitHub cron at
+close +45, +75, and +120 is retained only as a backstop; its observed start time is
+never treated as an action-time SLO.
+
+Every full attempt publishes `market-coverage-diagnostic.json` in its seven-day
+workflow artifact. The diagnostic freezes the eligible denominator before evaluation,
+classifies every security as valid, missing, stale, invalid, or quarantined, and records
+provider and targeted-retry outcomes without weakening the 95% broad-market gate.
+
+After accounting or Sunday passes its exact cutoff gate and its pointer is published,
+run `Publish phase readiness proof` with the decision and pointer workflow run IDs.
+That workflow reruns holiday, early-close, stale-source, reconciliation, quarantine,
+and rollback tests; measures discovery, download, decompression, and validation
+separately; and publishes `readiness-proof.json` as a 90-day artifact.
 
 Before enabling scheduled publication, run one manual `full` workflow with
 `refresh_enrichment=true`, validate its artifact, and publish it as the immutable

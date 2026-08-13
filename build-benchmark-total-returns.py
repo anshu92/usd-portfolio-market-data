@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Attach a source-backed, validated VTI total-return lane to a release."""
+"""Build an independent, all-or-nothing certified benchmark return lane."""
 
 from __future__ import annotations
 
 import argparse
-import copy
 import csv
 import hashlib
 import json
@@ -24,57 +23,75 @@ import duckdb
 from reliability_contract import apply_dataset_groups
 
 
-BENCHMARK_ID = "USD_V5_FUNDED_BENCHMARK_INPUT_V1"
+REQUIRED_BENCHMARKS = ("VTI", "SPY", "BIL")
+BENCHMARK_ROLES = {
+    "VTI": "FUNDED_EQUITY_BENCHMARK",
+    "SPY": "US_EQUITY_REFERENCE",
+    "BIL": "CASH_REFERENCE",
+}
+BENCHMARK_ID = "USD_V5_FUNDED_BENCHMARK_INPUT_V2"
 MINIMUM_SESSIONS = 140
 MINIMUM_WEEKS = 26
-RAW_CLOSE_RELATIVE_TOLERANCE = 1e-4
-DIVIDEND_RETURN_ABSOLUTE_TOLERANCE = 1e-4
+MAXIMUM_SESSIONS = 320
+RETURN_RECONCILIATION_TOLERANCE = 1e-4
 SOURCE_NAME = "Yahoo Finance Chart API"
-USER_AGENT = "usd-portfolio-market-data/1.0"
+USER_AGENT = "usd-portfolio-market-data/2.0"
 
-DISTRIBUTION_COLUMNS = (
-    ("security_id", "VARCHAR"),
-    ("ex_date", "DATE"),
-    ("record_date", "DATE"),
-    ("pay_date", "DATE"),
-    ("cash_amount", "DOUBLE"),
-    ("currency", "VARCHAR"),
-    ("distribution_type", "VARCHAR"),
-    ("distribution_id", "VARCHAR"),
-    ("known_at_utc", "TIMESTAMP"),
-    ("revision", "VARCHAR"),
-    ("source_locator", "VARCHAR"),
-    ("source_revision", "VARCHAR"),
-    ("source_publication_date", "DATE"),
-    ("source_retrieved_at_utc", "TIMESTAMP"),
-)
+RETURN_FILENAME = "benchmark-total-returns.parquet"
+DISTRIBUTION_FILENAME = "benchmark-distributions.parquet"
+CERTIFICATION_FILENAME = "benchmark-certification.json"
 
 RETURN_COLUMNS = (
     ("security_id", "VARCHAR"),
+    ("ticker", "VARCHAR"),
     ("benchmark_id", "VARCHAR"),
+    ("benchmark_role", "VARCHAR"),
     ("session_date", "DATE"),
+    ("raw_close", "DOUBLE"),
+    ("split_factor", "DOUBLE"),
+    ("cash_distribution", "DOUBLE"),
     ("price_return", "DOUBLE"),
     ("distribution_return", "DOUBLE"),
     ("total_return", "DOUBLE"),
     ("total_return_index", "DOUBLE"),
+    ("currency", "VARCHAR"),
     ("certification_status", "VARCHAR"),
     ("distribution_lineage_sha256", "VARCHAR"),
     ("corporate_action_lineage_sha256", "VARCHAR"),
-    ("known_at_utc", "TIMESTAMP"),
-    ("revision", "VARCHAR"),
     ("source_locator", "VARCHAR"),
     ("source_revision", "VARCHAR"),
     ("source_retrieved_at_utc", "TIMESTAMP"),
+    ("known_at_utc", "TIMESTAMP"),
+    ("certified_at_utc", "TIMESTAMP"),
+)
+
+DISTRIBUTION_COLUMNS = (
+    ("security_id", "VARCHAR"),
+    ("ticker", "VARCHAR"),
+    ("ex_date", "DATE"),
+    ("cash_amount", "DOUBLE"),
+    ("currency", "VARCHAR"),
+    ("distribution_type", "VARCHAR"),
+    ("distribution_id", "VARCHAR"),
+    ("source_locator", "VARCHAR"),
+    ("source_revision", "VARCHAR"),
+    ("source_retrieved_at_utc", "TIMESTAMP"),
+    ("known_at_utc", "TIMESTAMP"),
+    ("certified_at_utc", "TIMESTAMP"),
 )
 
 
 class BenchmarkBuildError(RuntimeError):
-    """Raised when the benchmark lane cannot be certified."""
+    """Raised when no canonical benchmark lane can be certified."""
 
 
 def canonical_json(value: object) -> bytes:
     return json.dumps(
-        value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
     ).encode("utf-8")
 
 
@@ -87,16 +104,23 @@ def sha256_file(path: Path) -> str:
 
 
 def format_utc(value: datetime) -> str:
-    normalized = value.astimezone(timezone.utc).replace(microsecond=0)
-    return normalized.isoformat().replace("+00:00", "Z")
+    return (
+        value.astimezone(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
 
 
 def parse_utc(value: str | None) -> datetime:
     if value is None:
         return datetime.now(timezone.utc)
-    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise BenchmarkBuildError("Timestamp is not RFC3339") from exc
     if parsed.tzinfo is None:
-        raise BenchmarkBuildError("--retrieved-at must include a timezone")
+        raise BenchmarkBuildError("Timestamp must include a timezone")
     return parsed.astimezone(timezone.utc)
 
 
@@ -112,9 +136,7 @@ def load_manifest(path: Path) -> dict[str, object]:
     return value
 
 
-def release_records(
-    manifest: Mapping[str, object],
-) -> dict[str, dict[str, object]]:
+def release_records(manifest: Mapping[str, object]) -> dict[str, dict[str, object]]:
     raw = manifest.get("release_files")
     if not isinstance(raw, list):
         raise BenchmarkBuildError("Release manifest lacks release_files")
@@ -124,32 +146,50 @@ def release_records(
             raise BenchmarkBuildError("release_files contains a non-object")
         filename = str(record.get("file") or "")
         if not filename or Path(filename).name != filename or filename in output:
-            raise BenchmarkBuildError(f"Unsafe or duplicate release file: {filename!r}")
+            raise BenchmarkBuildError(f"Unsafe release file identity: {filename!r}")
         output[filename] = dict(record)
     return output
 
 
-def benchmark_security_id(universe_path: Path, ticker: str) -> str:
-    matches: list[str] = []
+def benchmark_identities(
+    universe_path: Path, required: Sequence[str]
+) -> dict[str, dict[str, str]]:
+    required_set = {value.upper() for value in required}
+    matches: dict[str, list[dict[str, str]]] = {value: [] for value in required_set}
     with universe_path.open(newline="", encoding="utf-8-sig") as handle:
-        for row in csv.DictReader(handle):
-            if str(row.get("ticker") or "").upper() != ticker.upper():
+        reader = csv.DictReader(handle)
+        for row in reader:
+            ticker = str(row.get("ticker") or "").upper()
+            if ticker not in required_set:
                 continue
             if str(row.get("universe_admission_status") or "").upper() not in {
                 "ADMITTED",
                 "ADMITTED_ETF",
             }:
                 continue
-            matches.append(str(row.get("security_id") or ""))
-    if len(matches) != 1 or not matches[0]:
+            matches[ticker].append(
+                {
+                    "security_id": str(row.get("security_id") or ""),
+                    "ticker": ticker,
+                    "exchange_mic": str(row.get("exchange_mic") or ""),
+                    "security_type": str(row.get("security_type") or ""),
+                    "currency": str(row.get("currency") or "USD"),
+                }
+            )
+    invalid = {ticker: rows for ticker, rows in matches.items() if len(rows) != 1}
+    if invalid or any(not rows[0]["security_id"] for rows in matches.values()):
         raise BenchmarkBuildError(
-            f"Expected one admitted {ticker.upper()} identity, found {matches}"
+            "Benchmark identity subset is incomplete or ambiguous: "
+            + ", ".join(f"{ticker}={len(rows)}" for ticker, rows in sorted(invalid.items()))
         )
-    return matches[0]
+    output = {ticker: rows[0] for ticker, rows in matches.items()}
+    if any(record["currency"] not in {"", "USD"} for record in output.values()):
+        raise BenchmarkBuildError("Benchmark identity subset contains a non-USD security")
+    return output
 
 
 def yahoo_url(symbol: str, target_session: date) -> str:
-    period_start = target_session - timedelta(days=800)
+    period_start = target_session - timedelta(days=900)
     period_end = target_session + timedelta(days=1)
     period1 = int(datetime.combine(period_start, time.min, timezone.utc).timestamp())
     period2 = int(datetime.combine(period_end, time.min, timezone.utc).timestamp())
@@ -161,37 +201,65 @@ def yahoo_url(symbol: str, target_session: date) -> str:
     )
 
 
-def load_source_payload(source_json: Path | None, url: str) -> bytes:
-    if source_json is not None:
-        return source_json.read_bytes()
+def source_json_path(directory: Path | None, ticker: str) -> Path | None:
+    if directory is None:
+        return None
+    for name in (f"{ticker}.json", f"{ticker.lower()}.json"):
+        path = directory / name
+        if path.is_file():
+            return path
+    raise BenchmarkBuildError(f"Fixture source is missing for {ticker}")
+
+
+def load_source_payload(path: Path | None, url: str) -> tuple[bytes, list[dict[str, object]]]:
+    if path is not None:
+        return path.read_bytes(), [{"attempt": 1, "result": "FIXTURE"}]
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    failures: list[str] = []
-    for attempt in range(3):
+    attempts: list[dict[str, object]] = []
+    for attempt in range(1, 5):
+        started = datetime.now(timezone.utc)
         try:
-            with urllib.request.urlopen(request, timeout=15) as response:
-                return response.read()
+            with urllib.request.urlopen(request, timeout=20) as response:
+                payload = response.read()
+            attempts.append(
+                {
+                    "attempt": attempt,
+                    "result": "SUCCESS",
+                    "http_status": 200,
+                    "started_at_utc": format_utc(started),
+                    "completed_at_utc": format_utc(datetime.now(timezone.utc)),
+                }
+            )
+            return payload, attempts
         except OSError as exc:
-            failures.append(str(exc))
-            if attempt < 2:
-                time_module.sleep(2**attempt)
-    raise BenchmarkBuildError(
-        "Benchmark source request failed after three attempts: " + "; ".join(failures)
-    )
+            attempts.append(
+                {
+                    "attempt": attempt,
+                    "result": "ERROR",
+                    "error": str(exc),
+                    "started_at_utc": format_utc(started),
+                    "completed_at_utc": format_utc(datetime.now(timezone.utc)),
+                }
+            )
+            if attempt < 4:
+                time_module.sleep(2 ** (attempt - 1))
+    raise BenchmarkBuildError("Benchmark source failed after four targeted attempts")
 
 
-def source_result(payload: bytes) -> Mapping[str, object]:
+def source_result(payload: bytes, ticker: str) -> Mapping[str, object]:
     try:
         body = json.loads(payload)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise BenchmarkBuildError(f"Benchmark source is not valid JSON: {exc}") from exc
-    error = (body.get("chart") or {}).get("error") if isinstance(body, dict) else None
-    result = (
-        ((body.get("chart") or {}).get("result") or [None])[0]
-        if isinstance(body, dict)
-        else None
-    )
-    if error or not isinstance(result, dict):
-        raise BenchmarkBuildError(f"Benchmark source returned no result: {error}")
+        raise BenchmarkBuildError(f"{ticker} source is not valid JSON") from exc
+    chart = body.get("chart") if isinstance(body, dict) else None
+    result = ((chart or {}).get("result") or [None])[0] if isinstance(chart, dict) else None
+    if (chart or {}).get("error") or not isinstance(result, dict):
+        raise BenchmarkBuildError(f"{ticker} source returned no result")
+    meta = result.get("meta") or {}
+    if str(meta.get("symbol") or "").upper() != ticker:
+        raise BenchmarkBuildError(f"{ticker} source symbol mismatch")
+    if str(meta.get("currency") or "") != "USD":
+        raise BenchmarkBuildError(f"{ticker} source currency is not USD")
     return result
 
 
@@ -199,222 +267,234 @@ def event_date(event: Mapping[str, object]) -> date:
     try:
         return datetime.fromtimestamp(int(event["date"]), timezone.utc).date()
     except (KeyError, TypeError, ValueError, OSError) as exc:
-        raise BenchmarkBuildError("Benchmark event has an invalid date") from exc
+        raise BenchmarkBuildError("Corporate action has an invalid date") from exc
 
 
-def source_observations(
-    result: Mapping[str, object], target_session: date
-) -> list[tuple[date, float, float]]:
+def observations(result: Mapping[str, object], target: date) -> list[dict[str, object]]:
     timestamps = result.get("timestamp") or []
     indicators = result.get("indicators") or {}
-    quotes = indicators.get("quote") or []
-    adjusted = indicators.get("adjclose") or []
-    if not timestamps or not quotes or not adjusted:
-        raise BenchmarkBuildError("Benchmark source lacks close or adjusted-close data")
-    close_values = quotes[0].get("close") or []
-    adjusted_values = adjusted[0].get("adjclose") or []
-    if len(close_values) != len(timestamps) or len(adjusted_values) != len(timestamps):
-        raise BenchmarkBuildError("Benchmark source arrays have inconsistent lengths")
-    by_date: dict[date, tuple[float, float]] = {}
-    for timestamp, close, adjusted_close in zip(
-        timestamps, close_values, adjusted_values, strict=True
+    quote = ((indicators.get("quote") or [{}])[0])
+    adjusted = ((indicators.get("adjclose") or [{}])[0]).get("adjclose") or []
+    fields = {name: quote.get(name) or [] for name in ("open", "high", "low", "close", "volume")}
+    if not timestamps or len(adjusted) != len(timestamps) or any(
+        len(values) != len(timestamps) for values in fields.values()
     ):
-        if close is None or adjusted_close is None:
-            continue
+        raise BenchmarkBuildError("Benchmark source arrays are incomplete")
+    output: list[dict[str, object]] = []
+    seen: set[date] = set()
+    for index, timestamp in enumerate(timestamps):
         session = datetime.fromtimestamp(int(timestamp), timezone.utc).date()
-        if session > target_session:
+        if session > target:
             continue
-        values = (float(close), float(adjusted_close))
-        if not all(math.isfinite(value) and value > 0 for value in values):
-            raise BenchmarkBuildError(f"Invalid benchmark prices for {session}")
-        if session in by_date:
-            raise BenchmarkBuildError(f"Duplicate benchmark source session: {session}")
-        by_date[session] = values
-    return [(session, *by_date[session]) for session in sorted(by_date)]
+        values = {name: fields[name][index] for name in fields}
+        values["adjusted_close"] = adjusted[index]
+        if any(values[name] is None for name in ("open", "high", "low", "close", "volume", "adjusted_close")):
+            continue
+        numeric = {name: float(value) for name, value in values.items()}
+        if (
+            any(not math.isfinite(value) for value in numeric.values())
+            or min(numeric[name] for name in ("open", "high", "low", "close", "adjusted_close")) <= 0
+            or numeric["volume"] < 0
+            or numeric["high"] < max(numeric["open"], numeric["low"], numeric["close"])
+            or numeric["low"] > min(numeric["open"], numeric["high"], numeric["close"])
+            or session in seen
+        ):
+            raise BenchmarkBuildError(f"Invalid OHLCV observation for {session}")
+        seen.add(session)
+        output.append({"session_date": session, **numeric})
+    output.sort(key=lambda row: row["session_date"])
+    return output
 
 
-def source_dividends(
-    result: Mapping[str, object],
-    security_id: str,
-    first_session: date,
-    target_session: date,
-    currency: str,
-    retrieved_at: str,
-    source_locator: str,
-    source_revision: str,
-) -> list[tuple[object, ...]]:
-    events = (result.get("events") or {}).get("dividends") or {}
-    output: list[tuple[object, ...]] = []
-    seen: set[tuple[date, float]] = set()
-    for raw_event_id, raw in sorted(events.items()):
+def dividend_events(result: Mapping[str, object]) -> list[dict[str, object]]:
+    raw_events = ((result.get("events") or {}).get("dividends") or {})
+    output: list[dict[str, object]] = []
+    for event_id, raw in sorted(raw_events.items()):
         if not isinstance(raw, dict):
-            raise BenchmarkBuildError("Benchmark dividend event is not an object")
-        ex_date = event_date(raw)
-        if not first_session <= ex_date <= target_session:
-            continue
-        try:
-            amount = float(raw["amount"])
-        except (KeyError, TypeError, ValueError) as exc:
-            raise BenchmarkBuildError("Benchmark dividend lacks a cash amount") from exc
+            raise BenchmarkBuildError("Dividend event is not an object")
+        amount = float(raw.get("amount") or 0)
         if not math.isfinite(amount) or amount <= 0:
-            raise BenchmarkBuildError(f"Invalid benchmark dividend for {ex_date}")
-        key = (ex_date, amount)
-        if key in seen:
-            continue
-        seen.add(key)
-        identity = hashlib.sha256(
-            canonical_json(
-                {
-                    "security_id": security_id,
-                    "ex_date": ex_date,
-                    "cash_amount": amount,
-                    "source_event_id": str(raw_event_id),
-                }
-            )
-        ).hexdigest()
+            raise BenchmarkBuildError("Dividend event has an invalid cash amount")
         output.append(
-            (
-                security_id,
-                ex_date,
-                None,
-                None,
-                amount,
-                currency,
-                "CASH_DIVIDEND",
-                f"yahoo:{identity}",
-                retrieved_at,
-                source_revision,
-                source_locator,
-                source_revision,
-                None,
-                retrieved_at,
-            )
+            {"event_id": str(event_id), "event_date": event_date(raw), "cash_amount": amount}
         )
     return output
 
 
-def canonical_market(
-    release_dir: Path, security_id: str
-) -> tuple[list[tuple[date, float]], list[dict[str, object]]]:
-    connection = duckdb.connect()
-    try:
-        prices = [
-            (row[0], float(row[1]))
-            for row in connection.execute(
-                "SELECT session_date, close FROM read_parquet(?) "
-                "WHERE security_id = ? ORDER BY session_date",
-                [str(release_dir / "yahoo-ohlcv-320.parquet"), security_id],
-            ).fetchall()
-        ]
-        splits = [
-            {"event_date": row[0], "split_factor": str(row[1])}
-            for row in connection.execute(
-                "SELECT event_date, split_factor FROM read_parquet(?) "
-                "WHERE security_id = ? ORDER BY event_date, split_factor",
-                [str(release_dir / "yahoo-splits.parquet"), security_id],
-            ).fetchall()
-        ]
-    finally:
-        connection.close()
-    if len(prices) < MINIMUM_SESSIONS:
-        raise BenchmarkBuildError(
-            f"Canonical benchmark has {len(prices)} sessions; requires {MINIMUM_SESSIONS}"
+def split_events(result: Mapping[str, object]) -> list[dict[str, object]]:
+    raw_events = ((result.get("events") or {}).get("splits") or {})
+    output: list[dict[str, object]] = []
+    for event_id, raw in sorted(raw_events.items()):
+        if not isinstance(raw, dict):
+            raise BenchmarkBuildError("Split event is not an object")
+        numerator = float(raw.get("numerator") or 0)
+        denominator = float(raw.get("denominator") or 0)
+        factor = numerator / denominator if denominator else 0
+        if not math.isfinite(factor) or factor <= 0:
+            raise BenchmarkBuildError("Split event has an invalid factor")
+        output.append(
+            {"event_id": str(event_id), "event_date": event_date(raw), "split_factor": factor}
         )
-    return prices, splits
+    return output
 
 
-def lineage_sha256(events: Sequence[Mapping[str, object]], session: date) -> str:
+def lineage(events: Sequence[Mapping[str, object]], session: date) -> str:
     eligible = [event for event in events if event["event_date"] <= session]
     return hashlib.sha256(canonical_json(eligible)).hexdigest()
 
 
-def build_return_rows(
-    observations: Sequence[tuple[date, float, float]],
-    canonical: Sequence[tuple[date, float]],
-    dividends: Sequence[tuple[object, ...]],
-    splits: Sequence[dict[str, object]],
-    security_id: str,
-    retrieved_at: str,
+def build_security_rows(
+    *,
+    ticker: str,
+    identity: Mapping[str, str],
+    result: Mapping[str, object],
+    target_session: date,
     source_locator: str,
     source_revision: str,
-) -> tuple[list[tuple[object, ...]], float, float]:
-    source_by_date = {
-        session: (close, adjusted) for session, close, adjusted in observations
-    }
-    canonical_by_date = dict(canonical)
-    missing = sorted(set(canonical_by_date) - set(source_by_date))
-    if missing:
+    retrieved_at: str,
+    certified_at: str,
+) -> tuple[list[tuple[object, ...]], list[tuple[object, ...]], dict[str, object]]:
+    all_observations = observations(result, target_session)
+    if not all_observations or all_observations[-1]["session_date"] != target_session:
+        observed = all_observations[-1]["session_date"] if all_observations else None
         raise BenchmarkBuildError(
-            f"Benchmark source misses {len(missing)} canonical sessions; first={missing[0]}"
+            f"{ticker} current-session coverage failed: observed={observed}, expected={target_session}"
         )
-    maximum_close_error = max(
-        abs(source_by_date[session][0] - close) / close for session, close in canonical
-    )
-    if maximum_close_error > RAW_CLOSE_RELATIVE_TOLERANCE:
+    selected = all_observations[-MAXIMUM_SESSIONS:]
+    if selected and all_observations.index(selected[0]) == 0:
+        selected = selected[1:]
+    if len(selected) < MINIMUM_SESSIONS:
         raise BenchmarkBuildError(
-            "Benchmark source does not reconcile to canonical closes: "
-            f"maximum relative error={maximum_close_error:.8f}"
+            f"{ticker} has {len(selected)} sessions; requires {MINIMUM_SESSIONS}"
+        )
+    first_position = all_observations.index(selected[0])
+    if first_position == 0:
+        raise BenchmarkBuildError(f"{ticker} lacks a prior session for returns")
+    dividends = dividend_events(result)
+    splits = split_events(result)
+    selected_start = selected[0]["session_date"]
+    cash_events = [
+        event for event in dividends if selected_start <= event["event_date"] <= target_session
+    ]
+    split_window = [
+        event for event in splits if selected_start <= event["event_date"] <= target_session
+    ]
+    selected_sessions = {row["session_date"] for row in selected}
+    orphan_actions = [
+        event
+        for event in (*cash_events, *split_window)
+        if event["event_date"] not in selected_sessions
+    ]
+    if orphan_actions:
+        raise BenchmarkBuildError(
+            f"{ticker} corporate action does not map to a completed XNYS session"
+        )
+    cash_by_date: dict[date, float] = {}
+    for event in cash_events:
+        event_session = event["event_date"]
+        cash_by_date[event_session] = cash_by_date.get(event_session, 0.0) + float(
+            event["cash_amount"]
+        )
+    split_by_date: dict[date, float] = {}
+    for event in split_window:
+        split_by_date[event["event_date"]] = float(event["split_factor"])
+
+    distribution_rows: list[tuple[object, ...]] = []
+    for event in cash_events:
+        distribution_id = hashlib.sha256(
+            canonical_json(
+                {
+                    "security_id": identity["security_id"],
+                    "event_date": event["event_date"],
+                    "cash_amount": event["cash_amount"],
+                    "source_event_id": event["event_id"],
+                }
+            )
+        ).hexdigest()
+        distribution_rows.append(
+            (
+                identity["security_id"],
+                ticker,
+                event["event_date"],
+                event["cash_amount"],
+                "USD",
+                "CASH_DISTRIBUTION",
+                f"yahoo:{distribution_id}",
+                source_locator,
+                source_revision,
+                retrieved_at,
+                retrieved_at,
+                certified_at,
+            )
         )
 
-    dividend_events = [
-        {
-            "event_date": row[1],
-            "distribution_id": row[7],
-            "cash_amount": row[4],
-        }
-        for row in dividends
-    ]
-    dividend_amounts: dict[date, float] = {}
-    for row in dividends:
-        dividend_amounts[row[1]] = dividend_amounts.get(row[1], 0.0) + float(row[4])
-    ordered_source_dates = [row[0] for row in observations]
-    source_position = {
-        session: index for index, session in enumerate(ordered_source_dates)
-    }
-    rows: list[tuple[object, ...]] = []
+    return_rows: list[tuple[object, ...]] = []
     total_return_index = 100.0
-    maximum_dividend_error = 0.0
-    for session, _canonical_close in canonical:
-        index = source_position[session]
-        if index == 0:
+    maximum_error = 0.0
+    for row in selected:
+        position = all_observations.index(row)
+        previous = all_observations[position - 1]
+        session = row["session_date"]
+        split_factor = split_by_date.get(session, 1.0)
+        price_return = float(row["close"]) * split_factor / float(previous["close"]) - 1.0
+        distribution_return = cash_by_date.get(session, 0.0) / float(previous["close"])
+        total_return = float(row["adjusted_close"]) / float(previous["adjusted_close"]) - 1.0
+        error = abs(total_return - price_return - distribution_return)
+        maximum_error = max(maximum_error, error)
+        if error > RETURN_RECONCILIATION_TOLERANCE:
             raise BenchmarkBuildError(
-                "Benchmark source lacks the prior session needed for return calculation"
+                f"{ticker} distribution/action reconciliation failed for {session}: {error:.8f}"
             )
-        _previous_date, previous_close, previous_adjusted = observations[index - 1]
-        _date, close, adjusted = observations[index]
-        price_return = close / previous_close - 1.0
-        total_return = adjusted / previous_adjusted - 1.0
         if price_return <= -1 or total_return <= -1:
-            raise BenchmarkBuildError(f"Invalid benchmark return for {session}")
-        distribution_return = dividend_amounts.get(session, 0.0) / previous_close
-        error = abs(total_return - (price_return + distribution_return))
-        maximum_dividend_error = max(maximum_dividend_error, error)
-        if error > DIVIDEND_RETURN_ABSOLUTE_TOLERANCE:
-            raise BenchmarkBuildError(
-                f"Dividend-adjustment reconciliation failed for {session}: "
-                f"absolute error={error:.8f}"
-            )
+            raise BenchmarkBuildError(f"{ticker} contains an invalid return for {session}")
         total_return_index *= 1.0 + total_return
-        rows.append(
+        return_rows.append(
             (
-                security_id,
+                identity["security_id"],
+                ticker,
                 BENCHMARK_ID,
+                BENCHMARK_ROLES[ticker],
                 session,
+                row["close"],
+                split_factor,
+                cash_by_date.get(session, 0.0),
                 price_return,
                 distribution_return,
                 total_return,
                 total_return_index,
+                "USD",
                 "CERTIFIED",
-                lineage_sha256(dividend_events, session),
-                lineage_sha256(splits, session),
-                retrieved_at,
-                source_revision,
+                lineage(cash_events, session),
+                lineage(split_window, session),
                 source_locator,
                 source_revision,
                 retrieved_at,
+                retrieved_at,
+                certified_at,
             )
         )
-    return rows, maximum_close_error, maximum_dividend_error
+    weekly = len({row["session_date"].isocalendar()[:2] for row in selected})
+    if weekly < MINIMUM_WEEKS:
+        raise BenchmarkBuildError(
+            f"{ticker} has {weekly} weekly observations; requires {MINIMUM_WEEKS}"
+        )
+    summary = {
+        "security_id": identity["security_id"],
+        "ticker": ticker,
+        "benchmark_role": BENCHMARK_ROLES[ticker],
+        "currency": "USD",
+        "minimum_session": selected[0]["session_date"].isoformat(),
+        "maximum_session": selected[-1]["session_date"].isoformat(),
+        "sessions": len(selected),
+        "weekly_observations": weekly,
+        "cash_distributions": len(cash_events),
+        "splits": len(split_window),
+        "maximum_return_reconciliation_error": maximum_error,
+        "source_locator": source_locator,
+        "source_revision": source_revision,
+        "source_retrieved_at_utc": retrieved_at,
+    }
+    return return_rows, distribution_rows, summary
 
 
 def write_parquet(
@@ -439,21 +519,19 @@ def write_parquet(
         connection.close()
 
 
-def file_record(
-    path: Path, rows: int, columns: Sequence[tuple[str, str]]
-) -> dict[str, object]:
-    return {
+def file_record(path: Path, rows: int, schema: Sequence[tuple[str, str]] | None = None) -> dict[str, object]:
+    record: dict[str, object] = {
         "file": path.name,
         "sha256": sha256_file(path),
         "bytes": path.stat().st_size,
         "rows": rows,
-        "schema": [name for name, _ in columns],
     }
+    if schema is not None:
+        record["schema"] = [name for name, _ in schema]
+    return record
 
 
-def prior_group_overrides(
-    manifest: Mapping[str, object],
-) -> dict[str, dict[str, object]]:
+def group_overrides(manifest: Mapping[str, object]) -> dict[str, dict[str, object]]:
     ignored = {
         "group_id",
         "group_contract_version",
@@ -464,13 +542,10 @@ def prior_group_overrides(
     }
     output: dict[str, dict[str, object]] = {}
     for raw in manifest.get("dataset_groups", []):
-        if not isinstance(raw, dict) or not raw.get("group_id"):
-            continue
-        output[str(raw["group_id"])] = {
-            key: copy.deepcopy(value)
-            for key, value in raw.items()
-            if key not in ignored
-        }
+        if isinstance(raw, dict) and raw.get("group_id"):
+            output[str(raw["group_id"])] = {
+                key: value for key, value in raw.items() if key not in ignored
+            }
     return output
 
 
@@ -479,190 +554,180 @@ def attach(args: argparse.Namespace) -> dict[str, object]:
     manifest_path = release_dir / "manifest.json"
     manifest = load_manifest(manifest_path)
     records = release_records(manifest)
-    for required in (
-        "security-universe.csv",
-        "yahoo-ohlcv-320.parquet",
-        "yahoo-splits.parquet",
-    ):
-        path = release_dir / required
-        record = records.get(required)
-        if (
-            record is None
-            or not path.is_file()
-            or sha256_file(path) != record.get("sha256")
-        ):
-            raise BenchmarkBuildError(f"Release asset identity mismatch: {required}")
-
+    expected_text = str(
+        args.expected_session
+        or (manifest.get("validation") or {}).get("expected_latest_xnys_session")
+        or ""
+    )
     try:
-        target_session = date.fromisoformat(
-            str((manifest.get("aggregate") or {})["max_date"])
-        )
-        expected_session = date.fromisoformat(
-            str((manifest.get("validation") or {})["expected_latest_xnys_session"])
-        )
-    except (KeyError, TypeError, ValueError) as exc:
-        raise BenchmarkBuildError(
-            "Release lacks valid market session watermarks"
-        ) from exc
-    if target_session != expected_session:
-        raise BenchmarkBuildError(
-            f"Market release is not current: observed={target_session}, expected={expected_session}"
-        )
-
-    security_id = benchmark_security_id(
-        release_dir / "security-universe.csv", args.benchmark_ticker
+        expected_session = date.fromisoformat(expected_text)
+    except ValueError as exc:
+        raise BenchmarkBuildError("Expected completed XNYS session is invalid") from exc
+    required = tuple(
+        value.strip().upper()
+        for value in str(args.benchmark_tickers).split(",")
+        if value.strip()
     )
-    canonical, splits = canonical_market(release_dir, security_id)
-    url = yahoo_url(args.benchmark_ticker.upper(), target_session)
-    source_locator = args.source_locator or url
-    if not source_locator.startswith("https://"):
-        raise BenchmarkBuildError("Benchmark source locator must be HTTPS")
-    payload = load_source_payload(
-        Path(args.source_json).resolve() if args.source_json else None, url
-    )
-    revision = hashlib.sha256(payload).hexdigest()
-    result = source_result(payload)
-    meta = result.get("meta") or {}
-    if str(meta.get("symbol") or "").upper() != args.benchmark_ticker.upper():
-        raise BenchmarkBuildError("Benchmark source symbol does not match the request")
-    currency = str(meta.get("currency") or "")
-    if currency != "USD":
-        raise BenchmarkBuildError(f"Benchmark source currency is {currency!r}, not USD")
-    observations = source_observations(result, target_session)
-    if not observations or observations[-1][0] != target_session:
-        observed = observations[-1][0] if observations else None
+    if required != REQUIRED_BENCHMARKS:
         raise BenchmarkBuildError(
-            f"Benchmark source is stale: observed={observed}, expected={target_session}"
+            f"Required benchmark set must be {','.join(REQUIRED_BENCHMARKS)}"
         )
+    identity_path = Path(args.identity_universe).resolve() if args.identity_universe else release_dir / "security-universe.csv"
+    if not identity_path.is_file():
+        raise BenchmarkBuildError("Current benchmark identity universe is missing")
+    identities = benchmark_identities(identity_path, required)
+    identity_observed_at = format_utc(parse_utc(args.identity_observed_at))
     retrieved_at = format_utc(parse_utc(args.retrieved_at))
-    dividends = source_dividends(
-        result,
-        security_id,
-        canonical[0][0],
-        target_session,
-        currency,
-        retrieved_at,
-        source_locator,
-        revision,
-    )
-    if not dividends:
-        raise BenchmarkBuildError(
-            "Benchmark source has no cash distributions in the certification window"
-        )
-    returns, close_error, dividend_error = build_return_rows(
-        observations,
-        canonical,
-        dividends,
-        splits,
-        security_id,
-        retrieved_at,
-        source_locator,
-        revision,
-    )
-    weeks = len({session.isocalendar()[:2] for _, _, session, *_ in returns})
-    if len(returns) < MINIMUM_SESSIONS or weeks < MINIMUM_WEEKS:
-        raise BenchmarkBuildError(
-            f"Benchmark history is insufficient: sessions={len(returns)}, weeks={weeks}"
-        )
+    certified_at = format_utc(parse_utc(args.certified_at or args.retrieved_at))
+    fixture_directory = Path(args.source_json_dir).resolve() if args.source_json_dir else None
 
-    with tempfile.TemporaryDirectory(dir=release_dir, prefix="benchmark-") as raw_temp:
-        temporary = Path(raw_temp)
-        distributions_path = temporary / "distributions.parquet"
-        returns_path = temporary / "benchmark-total-returns.parquet"
-        write_parquet(
-            distributions_path,
-            DISTRIBUTION_COLUMNS,
-            dividends,
-            "security_id, ex_date, distribution_id",
+    all_returns: list[tuple[object, ...]] = []
+    all_distributions: list[tuple[object, ...]] = []
+    summaries: list[dict[str, object]] = []
+    provider_results: dict[str, object] = {}
+    for ticker in required:
+        url = yahoo_url(ticker, expected_session)
+        payload, attempts = load_source_payload(
+            source_json_path(fixture_directory, ticker), url
         )
+        revision = hashlib.sha256(payload).hexdigest()
+        result = source_result(payload, ticker)
+        returns, distributions, summary = build_security_rows(
+            ticker=ticker,
+            identity=identities[ticker],
+            result=result,
+            target_session=expected_session,
+            source_locator=url,
+            source_revision=revision,
+            retrieved_at=retrieved_at,
+            certified_at=certified_at,
+        )
+        all_returns.extend(returns)
+        all_distributions.extend(distributions)
+        summaries.append(summary)
+        provider_results[ticker] = {"attempts": attempts, "source_revision": revision}
+
+    if {row["ticker"] for row in summaries} != set(REQUIRED_BENCHMARKS):
+        raise BenchmarkBuildError("Benchmark security coverage is not 100%")
+    identity_subset = [identities[ticker] for ticker in REQUIRED_BENCHMARKS]
+    identity_subset_sha = hashlib.sha256(canonical_json(identity_subset)).hexdigest()
+    certification: dict[str, object] = {
+        "schema_version": "1.0.0",
+        "contract_version": "2.0.0",
+        "status": "CERTIFIED",
+        "benchmark_id": BENCHMARK_ID,
+        "required_tickers": list(REQUIRED_BENCHMARKS),
+        "coverage": {"required": len(REQUIRED_BENCHMARKS), "valid": len(summaries), "ratio": 1.0},
+        "expected_latest_xnys_session": expected_session.isoformat(),
+        "observed_latest_xnys_session": expected_session.isoformat(),
+        "identity_subset": identity_subset,
+        "identity_subset_sha256": identity_subset_sha,
+        "identity_universe_sha256": sha256_file(identity_path),
+        "identity_observed_at_utc": identity_observed_at,
+        "source_retrieved_at_utc": retrieved_at,
+        "known_at_utc": retrieved_at,
+        "certified_at_utc": certified_at,
+        "securities": summaries,
+        "provider_results": provider_results,
+        "validation": {
+            "minimum_sessions": MINIMUM_SESSIONS,
+            "minimum_weekly_observations": MINIMUM_WEEKS,
+            "required_current_session_coverage": 1.0,
+            "maximum_return_reconciliation_error": RETURN_RECONCILIATION_TOLERANCE,
+            "distribution_reconciliation": "PASS",
+            "corporate_action_reconciliation": "PASS",
+        },
+        "idempotency_key": str(args.idempotency_key or ""),
+    }
+
+    with tempfile.TemporaryDirectory(dir=release_dir, prefix="benchmark-v2-") as raw_temp:
+        temporary = Path(raw_temp)
+        returns_path = temporary / RETURN_FILENAME
+        distributions_path = temporary / DISTRIBUTION_FILENAME
+        certification_path = temporary / CERTIFICATION_FILENAME
         write_parquet(
             returns_path,
             RETURN_COLUMNS,
-            returns,
+            all_returns,
             "security_id, session_date",
         )
-        final_distributions = release_dir / distributions_path.name
-        final_returns = release_dir / returns_path.name
-        os.replace(distributions_path, final_distributions)
-        os.replace(returns_path, final_returns)
+        write_parquet(
+            distributions_path,
+            DISTRIBUTION_COLUMNS,
+            all_distributions,
+            "security_id, ex_date, distribution_id",
+        )
+        certification_path.write_bytes(canonical_json(certification))
+        final_paths = {
+            RETURN_FILENAME: release_dir / RETURN_FILENAME,
+            DISTRIBUTION_FILENAME: release_dir / DISTRIBUTION_FILENAME,
+            CERTIFICATION_FILENAME: release_dir / CERTIFICATION_FILENAME,
+        }
+        for filename, target in final_paths.items():
+            os.replace(temporary / filename, target)
 
-    records[final_distributions.name] = file_record(
-        final_distributions, len(dividends), DISTRIBUTION_COLUMNS
+    records[RETURN_FILENAME] = file_record(
+        release_dir / RETURN_FILENAME, len(all_returns), RETURN_COLUMNS
     )
-    records[final_returns.name] = file_record(
-        final_returns, len(returns), RETURN_COLUMNS
+    records[DISTRIBUTION_FILENAME] = file_record(
+        release_dir / DISTRIBUTION_FILENAME,
+        len(all_distributions),
+        DISTRIBUTION_COLUMNS,
+    )
+    records[CERTIFICATION_FILENAME] = file_record(
+        release_dir / CERTIFICATION_FILENAME, 1
     )
     manifest["release_files"] = [records[name] for name in sorted(records)]
-    datasets = manifest.get("datasets")
-    if not isinstance(datasets, list):
-        datasets = []
+
     datasets = [
         record
-        for record in datasets
+        for record in manifest.get("datasets", [])
         if isinstance(record, dict)
-        and record.get("path") not in {final_distributions.name, final_returns.name}
+        and record.get("path")
+        not in {RETURN_FILENAME, DISTRIBUTION_FILENAME, CERTIFICATION_FILENAME}
     ]
+    combined_revision = hashlib.sha256(
+        canonical_json(
+            {summary["ticker"]: summary["source_revision"] for summary in summaries}
+        )
+    ).hexdigest()
     for path, minimum, maximum in (
         (
-            final_distributions,
-            min(row[1] for row in dividends),
-            max(row[1] for row in dividends),
+            release_dir / RETURN_FILENAME,
+            min(str(summary["minimum_session"]) for summary in summaries),
+            expected_session.isoformat(),
         ),
-        (final_returns, canonical[0][0], target_session),
+        (
+            release_dir / DISTRIBUTION_FILENAME,
+            min(row[2] for row in all_distributions).isoformat(),
+            max(row[2] for row in all_distributions).isoformat(),
+        ),
+        (release_dir / CERTIFICATION_FILENAME, expected_session.isoformat(), expected_session.isoformat()),
     ):
         datasets.append(
             {
                 "path": path.name,
                 "source": SOURCE_NAME,
                 "source_name": SOURCE_NAME,
-                "source_revision": revision,
-                "immutable_source_revision": revision,
+                "source_revision": combined_revision,
+                "immutable_source_revision": combined_revision,
                 "source_retrieved_at_utc": retrieved_at,
                 "source_retrieval_time": retrieved_at,
-                "minimum_event_date": minimum.isoformat(),
-                "maximum_event_date": maximum.isoformat(),
+                "minimum_event_date": minimum,
+                "maximum_event_date": maximum,
                 "point_in_time_safe": True,
             }
         )
     manifest["datasets"] = datasets
-    manifest["benchmark_total_returns"] = {
-        "status": "CERTIFIED",
-        "certification_method": (
-            "YAHOO_ADJUSTED_CLOSE_RECONCILED_TO_CANONICAL_RAW_CLOSE_AND_CASH_EVENTS"
-        ),
-        "benchmark_id": BENCHMARK_ID,
-        "security_id": security_id,
-        "ticker": args.benchmark_ticker.upper(),
-        "currency": currency,
-        "minimum_session": canonical[0][0].isoformat(),
-        "maximum_session": target_session.isoformat(),
-        "expected_latest_xnys_session": expected_session.isoformat(),
-        "sessions": len(returns),
-        "weekly_observations": weeks,
-        "distributions": len(dividends),
-        "source_name": SOURCE_NAME,
-        "source_locator": source_locator,
-        "source_revision": revision,
-        "source_retrieved_at_utc": retrieved_at,
-        "maximum_raw_close_relative_error": close_error,
-        "maximum_total_return_reconciliation_error": dividend_error,
-        "thresholds": {
-            "minimum_sessions": MINIMUM_SESSIONS,
-            "minimum_weekly_observations": MINIMUM_WEEKS,
-            "maximum_raw_close_relative_error": RAW_CLOSE_RELATIVE_TOLERANCE,
-            "maximum_total_return_reconciliation_error": (
-                DIVIDEND_RETURN_ABSOLUTE_TOLERANCE
-            ),
-        },
-    }
-    overrides = prior_group_overrides(manifest)
+    manifest["benchmark_certification"] = certification
+    overrides = group_overrides(manifest)
     overrides["total_returns"] = {
         "state": "READY_NEW",
-        "mode": "FRESH_CERTIFIED_CANDIDATE",
+        "mode": "FRESH_CERTIFIED_BENCHMARK_V2",
         "freshness": {
             "clock": "XNYS_ELIGIBLE_SESSIONS",
             "expected": expected_session.isoformat(),
-            "observed": target_session.isoformat(),
+            "observed": expected_session.isoformat(),
             "lag_eligible_sessions": 0,
             "source_retrieved_at_utc": retrieved_at,
             "state": "READY",
@@ -684,31 +749,109 @@ def attach(args: argparse.Namespace) -> dict[str, object]:
         encoding="utf-8",
     )
     os.replace(temporary_manifest, manifest_path)
-    return manifest["benchmark_total_returns"]
+    return certification
+
+
+def write_quarantine(path: Path, args: argparse.Namespace, error: Exception) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema_version": "1.0.0",
+        "state": "QUARANTINED",
+        "attempted_at_utc": format_utc(datetime.now(timezone.utc)),
+        "expected_session": args.expected_session,
+        "required_tickers": list(REQUIRED_BENCHMARKS),
+        "idempotency_key": str(args.idempotency_key or ""),
+        "diagnostics": [str(error)],
+    }
+    path.write_bytes(canonical_json(payload))
+
+
+def remove_uncertified_lane(release_dir: Path, error: Exception) -> None:
+    """Ensure a failed attempt cannot carry an older certified lane forward."""
+    manifest_path = release_dir / "manifest.json"
+    if not manifest_path.is_file():
+        return
+    manifest = load_manifest(manifest_path)
+    if not any(
+        (release_dir / filename).exists()
+        for filename in (RETURN_FILENAME, DISTRIBUTION_FILENAME, CERTIFICATION_FILENAME)
+    ) and "benchmark_certification" not in manifest:
+        return
+    for filename in (RETURN_FILENAME, DISTRIBUTION_FILENAME, CERTIFICATION_FILENAME):
+        path = release_dir / filename
+        if path.exists():
+            path.unlink()
+    manifest["release_files"] = [
+        record
+        for record in manifest.get("release_files", [])
+        if isinstance(record, dict)
+        and record.get("file")
+        not in {RETURN_FILENAME, DISTRIBUTION_FILENAME, CERTIFICATION_FILENAME}
+    ]
+    manifest["datasets"] = [
+        record
+        for record in manifest.get("datasets", [])
+        if isinstance(record, dict)
+        and record.get("path")
+        not in {RETURN_FILENAME, DISTRIBUTION_FILENAME, CERTIFICATION_FILENAME}
+    ]
+    manifest.pop("benchmark_certification", None)
+    failures = [
+        dict(value)
+        for value in manifest.get("candidate_attempt_failures", [])
+        if isinstance(value, dict) and value.get("group_id") != "total_returns"
+    ]
+    failures.append(
+        {
+            "group_id": "total_returns",
+            "attempt_state": "QUARANTINED",
+            "diagnostics": [str(error)],
+            "released_state": "NOT_CONFIGURED",
+            "attempted_at_utc": format_utc(datetime.now(timezone.utc)),
+        }
+    )
+    apply_dataset_groups(
+        manifest,
+        release_dir,
+        group_overrides=group_overrides(manifest),
+        candidate_group_failures=manifest.get("candidate_group_failures", []),
+        candidate_attempt_failures=failures,
+    )
+    temporary = manifest_path.with_suffix(".json.benchmark-failed.tmp")
+    temporary.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True, default=str) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary, manifest_path)
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--release-dir", required=True)
-    parser.add_argument("--benchmark-ticker", default="VTI")
-    parser.add_argument("--source-json")
-    parser.add_argument("--source-locator")
+    parser.add_argument("--identity-universe")
+    parser.add_argument("--identity-observed-at")
+    parser.add_argument("--expected-session")
+    parser.add_argument("--benchmark-tickers", default=",".join(REQUIRED_BENCHMARKS))
+    parser.add_argument("--source-json-dir")
     parser.add_argument("--retrieved-at")
+    parser.add_argument("--certified-at")
+    parser.add_argument("--idempotency-key")
+    parser.add_argument("--quarantine-out")
     args = parser.parse_args(argv)
-    optional_paths = tuple(
-        Path(args.release_dir).resolve() / filename
-        for filename in (
-            "distributions.parquet",
-            "benchmark-total-returns.parquet",
-        )
-    )
-    existed_before = {path: path.exists() for path in optional_paths}
+    if args.identity_observed_at is None:
+        args.identity_observed_at = args.retrieved_at
     try:
         result = attach(args)
     except (BenchmarkBuildError, OSError, ValueError, duckdb.Error) as exc:
-        for path in optional_paths:
-            if not existed_before[path] and path.exists():
-                path.unlink()
+        try:
+            remove_uncertified_lane(Path(args.release_dir).resolve(), exc)
+        except (BenchmarkBuildError, OSError, ValueError, duckdb.Error) as cleanup_error:
+            print(
+                f"warning: could not remove uncertified benchmark lane: {cleanup_error}",
+                file=sys.stderr,
+            )
+        if args.quarantine_out:
+            write_quarantine(Path(args.quarantine_out).resolve(), args, exc)
         print(f"error: {exc}", file=sys.stderr)
         return 2
     print(json.dumps(result, sort_keys=True))

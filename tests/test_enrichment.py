@@ -463,7 +463,9 @@ def test_official_archive_registry_and_workflow_headers() -> None:
     assert "--compressed" in workflow
     assert "refresh_enrichment" in workflow
     assert 'cron: "15 7 * * 1-5"' in workflow
-    assert 'cron: "16 16 * * 1-5"' in workflow
+    assert 'cron: "45 16 * * 1-5"' in workflow
+    assert 'cron: "15 17 * * 1-5"' in workflow
+    assert 'cron: "0 18 * * 1-5"' in workflow
     assert 'cron: "0 2 * * 6"' in workflow
     assert 'EVENT_SCHEDULE: ${{ github.event.schedule }}' in workflow
     assert 'if [[ "$EVENT_SCHEDULE" == "0 2 * * 6" ]]' in workflow
@@ -479,6 +481,9 @@ def test_official_archive_registry_and_workflow_headers() -> None:
     assert "--yahoo-chart-workers 8" in workflow
     assert "--yahoo-chart-lookback-days 14" in workflow
     assert "python build-benchmark-total-returns.py" in workflow
+    assert "producer_phase_deadline" in workflow
+    assert "build-market-coverage-diagnostic.py" in workflow
+    assert "--benchmark-tickers" not in workflow
     assert "continue-on-error: ${{ steps.inputs.outputs.mode == 'full' }}" in workflow
     assert 'candidate="$RUNNER_TEMP/candidate-release"' in workflow
     assert "python compose-release.py" in workflow

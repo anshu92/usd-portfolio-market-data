@@ -678,6 +678,7 @@ def supplement_missing_yahoo_chart_history(
     workers: int,
     lookback_days: int,
     refresh_all: bool = False,
+    required_session: date | None = None,
 ) -> dict[str, object]:
     """Fill source-symbol gaps from Yahoo's chart endpoint with row provenance.
 
@@ -685,7 +686,19 @@ def supplement_missing_yahoo_chart_history(
     supplement requests only aliases absent from the immutable snapshot; refresh-all
     requests every admitted security's aliases for a current-session delta.
     """
-    selection = "" if refresh_all else """
+    if required_session is not None:
+        selection = f"""
+            WHERE NOT EXISTS (
+              SELECT 1 FROM price_source current
+              JOIN aliases current_alias
+                ON current.source_symbol = current_alias.source_symbol
+              WHERE current_alias.security_id = a.security_id
+                AND current.session_date = DATE '{required_session.isoformat()}'
+                AND NOT ({PRICE_INVALID_SQL})
+            )
+        """
+    else:
+        selection = "" if refresh_all else """
             WHERE NOT EXISTS (
                     SELECT 1 FROM price_source p
                     WHERE p.source_symbol = a.source_symbol
@@ -708,6 +721,7 @@ def supplement_missing_yahoo_chart_history(
 
     def fetch(security_id: str, aliases: list[str]):
         errors: list[str] = []
+        attempt_count = 0
         for symbol in aliases:
             url = (
                 "https://query2.finance.yahoo.com/v8/finance/chart/"
@@ -718,6 +732,7 @@ def supplement_missing_yahoo_chart_history(
             )
             request = urllib.request.Request(url, headers={"User-Agent": "usd-portfolio-market-data/1.0"})
             for attempt in range(5):
+                attempt_count += 1
                 try:
                     with urllib.request.urlopen(request, timeout=30) as response:
                         payload = response.read()
@@ -725,19 +740,28 @@ def supplement_missing_yahoo_chart_history(
                     result = (body.get("chart", {}).get("result") or [None])[0]
                     if not result or not result.get("timestamp"):
                         raise AggregateError("no daily history")
-                    return security_id, symbol, payload, result, None
+                    if required_session is not None and required_session not in {
+                        datetime.fromtimestamp(int(value), timezone.utc).date()
+                        for value in result.get("timestamp") or []
+                    }:
+                        raise AggregateError(
+                            f"required session {required_session} is absent"
+                        )
+                    return security_id, symbol, payload, result, None, attempt_count, errors
                 except (OSError, ValueError, AggregateError) as exc:
                     errors.append(f"{symbol}:{exc}")
                     # Yahoo rate-limits bursty anonymous requests; use bounded
                     # exponential backoff rather than silently dropping data.
                     time.sleep(1.0 * (2 ** attempt))
-        return security_id, "", b"", None, "; ".join(errors)
+        return security_id, "", b"", None, "; ".join(errors), attempt_count, errors
 
     results = []
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = [executor.submit(fetch, security_id, aliases) for security_id, aliases in requested.items()]
         for future in as_completed(futures):
             results.append(future.result())
+    con.execute("DROP TABLE IF EXISTS yahoo_chart_supplement")
+    con.execute("DROP TABLE IF EXISTS yahoo_chart_splits")
     con.execute(
         "CREATE TEMP TABLE yahoo_chart_supplement(source_symbol VARCHAR, session_date DATE, open DOUBLE, high DOUBLE, low DOUBLE, close DOUBLE, volume BIGINT, source_dataset VARCHAR, source_revision VARCHAR, observed_at_utc VARCHAR)"
     )
@@ -748,9 +772,16 @@ def supplement_missing_yahoo_chart_history(
     split_records: list[tuple[object, ...]] = []
     response_records: list[dict[str, object]] = []
     failures: list[dict[str, str]] = []
-    for security_id, symbol, payload, result, error in results:
+    for security_id, symbol, payload, result, error, attempt_count, retry_errors in results:
         if error or result is None:
-            failures.append({"security_id": security_id, "error": error or "unknown error"})
+            failures.append(
+                {
+                    "security_id": security_id,
+                    "attempt_count": attempt_count,
+                    "retry_results": retry_errors,
+                    "error": error or "unknown error",
+                }
+            )
             continue
         digest = hashlib.sha256(payload).hexdigest()
         observed = format_utc(utcnow())
@@ -768,7 +799,16 @@ def supplement_missing_yahoo_chart_history(
             if event_date <= cutoff:
                 factor = f"{event.get('numerator')}:{event.get('denominator')}"
                 split_records.append((symbol, event_date, factor, "Yahoo Finance Chart API", digest, observed))
-        response_records.append({"security_id": security_id, "source_symbol": symbol, "sha256": digest, "observed_at_utc": observed})
+        response_records.append(
+            {
+                "security_id": security_id,
+                "source_symbol": symbol,
+                "sha256": digest,
+                "observed_at_utc": observed,
+                "attempt_count": attempt_count,
+                "retry_results": retry_errors,
+            }
+        )
     if price_records:
         con.executemany("INSERT INTO yahoo_chart_supplement VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", price_records)
         con.execute(
@@ -793,7 +833,14 @@ def supplement_missing_yahoo_chart_history(
     con.execute("DROP TABLE split_dedup")
     con.execute("CREATE TEMP TABLE split_dedup AS SELECT DISTINCT * FROM split_source")
     return {
-        "mode": "ALL_ADMITTED_CURRENT_DELTA" if refresh_all else "MISSING_HISTORY_ONLY",
+        "mode": (
+            "TARGETED_MISSING_CURRENT_SESSION_RETRY"
+            if required_session is not None
+            else "ALL_ADMITTED_CURRENT_DELTA"
+            if refresh_all
+            else "MISSING_HISTORY_ONLY"
+        ),
+        "required_session": required_session.isoformat() if required_session else None,
         "requested": len(requested),
         "responses": response_records,
         "failures": failures,
@@ -853,11 +900,11 @@ def repair_invalid_yahoo_chart_rows(
                 result = (body.get("chart", {}).get("result") or [None])[0]
                 if not result or not result.get("timestamp"):
                     raise AggregateError("no daily history")
-                return symbol, target_dates, payload, result, None
+                return symbol, target_dates, payload, result, None, attempt + 1, errors
             except (OSError, ValueError, AggregateError) as exc:
                 errors.append(str(exc))
                 time.sleep(1.0 * (2**attempt))
-        return symbol, target_dates, b"", None, "; ".join(errors)
+        return symbol, target_dates, b"", None, "; ".join(errors), 5, errors
 
     results = []
     with ThreadPoolExecutor(max_workers=workers) as executor:
@@ -871,12 +918,14 @@ def repair_invalid_yahoo_chart_rows(
     repaired_records: list[tuple[object, ...]] = []
     responses: list[dict[str, object]] = []
     failures: list[dict[str, object]] = []
-    for symbol, target_dates, payload, result, error in results:
+    for symbol, target_dates, payload, result, error, attempt_count, retry_errors in results:
         if error or result is None:
             failures.append(
                 {
                     "source_symbol": symbol,
                     "session_dates": sorted(value.isoformat() for value in target_dates),
+                    "attempt_count": attempt_count,
+                    "retry_results": retry_errors,
                     "error": error or "unknown error",
                 }
             )
@@ -932,6 +981,8 @@ def repair_invalid_yahoo_chart_rows(
                 "observed_at_utc": observed,
                 "requested_dates": sorted(value.isoformat() for value in target_dates),
                 "repaired_dates": sorted(value.isoformat() for value in repaired_dates),
+                "attempt_count": attempt_count,
+                "retry_results": retry_errors,
             }
         )
     if repaired_records:
@@ -1080,6 +1131,7 @@ def build(args: argparse.Namespace) -> tuple[dict[str, object], int]:
             con, splits_path, cutoff, dataset=args.source_repo,
             revision=splits_revision, observed_at=observed_text,
         )
+        expected_session = expected_latest_session(cutoff, observed_at)
         if args.previous_aggregate:
             previous_aggregate = Path(args.previous_aggregate).resolve()
             previous_splits = (
@@ -1106,13 +1158,21 @@ def build(args: argparse.Namespace) -> tuple[dict[str, object], int]:
                 lookback_days=args.yahoo_chart_lookback_days,
                 refresh_all=args.yahoo_chart_refresh_all,
             )
+            chart_supplement["targeted_current_session_retry"] = (
+                supplement_missing_yahoo_chart_history(
+                    con,
+                    cutoff=cutoff,
+                    workers=args.yahoo_chart_workers,
+                    lookback_days=args.yahoo_chart_lookback_days,
+                    required_session=expected_session,
+                )
+            )
             repair_report = repair_invalid_yahoo_chart_rows(
                 con,
                 cutoff=cutoff,
                 sessions=args.sessions,
                 workers=args.yahoo_chart_workers,
             )
-        expected_session = expected_latest_session(cutoff, observed_at)
         (
             oldest_active_session,
             stale_source_rows,
@@ -1290,9 +1350,9 @@ def build(args: argparse.Namespace) -> tuple[dict[str, object], int]:
                 "320_or_more": sum(count >= 320 for count in session_counts),
             },
         }
-        latest_session_total = int(
-            con.execute("SELECT count(*) FROM active_security_ids").fetchone()[0]
-        )
+        # Freeze the broad-market denominator from the eligible universe before
+        # observing provider results. Stale/unmatched rows cannot disappear from it.
+        latest_session_total = admitted_count
         latest_session_valid = int(
             con.execute(
                 f"""
@@ -1551,7 +1611,7 @@ def build(args: argparse.Namespace) -> tuple[dict[str, object], int]:
                     "repair": repair_report,
                     "latest_session": {
                         "expected": expected_session.isoformat(),
-                        "active_matched_securities": latest_session_total,
+                        "frozen_eligible_securities": latest_session_total,
                         "valid_securities": latest_session_valid,
                         "valid_coverage": latest_session_coverage,
                         "benchmark_ticker": args.benchmark_ticker.upper(),

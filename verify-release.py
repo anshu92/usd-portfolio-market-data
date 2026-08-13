@@ -23,6 +23,7 @@ from reliability_contract import (
     GROUP_STATES,
     MARKET_READY_MAX_LAG_SESSIONS,
     ReliabilityContractError,
+    canonical_json,
     group_file_identities,
     group_sha256,
 )
@@ -37,8 +38,9 @@ PRODUCTION_FILES = {
     "NOTICE.md",
 } | set(CONTRACTS)
 OPTIONAL_PRODUCTION_FILES = {
-    "distributions.parquet",
+    "benchmark-distributions.parquet",
     "benchmark-total-returns.parquet",
+    "benchmark-certification.json",
 }
 BENCHMARK_MINIMUM_SESSIONS = 140
 BENCHMARK_MINIMUM_WEEKLY_OBSERVATIONS = 26
@@ -46,37 +48,42 @@ BENCHMARK_RAW_CLOSE_RELATIVE_TOLERANCE = 1e-4
 BENCHMARK_TOTAL_RETURN_RECONCILIATION_TOLERANCE = 1e-4
 BENCHMARK_RETURN_COLUMNS = (
     "security_id",
+    "ticker",
     "benchmark_id",
+    "benchmark_role",
     "session_date",
+    "raw_close",
+    "split_factor",
+    "cash_distribution",
     "price_return",
     "distribution_return",
     "total_return",
     "total_return_index",
+    "currency",
     "certification_status",
     "distribution_lineage_sha256",
     "corporate_action_lineage_sha256",
-    "known_at_utc",
-    "revision",
     "source_locator",
     "source_revision",
     "source_retrieved_at_utc",
+    "known_at_utc",
+    "certified_at_utc",
 )
 BENCHMARK_DISTRIBUTION_COLUMNS = (
     "security_id",
+    "ticker",
     "ex_date",
-    "record_date",
-    "pay_date",
     "cash_amount",
     "currency",
     "distribution_type",
     "distribution_id",
-    "known_at_utc",
-    "revision",
     "source_locator",
     "source_revision",
-    "source_publication_date",
     "source_retrieved_at_utc",
+    "known_at_utc",
+    "certified_at_utc",
 )
+REQUIRED_BENCHMARK_TICKERS = {"VTI", "SPY", "BIL"}
 ACCESSION_PATTERN = re.compile(r"^[0-9]{10}-[0-9]{2}-[0-9]{6}$")
 
 
@@ -134,6 +141,14 @@ def verify_record(
         rows = csv_rows(path)
     elif path.suffix == ".md":
         rows = 0
+    elif path.suffix == ".json":
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise VerificationError(f"Invalid JSON release file: {filename}") from exc
+        if not isinstance(value, dict):
+            raise VerificationError(f"JSON release root is not an object: {filename}")
+        rows = 1
     else:
         raise VerificationError(f"Unsupported release file type: {filename}")
     if rows != expected_rows:
@@ -449,6 +464,238 @@ def verify_benchmark_total_returns(
     }
     if certification.get("thresholds") != expected_thresholds:
         raise VerificationError("Benchmark certification thresholds are invalid")
+
+
+def verify_benchmark_total_returns(
+    con: duckdb.DuckDBPyConnection,
+    directory: Path,
+    manifest: dict[str, object],
+) -> None:
+    """Verify the independent three-security benchmark contract."""
+    returns_path = directory / "benchmark-total-returns.parquet"
+    distributions_path = directory / "benchmark-distributions.parquet"
+    certification_path = directory / "benchmark-certification.json"
+    present = (
+        returns_path.is_file(),
+        distributions_path.is_file(),
+        certification_path.is_file(),
+    )
+    if not any(present):
+        return
+    if not all(present):
+        raise VerificationError("Benchmark total-return lane is incomplete")
+    try:
+        certification = json.loads(certification_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise VerificationError("Benchmark certification JSON is invalid") from exc
+    if not isinstance(certification, dict):
+        raise VerificationError("Benchmark certification root is not an object")
+    if manifest.get("benchmark_certification") != certification:
+        raise VerificationError("Manifest/file benchmark certification mismatch")
+    if (
+        certification.get("schema_version") != "1.0.0"
+        or certification.get("contract_version") != "2.0.0"
+        or certification.get("status") != "CERTIFIED"
+        or set(certification.get("required_tickers") or [])
+        != REQUIRED_BENCHMARK_TICKERS
+    ):
+        raise VerificationError("Benchmark certification identity is invalid")
+    return_columns = tuple(
+        str(column[0])
+        for column in con.execute(
+            "SELECT * FROM read_parquet(?) LIMIT 0", [str(returns_path)]
+        ).description
+    )
+    distribution_columns = tuple(
+        str(column[0])
+        for column in con.execute(
+            "SELECT * FROM read_parquet(?) LIMIT 0", [str(distributions_path)]
+        ).description
+    )
+    if return_columns != BENCHMARK_RETURN_COLUMNS:
+        raise VerificationError("Benchmark total-return schema mismatch")
+    if distribution_columns != BENCHMARK_DISTRIBUTION_COLUMNS:
+        raise VerificationError("Benchmark distribution schema mismatch")
+    expected = str(
+        (manifest.get("validation") or {}).get("expected_latest_xnys_session") or ""
+    )
+    if (
+        certification.get("expected_latest_xnys_session") != expected
+        or certification.get("observed_latest_xnys_session") != expected
+        or certification.get("coverage")
+        != {"required": 3, "valid": 3, "ratio": 1.0}
+    ):
+        raise VerificationError("Benchmark current-session coverage is not 100%")
+    stats = con.execute(
+        """
+        SELECT count(DISTINCT ticker), count(DISTINCT security_id),
+               count(DISTINCT benchmark_id),
+               count(*) - count(DISTINCT (security_id, session_date)),
+               count(*) FILTER (
+                 WHERE certification_status <> 'CERTIFIED'
+                    OR ticker IS NULL OR benchmark_role IS NULL
+                    OR raw_close IS NULL OR NOT isfinite(raw_close) OR raw_close <= 0
+                    OR split_factor IS NULL OR NOT isfinite(split_factor) OR split_factor <= 0
+                    OR cash_distribution IS NULL OR NOT isfinite(cash_distribution)
+                    OR cash_distribution < 0 OR currency <> 'USD'
+                    OR price_return IS NULL OR NOT isfinite(price_return)
+                    OR distribution_return IS NULL OR NOT isfinite(distribution_return)
+                    OR total_return IS NULL OR NOT isfinite(total_return)
+                    OR total_return <= -1
+                    OR abs(total_return - price_return - distribution_return) > 0.0001
+                    OR total_return_index IS NULL OR NOT isfinite(total_return_index)
+                    OR total_return_index <= 0
+                    OR NOT regexp_full_match(distribution_lineage_sha256, '[0-9a-f]{64}')
+                    OR NOT regexp_full_match(corporate_action_lineage_sha256, '[0-9a-f]{64}')
+                    OR source_locator IS NULL OR source_revision IS NULL
+                    OR source_retrieved_at_utc IS NULL OR known_at_utc IS NULL
+                    OR certified_at_utc IS NULL
+               )
+        FROM read_parquet(?)
+        """,
+        [str(returns_path)],
+    ).fetchone()
+    if tuple(int(value or 0) for value in stats[:3]) != (3, 3, 1):
+        raise VerificationError("Benchmark total-return lane lacks required securities")
+    if int(stats[3] or 0) or int(stats[4] or 0):
+        raise VerificationError("Benchmark total-return lane has invalid rows")
+    per_security = con.execute(
+        """
+        SELECT ticker, min(security_id), count(*),
+               count(DISTINCT date_trunc('week', session_date)),
+               min(session_date), max(session_date),
+               count(*) FILTER (WHERE session_date = cast(? AS DATE))
+        FROM read_parquet(?) GROUP BY ticker ORDER BY ticker
+        """,
+        [expected, str(returns_path)],
+    ).fetchall()
+    if {str(row[0]) for row in per_security} != REQUIRED_BENCHMARK_TICKERS:
+        raise VerificationError("Benchmark ticker set is incomplete")
+    for ticker, _security_id, sessions, weeks, _minimum, maximum, current_rows in per_security:
+        if int(sessions) < BENCHMARK_MINIMUM_SESSIONS:
+            raise VerificationError(f"{ticker} benchmark history is shorter than 140 sessions")
+        if int(weeks) < BENCHMARK_MINIMUM_WEEKLY_OBSERVATIONS:
+            raise VerificationError(f"{ticker} benchmark history is shorter than 26 weeks")
+        if str(maximum) != expected or int(current_rows) != 1:
+            raise VerificationError(f"{ticker} current-session coverage is not 100%")
+    return_errors = int(
+        con.execute(
+            """
+            WITH ordered AS (
+              SELECT security_id, session_date, raw_close, split_factor,
+                     cash_distribution, price_return, distribution_return,
+                     total_return, total_return_index,
+                     lag(raw_close) OVER (
+                       PARTITION BY security_id ORDER BY session_date
+                     ) AS previous_close,
+                     lag(total_return_index) OVER (
+                       PARTITION BY security_id ORDER BY session_date
+                     ) AS previous_index
+              FROM read_parquet(?)
+            )
+            SELECT count(*) FROM ordered
+            WHERE previous_index IS NOT NULL AND (
+              abs(total_return_index / previous_index - 1 - total_return) > 1e-10
+              OR abs(price_return - (raw_close * split_factor / previous_close - 1)) > 1e-10
+              OR abs(distribution_return - cash_distribution / previous_close) > 1e-10
+            )
+            """,
+            [str(returns_path)],
+        ).fetchone()[0]
+    )
+    if return_errors:
+        raise VerificationError("Benchmark return/index reconciliation failed")
+    distribution_stats = con.execute(
+        """
+        SELECT count(*), count(*) - count(DISTINCT distribution_id),
+               count(*) FILTER (
+                 WHERE security_id IS NULL OR ticker IS NULL OR ex_date IS NULL
+                    OR cash_amount IS NULL OR NOT isfinite(cash_amount)
+                    OR cash_amount <= 0 OR currency <> 'USD'
+                    OR distribution_type <> 'CASH_DISTRIBUTION'
+                    OR distribution_id IS NULL OR source_locator IS NULL
+                    OR source_revision IS NULL OR source_retrieved_at_utc IS NULL
+                    OR known_at_utc IS NULL OR certified_at_utc IS NULL
+               )
+        FROM read_parquet(?)
+        """,
+        [str(distributions_path)],
+    ).fetchone()
+    if int(distribution_stats[0] or 0) < 3:
+        raise VerificationError("Benchmark distribution lane is incomplete")
+    if int(distribution_stats[1] or 0) or int(distribution_stats[2] or 0):
+        raise VerificationError("Benchmark distribution lane has invalid rows")
+    distribution_errors = int(
+        con.execute(
+            """
+            WITH cash AS (
+              SELECT security_id, ex_date, sum(cash_amount) AS cash_amount
+              FROM read_parquet(?) GROUP BY security_id, ex_date
+            )
+            SELECT count(*)
+            FROM read_parquet(?) returns
+            LEFT JOIN cash
+              ON cash.security_id = returns.security_id
+             AND cash.ex_date = returns.session_date
+            WHERE abs(returns.cash_distribution - coalesce(cash.cash_amount, 0)) > 1e-10
+            """,
+            [str(distributions_path), str(returns_path)],
+        ).fetchone()[0]
+    )
+    if distribution_errors:
+        raise VerificationError("Benchmark distributions do not reconcile")
+    securities = certification.get("securities")
+    if not isinstance(securities, list) or len(securities) != 3:
+        raise VerificationError("Benchmark certification summaries are incomplete")
+    summaries = {
+        str(value.get("ticker")): value
+        for value in securities
+        if isinstance(value, dict)
+    }
+    if set(summaries) != REQUIRED_BENCHMARK_TICKERS:
+        raise VerificationError("Benchmark certification security set is incomplete")
+    identity_subset = certification.get("identity_subset")
+    if not isinstance(identity_subset, list) or len(identity_subset) != 3:
+        raise VerificationError("Benchmark identity subset is incomplete")
+    if certification.get("identity_subset_sha256") != hashlib.sha256(
+        canonical_json(identity_subset)
+    ).hexdigest():
+        raise VerificationError("Benchmark identity-subset digest mismatch")
+    master_ids = {
+        str(row[0])
+        for row in con.execute(
+            "SELECT security_id FROM read_parquet(?)",
+            [str(directory / "security-master.parquet")],
+        ).fetchall()
+    }
+    for ticker, security_id, sessions, weeks, minimum, maximum, _current in per_security:
+        summary = summaries[str(ticker)]
+        if (
+            summary.get("security_id") != security_id
+            or security_id not in master_ids
+            or summary.get("minimum_session") != str(minimum)
+            or summary.get("maximum_session") != str(maximum)
+            or summary.get("sessions") != int(sessions)
+            or summary.get("weekly_observations") != int(weeks)
+            or float(summary.get("maximum_return_reconciliation_error", 1.0))
+            > BENCHMARK_TOTAL_RETURN_RECONCILIATION_TOLERANCE
+            or not str(summary.get("source_locator") or "").startswith("https://")
+            or re.fullmatch(
+                r"[0-9a-f]{64}", str(summary.get("source_revision") or "")
+            )
+            is None
+        ):
+            raise VerificationError(f"Benchmark certification mismatch: {ticker}")
+    validation = certification.get("validation")
+    if not isinstance(validation, dict) or (
+        validation.get("distribution_reconciliation") != "PASS"
+        or validation.get("corporate_action_reconciliation") != "PASS"
+        or validation.get("required_current_session_coverage") != 1.0
+        or validation.get("minimum_sessions") != BENCHMARK_MINIMUM_SESSIONS
+        or validation.get("minimum_weekly_observations")
+        != BENCHMARK_MINIMUM_WEEKLY_OBSERVATIONS
+    ):
+        raise VerificationError("Benchmark certification validation is incomplete")
 
 
 def verify_enrichment(

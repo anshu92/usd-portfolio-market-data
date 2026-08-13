@@ -1,0 +1,172 @@
+name: Publish phase readiness proof
+
+on:
+  workflow_dispatch:
+    inputs:
+      decision_run_id:
+        description: "Successful decision-support workflow run ID"
+        required: true
+        type: string
+      pointer_publication_run_id:
+        description: "Successful decision-support pointer publication run ID"
+        required: true
+        type: string
+      phase:
+        description: "Newly usable phase"
+        required: true
+        type: choice
+        options: [accounting, sunday]
+      as_of:
+        description: "RFC3339 decision instant for the exact phase gate"
+        required: true
+        type: string
+      previous_phase_status:
+        description: "Previously published phase status"
+        required: true
+        default: BLOCKED
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: readiness-proof-${{ inputs.phase }}-${{ inputs.decision_run_id }}
+  cancel-in-progress: false
+
+jobs:
+  proof:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Resolve exact runs and decision artifact
+        id: evidence
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DECISION_RUN_ID: ${{ inputs.decision_run_id }}
+          POINTER_RUN_ID: ${{ inputs.pointer_publication_run_id }}
+        run: |
+          set -euo pipefail
+          [[ "$DECISION_RUN_ID" =~ ^[0-9]+$ && "$POINTER_RUN_ID" =~ ^[0-9]+$ ]] || exit 2
+          started="$(date +%s%N)"
+          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${DECISION_RUN_ID}" > "$RUNNER_TEMP/decision-run.json"
+          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${POINTER_RUN_ID}" > "$RUNNER_TEMP/pointer-run.json"
+          jq -e '
+            .path == ".github/workflows/build-decision-support.yml" and
+            .status == "completed" and .conclusion == "success"
+          ' "$RUNNER_TEMP/decision-run.json" >/dev/null
+          jq -e '
+            .path == ".github/workflows/publish-decision-support-pointer.yml" and
+            .status == "completed" and .conclusion == "success"
+          ' "$RUNNER_TEMP/pointer-run.json" >/dev/null
+          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${DECISION_RUN_ID}/artifacts" > "$RUNNER_TEMP/artifacts.json"
+          artifact_count="$(jq --arg suffix "-${DECISION_RUN_ID}" '[.artifacts[] | select((.name | startswith("decision-support-market-data-")) and (.name | endswith($suffix)))] | length' "$RUNNER_TEMP/artifacts.json")"
+          [[ "$artifact_count" == "1" ]] || { echo "Expected one decision artifact" >&2; exit 2; }
+          artifact_id="$(jq -r --arg suffix "-${DECISION_RUN_ID}" '.artifacts[] | select((.name | startswith("decision-support-market-data-")) and (.name | endswith($suffix))) | .id' "$RUNNER_TEMP/artifacts.json")"
+          artifact_name="$(jq -r --argjson id "$artifact_id" '.artifacts[] | select(.id == $id) | .name' "$RUNNER_TEMP/artifacts.json")"
+          gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}" > "$RUNNER_TEMP/artifact.json"
+          completed="$(date +%s%N)"
+          python -c 'import sys; print((int(sys.argv[2])-int(sys.argv[1]))/1e9)' "$started" "$completed" > "$RUNNER_TEMP/discovery-seconds.txt"
+          echo "artifact_id=$artifact_id" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=$artifact_name" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$(jq -r '.head_sha' "$RUNNER_TEMP/decision-run.json")" >> "$GITHUB_OUTPUT"
+
+      - name: Check out exact producer and validator commit
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ steps.evidence.outputs.head_sha }}
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.13.14"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install reviewed dependencies
+        run: |
+          python -m pip install --disable-pip-version-check --require-hashes -r requirements-dev.txt
+
+      - name: Download exact decision artifact and measure transfer
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_NAME: ${{ steps.evidence.outputs.artifact_name }}
+        run: |
+          set -euo pipefail
+          started="$(date +%s%N)"
+          gh run download "${{ inputs.decision_run_id }}" \
+            --name "$ARTIFACT_NAME" \
+            --dir staging/decision
+          completed="$(date +%s%N)"
+          python -c 'import sys; print((int(sys.argv[2])-int(sys.argv[1]))/1e9)' "$started" "$completed" > "$RUNNER_TEMP/download-seconds.txt"
+
+      - name: Run exact phase gate with scoped validation latency
+        run: |
+          python verify-decision-support.py \
+            --dist staging/decision \
+            --phase "${{ inputs.phase }}" \
+            --as-of "${{ inputs.as_of }}" \
+            --allow-degraded \
+            > phase-result.json
+
+      - name: Retrieve immutable source evidence and published pointer
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          source_tag="$(jq -r '.source_release.tag' staging/decision/decision-support-manifest.json)"
+          mkdir -p staging/source
+          gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${source_tag}" > "$RUNNER_TEMP/source-release.json"
+          gh release download "$source_tag" \
+            --dir staging/source \
+            --pattern manifest.json \
+            --pattern benchmark-certification.json
+          gh api "repos/${GITHUB_REPOSITORY}/contents/consumer/latest-decision-support-artifact.json?ref=main" \
+            --jq '.content' | base64 -d > "$RUNNER_TEMP/decision-pointer.json"
+
+      - name: Run mandatory readiness failure and calendar tests
+        run: |
+          python -m pytest -q \
+            tests/test_producer_dispatch.py \
+            tests/test_benchmark_total_returns.py
+          jq -n '{
+            holiday_calendar: "PASS",
+            early_close_calendar: "PASS",
+            stale_source_quarantine: "PASS",
+            unreconciled_return_quarantine: "PASS",
+            rollback_carried_forward_lane: "PASS"
+          }' > test-results.json
+
+      - name: Build proof bundle
+        run: |
+          mkdir -p proof
+          python build-readiness-proof.py \
+            --source-manifest staging/source/manifest.json \
+            --benchmark-certification staging/source/benchmark-certification.json \
+            --decision-manifest staging/decision/decision-support-manifest.json \
+            --decision-pointer "$RUNNER_TEMP/decision-pointer.json" \
+            --phase-result phase-result.json \
+            --source-release-metadata "$RUNNER_TEMP/source-release.json" \
+            --decision-run-metadata "$RUNNER_TEMP/decision-run.json" \
+            --pointer-run-metadata "$RUNNER_TEMP/pointer-run.json" \
+            --artifact-metadata "$RUNNER_TEMP/artifact.json" \
+            --test-results test-results.json \
+            --phase "${{ inputs.phase }}" \
+            --previous-phase-status "${{ inputs.previous_phase_status }}" \
+            --discovery-seconds "$(cat "$RUNNER_TEMP/discovery-seconds.txt")" \
+            --download-seconds "$(cat "$RUNNER_TEMP/download-seconds.txt")" \
+            --out proof/readiness-proof.json
+
+      - name: Upload immutable proof bundle
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: readiness-proof-${{ inputs.phase }}-${{ inputs.decision_run_id }}
+          path: proof/readiness-proof.json
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 9

@@ -86,6 +86,18 @@ def benchmark_builder_module():
     )
 
 
+@pytest.fixture(scope="session")
+def producer_dispatch_module():
+    return load_script("dispatch_producer_phase", "dispatch-producer-phase.py")
+
+
+@pytest.fixture(scope="session")
+def coverage_diagnostic_module():
+    return load_script(
+        "build_market_coverage_diagnostic", "build-market-coverage-diagnostic.py"
+    )
+
+
 def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 

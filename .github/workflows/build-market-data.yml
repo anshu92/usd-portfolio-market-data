@@ -1,6 +1,8 @@
 name: Build portfolio market-data release
 
 on:
+  repository_dispatch:
+    types: [producer_phase_deadline]
   workflow_dispatch:
     inputs:
       mode:
@@ -39,19 +41,53 @@ on:
         required: true
         default: false
         type: boolean
+      expected_session:
+        description: "Expected completed XNYS session supplied by the dispatcher"
+        required: false
+        default: ""
+        type: string
+      phase:
+        description: "Scheduled consumer phase (accounting or sunday)"
+        required: false
+        default: ""
+        type: string
+      decision_cutoff:
+        description: "RFC3339 consumer decision cutoff supplied by the dispatcher"
+        required: false
+        default: ""
+        type: string
+      scheduled_time:
+        description: "RFC3339 scheduled trigger time supplied by the dispatcher"
+        required: false
+        default: ""
+        type: string
+      attempt:
+        description: "Initial, +75, or +120 attempt label"
+        required: false
+        default: "manual"
+        type: string
+      idempotency_key:
+        description: "Stable dispatcher idempotency key"
+        required: false
+        default: ""
+        type: string
   schedule:
     # Pre-open backstop: publish the prior completed XNYS session before 08:10.
     - cron: "15 7 * * 1-5"
       timezone: "America/New_York"
-    # Terminal-close build: begins after the regular XNYS close.
-    - cron: "16 16 * * 1-5"
+    # GitHub cron is a backstop, not the action-time deadline mechanism.
+    - cron: "45 16 * * 1-5"
+      timezone: "America/New_York"
+    - cron: "15 17 * * 1-5"
+      timezone: "America/New_York"
+    - cron: "0 18 * * 1-5"
       timezone: "America/New_York"
     # Leave the full source refresh enough headroom to finish before 08:30 Saturday.
     - cron: "0 2 * * 6"
       timezone: "America/New_York"
 
 concurrency:
-  group: portfolio-market-data-build
+  group: portfolio-market-data-${{ github.event.client_payload.phase || inputs.phase || 'backstop' }}-${{ github.event.client_payload.expected_session || inputs.expected_session || 'current' }}
   cancel-in-progress: false
 
 jobs:
@@ -66,6 +102,8 @@ jobs:
       artifact_name: ${{ steps.inputs.outputs.artifact_name }}
       publish: ${{ steps.inputs.outputs.publish }}
       tag: ${{ steps.inputs.outputs.tag }}
+      phase: ${{ steps.inputs.outputs.phase }}
+      decision_cutoff: ${{ steps.inputs.outputs.decision_cutoff }}
     env:
       HF_HOME: ${{ github.workspace }}/.hf-cache
       PYTHONUNBUFFERED: "1"
@@ -98,6 +136,18 @@ jobs:
           INPUT_ALLOW_DRIFT: ${{ inputs.allow_universe_drift }}
           INPUT_REFRESH_ENRICHMENT: ${{ inputs.refresh_enrichment }}
           INPUT_REUSE_CHART_HISTORY: ${{ inputs.reuse_yahoo_chart_history }}
+          INPUT_EXPECTED_SESSION: ${{ inputs.expected_session }}
+          INPUT_PHASE: ${{ inputs.phase }}
+          INPUT_DECISION_CUTOFF: ${{ inputs.decision_cutoff }}
+          INPUT_SCHEDULED_TIME: ${{ inputs.scheduled_time }}
+          INPUT_ATTEMPT: ${{ inputs.attempt }}
+          INPUT_IDEMPOTENCY_KEY: ${{ inputs.idempotency_key }}
+          DISPATCH_EXPECTED_SESSION: ${{ github.event.client_payload.expected_session }}
+          DISPATCH_PHASE: ${{ github.event.client_payload.phase }}
+          DISPATCH_DECISION_CUTOFF: ${{ github.event.client_payload.decision_cutoff }}
+          DISPATCH_SCHEDULED_TIME: ${{ github.event.client_payload.scheduled_time }}
+          DISPATCH_ATTEMPT: ${{ github.event.client_payload.attempt }}
+          DISPATCH_IDEMPOTENCY_KEY: ${{ github.event.client_payload.idempotency_key }}
           RELEASES_ENABLED: ${{ vars.PRODUCTION_RELEASES_ENABLED }}
         run: |
           set -euo pipefail
@@ -111,6 +161,35 @@ jobs:
           allow_drift="${INPUT_ALLOW_DRIFT:-false}"
           refresh_enrichment="${INPUT_REFRESH_ENRICHMENT:-false}"
           reuse_chart_history="${INPUT_REUSE_CHART_HISTORY:-false}"
+          expected_session="${DISPATCH_EXPECTED_SESSION:-${INPUT_EXPECTED_SESSION:-}}"
+          phase="${DISPATCH_PHASE:-${INPUT_PHASE:-}}"
+          decision_cutoff="${DISPATCH_DECISION_CUTOFF:-${INPUT_DECISION_CUTOFF:-}}"
+          scheduled_time="${DISPATCH_SCHEDULED_TIME:-${INPUT_SCHEDULED_TIME:-}}"
+          attempt="${DISPATCH_ATTEMPT:-${INPUT_ATTEMPT:-manual}}"
+          idempotency_key="${DISPATCH_IDEMPOTENCY_KEY:-${INPUT_IDEMPOTENCY_KEY:-}}"
+          actual_start="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+          if [[ "$EVENT_NAME" == "repository_dispatch" ]]; then
+            [[ "$expected_session" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || {
+              echo "repository_dispatch requires expected_session" >&2
+              exit 2
+            }
+            [[ "$phase" == "accounting" || "$phase" == "sunday" ]] || {
+              echo "repository_dispatch phase must be accounting or sunday" >&2
+              exit 2
+            }
+            [[ -n "$decision_cutoff" && -n "$scheduled_time" && -n "$idempotency_key" ]] || {
+              echo "repository_dispatch lacks cutoff, schedule, or idempotency metadata" >&2
+              exit 2
+            }
+            mode="full"
+            sessions="320"
+            cutoff="$expected_session"
+            requested_publish="${RELEASES_ENABLED:-false}"
+            allow_drift="false"
+            refresh_enrichment="false"
+            reuse_chart_history="true"
+          fi
 
           if [[ "$EVENT_NAME" == "schedule" ]]; then
             mode="full"
@@ -156,7 +235,11 @@ jobs:
             exit 2
           fi
           if [[ "$requested_publish" == "true" ]]; then
-            if [[ "$mode" != "full" || "$sessions" != "320" || "$cutoff" != "$market_today" ]]; then
+            if [[ "$mode" != "full" || "$sessions" != "320" ]]; then
+              echo "Publication requires full mode and 320 sessions" >&2
+              exit 2
+            fi
+            if [[ "$EVENT_NAME" != "repository_dispatch" && "$cutoff" != "$market_today" ]]; then
               echo "Publication requires full mode, 320 sessions, and today's New York market cutoff" >&2
               exit 2
             fi
@@ -175,6 +258,13 @@ jobs:
           echo "allow_drift=$allow_drift" >> "$GITHUB_OUTPUT"
           echo "refresh_enrichment=$refresh_enrichment" >> "$GITHUB_OUTPUT"
           echo "reuse_chart_history=$reuse_chart_history" >> "$GITHUB_OUTPUT"
+          echo "expected_session=$expected_session" >> "$GITHUB_OUTPUT"
+          echo "phase=$phase" >> "$GITHUB_OUTPUT"
+          echo "decision_cutoff=$decision_cutoff" >> "$GITHUB_OUTPUT"
+          echo "scheduled_time=$scheduled_time" >> "$GITHUB_OUTPUT"
+          echo "attempt=$attempt" >> "$GITHUB_OUTPUT"
+          echo "idempotency_key=${idempotency_key:-${phase:-market}:$cutoff:$attempt}" >> "$GITHUB_OUTPUT"
+          echo "actual_start=$actual_start" >> "$GITHUB_OUTPUT"
           echo "artifact_name=market-data-${GITHUB_RUN_ID}" >> "$GITHUB_OUTPUT"
           echo "tag=market-data-$(date -u +%Y%m%dT%H%M%SZ)" >> "$GITHUB_OUTPUT"
 
@@ -308,6 +398,15 @@ jobs:
           fi
           "${args[@]}"
 
+      - name: Build frozen-denominator market coverage diagnostic
+        if: always() && steps.inputs.outputs.mode == 'full'
+        run: |
+          python build-market-coverage-diagnostic.py \
+            --manifest dist/manifest.json \
+            --universe dist/security-universe.csv \
+            --prices dist/yahoo-ohlcv-320.parquet \
+            --out "$RUNNER_TEMP/market-coverage-diagnostic.json"
+
       - name: Download official SEC bulk sources
         if: steps.inputs.outputs.mode == 'full' && steps.inputs.outputs.refresh_enrichment == 'true'
         shell: bash
@@ -426,12 +525,42 @@ jobs:
           echo "failure_count=$(jq '.candidate_attempt_failures | length' dist/manifest.json)" >> "$GITHUB_OUTPUT"
 
       - name: Build certified benchmark total-return lane
+        id: benchmark_candidate
         if: steps.inputs.outputs.mode == 'full'
         continue-on-error: true
+        shell: bash
         run: |
-          python build-benchmark-total-returns.py \
+          set -euo pipefail
+          args=(
+            python build-benchmark-total-returns.py \
             --release-dir dist \
-            --benchmark-ticker VTI
+            --identity-universe "$RUNNER_TEMP/candidate-release/security-universe.csv" \
+            --idempotency-key "${{ steps.inputs.outputs.idempotency_key }}" \
+            --quarantine-out "$RUNNER_TEMP/benchmark-quarantine.json"
+          )
+          if [[ -n "${{ steps.inputs.outputs.expected_session }}" ]]; then
+            args+=(--expected-session "${{ steps.inputs.outputs.expected_session }}")
+          fi
+          "${args[@]}"
+
+      - name: Record dispatcher timing and outcome
+        if: steps.inputs.outputs.mode == 'full'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python write-production-run-metadata.py \
+            --manifest dist/manifest.json \
+            --trigger "${{ github.event_name }}" \
+            --phase "${{ steps.inputs.outputs.phase }}" \
+            --expected-session "${{ steps.inputs.outputs.expected_session }}" \
+            --decision-cutoff "${{ steps.inputs.outputs.decision_cutoff }}" \
+            --scheduled-time "${{ steps.inputs.outputs.scheduled_time }}" \
+            --actual-start "${{ steps.inputs.outputs.actual_start }}" \
+            --attempt "${{ steps.inputs.outputs.attempt }}" \
+            --idempotency-key "${{ steps.inputs.outputs.idempotency_key }}" \
+            --benchmark-outcome "${{ steps.benchmark_candidate.outcome }}" \
+            --workflow-run-id "$GITHUB_RUN_ID" \
+            --producer-commit "$GITHUB_SHA"
 
       - name: Verify build output
         run: |
@@ -479,11 +608,13 @@ jobs:
         run: |
           python verify-workflow-artifact-size.py --allow-missing \
             dist/*.parquet \
+            dist/*.json \
             dist/security-universe.csv \
-            dist/manifest.json \
             dist/unmatched-tickers.csv \
             dist/NOTICE.md \
-            dist/release-notes.md
+            dist/release-notes.md \
+            ${{ runner.temp }}/market-coverage-diagnostic.json \
+            ${{ runner.temp }}/benchmark-quarantine.json
 
       - name: Upload seven-day diagnostic artifact
         if: always() && steps.diagnostic_artifact_size.outcome == 'success'
@@ -492,11 +623,14 @@ jobs:
           name: ${{ steps.inputs.outputs.artifact_name }}
           path: |
             dist/*.parquet
+            dist/*.json
             dist/security-universe.csv
             dist/manifest.json
             dist/unmatched-tickers.csv
             dist/NOTICE.md
             dist/release-notes.md
+            ${{ runner.temp }}/market-coverage-diagnostic.json
+            ${{ runner.temp }}/benchmark-quarantine.json
           if-no-files-found: warn
           retention-days: 7
           compression-level: 9
@@ -579,8 +713,9 @@ jobs:
             dist/yahoo-splits.parquet
           )
           for optional in \
-            dist/distributions.parquet \
-            dist/benchmark-total-returns.parquet
+            dist/benchmark-distributions.parquet \
+            dist/benchmark-total-returns.parquet \
+            dist/benchmark-certification.json
           do
             if [[ -f "$optional" ]]; then
               assets+=("$optional")
@@ -596,12 +731,20 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.build.outputs.tag }}
+          PHASE: ${{ needs.build.outputs.phase }}
+          DECISION_CUTOFF: ${{ needs.build.outputs.decision_cutoff }}
         run: |
           set -euo pipefail
           gh workflow run export-release-for-consumer.yml \
             --repo "$GITHUB_REPOSITORY" \
             --ref main
-          gh workflow run build-decision-support.yml \
-            --repo "$GITHUB_REPOSITORY" \
-            --ref main \
+          decision_args=(
+            gh workflow run build-decision-support.yml
+            --repo "$GITHUB_REPOSITORY"
+            --ref main
             -f source_tag="$TAG"
+          )
+          if [[ -n "$PHASE" && -n "$DECISION_CUTOFF" ]]; then
+            decision_args+=(-f phase="$PHASE" -f as_of="$DECISION_CUTOFF")
+          fi
+          "${decision_args[@]}"

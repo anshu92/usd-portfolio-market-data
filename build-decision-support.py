@@ -62,24 +62,27 @@ SQLITE_TYPE = {
 FUTURE_TABLE_COLUMNS = {
     "distributions": (
         ("security_id", "TEXT"),
+        ("ticker", "TEXT"),
         ("ex_date", "TEXT"),
-        ("record_date", "TEXT"),
-        ("pay_date", "TEXT"),
         ("cash_amount", "REAL"),
         ("currency", "TEXT"),
         ("distribution_type", "TEXT"),
         ("distribution_id", "TEXT"),
-        ("known_at_utc", "TEXT"),
-        ("revision", "TEXT"),
         ("source_locator", "TEXT"),
         ("source_revision", "TEXT"),
-        ("source_publication_date", "TEXT"),
         ("source_retrieved_at_utc", "TEXT"),
+        ("known_at_utc", "TEXT"),
+        ("certified_at_utc", "TEXT"),
     ),
     "benchmark_total_returns": (
         ("security_id", "TEXT"),
+        ("ticker", "TEXT"),
         ("benchmark_id", "TEXT"),
+        ("benchmark_role", "TEXT"),
         ("session_date", "TEXT"),
+        ("raw_close", "REAL"),
+        ("split_factor", "REAL"),
+        ("cash_distribution", "REAL"),
         ("price_return", "REAL"),
         ("distribution_return", "REAL"),
         ("total_return", "REAL"),
@@ -87,11 +90,11 @@ FUTURE_TABLE_COLUMNS = {
         ("certification_status", "TEXT"),
         ("distribution_lineage_sha256", "TEXT"),
         ("corporate_action_lineage_sha256", "TEXT"),
-        ("known_at_utc", "TEXT"),
-        ("revision", "TEXT"),
         ("source_locator", "TEXT"),
         ("source_revision", "TEXT"),
         ("source_retrieved_at_utc", "TEXT"),
+        ("known_at_utc", "TEXT"),
+        ("certified_at_utc", "TEXT"),
     ),
 }
 
@@ -453,6 +456,108 @@ def benchmark_lane_status(release_dir: Path) -> dict[str, object]:
         connection.close()
 
 
+def benchmark_lane_status(release_dir: Path) -> dict[str, object]:
+    returns_path = release_dir / "benchmark-total-returns.parquet"
+    distributions_path = release_dir / "benchmark-distributions.parquet"
+    certification_path = release_dir / "benchmark-certification.json"
+    if not all(path.is_file() for path in (returns_path, distributions_path, certification_path)):
+        return {
+            "state": "NOT_CONFIGURED",
+            "identity_state": "NOT_CONFIGURED",
+            "market_state": "NOT_CONFIGURED",
+            "reason": "Certified VTI/SPY/BIL benchmark lane is not configured",
+            "observed_at": None,
+            "identity_observed_at": None,
+            "sessions": 0,
+            "weekly_observations": 0,
+            "securities": 0,
+            "coverage": 0.0,
+            "maximum_session": None,
+        }
+    try:
+        certification = json.loads(certification_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise DecisionSupportBuildError(
+            f"Cannot read benchmark certification: {exc}"
+        ) from exc
+    if not isinstance(certification, dict):
+        raise DecisionSupportBuildError("Benchmark certification root is not an object")
+    if (
+        certification.get("status") != "CERTIFIED"
+        or set(certification.get("required_tickers") or []) != {"VTI", "SPY", "BIL"}
+        or certification.get("coverage")
+        != {"required": 3, "valid": 3, "ratio": 1.0}
+    ):
+        return {
+            "state": "INVALID",
+            "identity_state": "INVALID",
+            "market_state": "INVALID",
+            "reason": "Benchmark certification is incomplete",
+            "observed_at": certification.get("source_retrieved_at_utc"),
+            "identity_observed_at": certification.get("identity_observed_at_utc"),
+            "sessions": 0,
+            "weekly_observations": 0,
+            "securities": 0,
+            "coverage": 0.0,
+            "maximum_session": certification.get("observed_latest_xnys_session"),
+        }
+    connection = duckdb.connect()
+    try:
+        rows = connection.execute(
+            """
+            SELECT ticker, count(*),
+                   count(DISTINCT date_trunc('week', session_date)),
+                   max(session_date),
+                   count(*) FILTER (WHERE certification_status <> 'CERTIFIED')
+            FROM read_parquet(?) GROUP BY ticker
+            """,
+            [str(returns_path)],
+        ).fetchall()
+        invalid_distributions = int(
+            connection.execute(
+                """
+                SELECT count(*) FILTER (
+                  WHERE cash_amount <= 0 OR currency <> 'USD'
+                     OR distribution_type <> 'CASH_DISTRIBUTION'
+                     OR source_retrieved_at_utc IS NULL
+                ) FROM read_parquet(?)
+                """,
+                [str(distributions_path)],
+            ).fetchone()[0]
+        )
+    finally:
+        connection.close()
+    by_ticker = {str(row[0]): row for row in rows}
+    expected = str(certification.get("expected_latest_xnys_session") or "")
+    sessions = min((int(row[1]) for row in rows), default=0)
+    weeks = min((int(row[2]) for row in rows), default=0)
+    current = (
+        set(by_ticker) == {"VTI", "SPY", "BIL"}
+        and all(str(row[3]) == expected for row in rows)
+    )
+    valid = (
+        current
+        and all(int(row[4] or 0) == 0 for row in rows)
+        and invalid_distributions == 0
+        and sessions >= BENCHMARK_MINIMUM_SESSIONS
+        and weeks >= BENCHMARK_MINIMUM_WEEKLY_OBSERVATIONS
+    )
+    return {
+        "state": "READY" if valid else "INVALID",
+        "identity_state": "READY",
+        "market_state": "READY" if current else "STALE",
+        "reason": None if valid else "Benchmark assets fail current-session/history validation",
+        "observed_at": certification.get("source_retrieved_at_utc"),
+        "identity_observed_at": certification.get("identity_observed_at_utc"),
+        "sessions": sessions,
+        "weekly_observations": weeks,
+        "securities": len(by_ticker),
+        "coverage": len(by_ticker) / 3,
+        "maximum_session": certification.get("observed_latest_xnys_session"),
+        "identity_subset_sha256": certification.get("identity_subset_sha256"),
+    }
+
+
 def source_watermarks(
     groups: Mapping[str, Mapping[str, object]],
     capabilities: Mapping[str, Mapping[str, object]],
@@ -502,6 +607,15 @@ def validator_identity(producer_commit: str) -> dict[str, object]:
 
 
 def source_session(manifest: Mapping[str, object]) -> date:
+    certification = manifest.get("benchmark_certification")
+    if isinstance(certification, dict) and certification.get("status") == "CERTIFIED":
+        value = certification.get("observed_latest_xnys_session")
+        try:
+            return date.fromisoformat(str(value))
+        except ValueError as exc:
+            raise DecisionSupportBuildError(
+                "Source benchmark certification has an invalid session"
+            ) from exc
     aggregate = manifest.get("aggregate")
     value = aggregate.get("max_date") if isinstance(aggregate, dict) else None
     try:
@@ -654,10 +768,19 @@ def capability_records(
         source_group = contract.source_group
         group = groups.get(str(source_group)) if source_group else None
         if capability_id in {
+            "benchmark_identity",
+            "benchmark_market_current",
             "certified_total_returns",
             "funded_benchmark_inputs",
         }:
-            state = str(benchmark["state"])
+            state_key = (
+                "identity_state"
+                if capability_id == "benchmark_identity"
+                else "market_state"
+                if capability_id == "benchmark_market_current"
+                else "state"
+            )
+            state = str(benchmark[state_key])
             reason = benchmark["reason"]
             freshness_value = group.get("freshness") if group else None
             freshness = freshness_value if isinstance(freshness_value, dict) else {}
@@ -666,7 +789,11 @@ def capability_records(
                 state = group_state or "NOT_CONFIGURED"
                 reason = "Certified total-return source group is not usable"
             if state == "READY" and as_of is not None:
-                observed = benchmark.get("observed_at")
+                observed = benchmark.get(
+                    "identity_observed_at"
+                    if capability_id == "benchmark_identity"
+                    else "observed_at"
+                )
                 try:
                     observed_at = datetime.fromisoformat(
                         str(observed).replace("Z", "+00:00")
@@ -725,7 +852,10 @@ def capability_records(
                 if state == "READY"
                 else f"Source group state is {group_state or 'missing'}"
             )
-            if state == "READY" and capability_id == "historical_market":
+            if state == "READY" and capability_id in {
+                "historical_market",
+                "broad_market_current",
+            }:
                 lag = freshness.get("lag_eligible_sessions")
                 if not isinstance(lag, int) or lag != 0:
                     state = "STALE"
@@ -748,12 +878,28 @@ def capability_records(
             "observed_at": freshness.get("observed"),
             "maximum_age_seconds": contract.maximum_age_seconds,
         }
-        if capability_id in {"certified_total_returns", "funded_benchmark_inputs"}:
+        if capability_id in {
+            "benchmark_identity",
+            "benchmark_market_current",
+            "certified_total_returns",
+            "funded_benchmark_inputs",
+        }:
             output[capability_id].update(
                 {
-                    "observed_at": benchmark["observed_at"],
+                    "observed_at": benchmark[
+                        "identity_observed_at"
+                        if capability_id == "benchmark_identity"
+                        else "observed_at"
+                    ],
                     "sessions": benchmark["sessions"],
                     "weekly_observations": benchmark["weekly_observations"],
+                    "securities": benchmark["securities"],
+                    "coverage": benchmark["coverage"],
+                    "expected_coverage": 1.0,
+                    "maximum_session": benchmark["maximum_session"],
+                    "identity_subset_sha256": benchmark.get(
+                        "identity_subset_sha256"
+                    ),
                     "minimum_sessions": BENCHMARK_MINIMUM_SESSIONS,
                     "minimum_weekly_observations": BENCHMARK_MINIMUM_WEEKLY_OBSERVATIONS,
                 }
@@ -792,12 +938,17 @@ def build_phase_pack(
         else "READY"
     )
     operating_modes = ["ARTIFACT_VALID"]
-    if all(
+    if phase_id in {"sunday", "accounting"} and all(
         capabilities[capability_id].get("state") == "READY"
-        for capability_id in ("certified_total_returns", "funded_benchmark_inputs")
+        for capability_id in (
+            "benchmark_identity",
+            "benchmark_market_current",
+            "certified_total_returns",
+            "funded_benchmark_inputs",
+        )
     ):
         operating_modes.append("BENCHMARK_ONLY_SAFE")
-    if not unavailable_required:
+    if phase_id != "accounting" and not unavailable_required and not unavailable_optional:
         operating_modes.append("CHALLENGER_RESEARCH_READY")
     if external:
         operating_modes.append("LIVE_SNAPSHOT_REQUIRED")
@@ -1075,6 +1226,11 @@ def build_database(
                 ("weekly_observations", "INTEGER"),
                 ("minimum_sessions", "INTEGER"),
                 ("minimum_weekly_observations", "INTEGER"),
+                ("securities", "INTEGER"),
+                ("coverage", "REAL"),
+                ("expected_coverage", "REAL"),
+                ("maximum_session", "TEXT"),
+                ("identity_subset_sha256", "TEXT"),
             ),
             ("capability_id",),
         )
@@ -1092,6 +1248,11 @@ def build_database(
                 "weekly_observations",
                 "minimum_sessions",
                 "minimum_weekly_observations",
+                "securities",
+                "coverage",
+                "expected_coverage",
+                "maximum_session",
+                "identity_subset_sha256",
             ),
             (
                 (
@@ -1105,6 +1266,11 @@ def build_database(
                     record.get("weekly_observations"),
                     record.get("minimum_sessions"),
                     record.get("minimum_weekly_observations"),
+                    record.get("securities"),
+                    record.get("coverage"),
+                    record.get("expected_coverage"),
+                    record.get("maximum_session"),
+                    record.get("identity_subset_sha256"),
                 )
                 for capability_id, record in sorted(capabilities.items())
             ),
@@ -1530,7 +1696,7 @@ def build_database(
             row_counts["analyst_estimates_latest"] = 0
 
         future_sources = {
-            "distributions": "distributions.parquet",
+            "distributions": "benchmark-distributions.parquet",
             "benchmark_total_returns": "benchmark-total-returns.parquet",
         }
         for table, columns in FUTURE_TABLE_COLUMNS.items():

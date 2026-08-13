@@ -223,7 +223,7 @@ def test_market_reuse_allows_documented_two_session_lag() -> None:
 def test_optional_group_must_be_absent_or_complete(tmp_path: Path) -> None:
     release = tmp_path / "release"
     manifest = _write_grouped_release(release)
-    distributions = release / "distributions.parquet"
+    distributions = release / "benchmark-distributions.parquet"
     con = duckdb.connect()
     try:
         con.execute(
@@ -236,7 +236,7 @@ def test_optional_group_must_be_absent_or_complete(tmp_path: Path) -> None:
 
     with pytest.raises(
         ReliabilityContractError,
-        match="total_returns lacks dataset identity for benchmark-total-returns.parquet",
+        match="total_returns lacks dataset identity for benchmark-certification.json",
     ):
         apply_dataset_groups(manifest, release)
 

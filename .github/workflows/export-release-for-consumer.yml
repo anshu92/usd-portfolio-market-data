@@ -92,8 +92,9 @@ jobs:
               --dir staging/release
           done
           for asset in \
-            distributions.parquet \
-            benchmark-total-returns.parquet
+            benchmark-distributions.parquet \
+            benchmark-total-returns.parquet \
+            benchmark-certification.json
           do
             if jq -e --arg name "$asset" '.assets[] | select(.name == $name)' \
               staging/github-release.json >/dev/null

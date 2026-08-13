@@ -61,6 +61,15 @@ The status is supplemented by ordered operating modes: `ARTIFACT_VALID`,
 benchmark lane. Candidate-level actionability is empty and explicitly rejected until
 an approved selector is configured.
 
+Benchmark decisions use five separate capabilities: `benchmark_identity`,
+`benchmark_market_current`, `certified_total_returns`, `funded_benchmark_inputs`, and
+`broad_market_current`. Accounting requires the first four at 100% VTI/SPY/BIL
+coverage but does not require the broad universe. Sunday uses the same four as required
+inputs and treats broad-market and challenger lanes as optional, so it reports
+`BENCHMARK_ONLY_SAFE` while remaining `DEGRADED` until those inputs exist. Screening
+and candidate generation continue to require `broad_market_current`; broad-market
+failure can never be promoted into full readiness.
+
 Task delivery targets are expressed in `America/Toronto`; exchange sessions and closes
 are calculated in `America/New_York`: pre-open by 08:10, exception
 monitoring by 09:55 and 15:25, terminal review at XNYS close +20 minutes, accounting at

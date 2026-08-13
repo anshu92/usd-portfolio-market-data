@@ -89,8 +89,11 @@ GROUPS: dict[str, GroupContract] = {
     ),
     "total_returns": GroupContract(
         "total_returns",
-        ("distributions.parquet", "benchmark-total-returns.parquet"),
-        ("identity", "market"),
+        (
+            "benchmark-distributions.parquet",
+            "benchmark-total-returns.parquet",
+            "benchmark-certification.json",
+        ),
         optional=True,
     ),
 }
@@ -103,16 +106,18 @@ LEGACY_PRIMARY_KEYS: dict[str, tuple[str, ...]] = {
     "unmatched-tickers.csv": ("security_id",),
     "yahoo-ohlcv-320.parquet": ("security_id", "session_date"),
     "yahoo-splits.parquet": ("security_id", "event_date", "split_factor"),
-    "distributions.parquet": ("distribution_id",),
+    "benchmark-distributions.parquet": ("distribution_id",),
     "benchmark-total-returns.parquet": ("security_id", "session_date"),
+    "benchmark-certification.json": (),
 }
 LEGACY_SOURCES = {
     "security-universe.csv": "Nasdaq Trader Symbol Directory",
     "unmatched-tickers.csv": "Derived identifier reconciliation",
     "yahoo-ohlcv-320.parquet": "defeatbeta/yahoo-finance-data and Yahoo Finance Chart API",
     "yahoo-splits.parquet": "defeatbeta/yahoo-finance-data and Yahoo Finance Chart API",
-    "distributions.parquet": "Yahoo Finance Chart API",
+    "benchmark-distributions.parquet": "Yahoo Finance Chart API",
     "benchmark-total-returns.parquet": "Yahoo Finance Chart API",
+    "benchmark-certification.json": "Producer benchmark certification",
 }
 
 
@@ -151,6 +156,18 @@ def physical_schema(
         return tuple((str(column[0]), str(column[1])) for column in description)
     if path.suffix == ".csv":
         return _csv_schema(path)
+    if path.suffix == ".json":
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ReliabilityContractError(
+                f"JSON dataset is invalid: {path.name}"
+            ) from exc
+        if not isinstance(value, dict):
+            raise ReliabilityContractError(
+                f"JSON dataset root is not an object: {path.name}"
+            )
+        return tuple((str(name), "JSON") for name in sorted(value))
     raise ReliabilityContractError(f"Unsupported dataset file: {path.name}")
 
 
@@ -159,6 +176,8 @@ def _row_count(con: duckdb.DuckDBPyConnection, path: Path) -> int:
         return int(
             con.execute("SELECT count(*) FROM read_parquet(?)", [str(path)]).fetchone()[0]
         )
+    if path.suffix == ".json":
+        return 1
     with path.open(newline="", encoding="utf-8-sig") as handle:
         reader = csv.reader(handle)
         next(reader, None)

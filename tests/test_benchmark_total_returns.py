@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import duckdb
 import pytest
 
+from enrichment_contract import CONTRACTS, write_parquet
 from reliability_contract import apply_dataset_groups
 from test_reliability_contract import _file_record, _write_grouped_release
 
@@ -26,6 +27,20 @@ def weekday_sessions(end: date, count: int) -> list[date]:
 
 def prepare_release(directory: Path) -> tuple[Path, list[date], list[float]]:
     manifest = _write_grouped_release(directory)
+    universe = directory / "security-universe.csv"
+    universe.write_text(
+        "security_id,ticker,exchange_mic,security_type,currency,universe_admission_status\n"
+        "ARCX:VTI,VTI,ARCX,ETF,USD,ADMITTED_ETF\n"
+        "ARCX:SPY,SPY,ARCX,ETF,USD,ADMITTED_ETF\n"
+        "ARCX:BIL,BIL,ARCX,ETF,USD,ADMITTED_ETF\n",
+        encoding="utf-8",
+    )
+    master = directory / "security-master.parquet"
+    master_rows = [
+        {"security_id": f"ARCX:{ticker}", "ticker": ticker, "cik": cik}
+        for ticker, cik in (("VTI", "0000000001"), ("SPY", "0000000002"), ("BIL", "0000000003"))
+    ]
+    write_parquet(master, CONTRACTS[master.name], master_rows)
     sessions = weekday_sessions(date(2026, 7, 24), 160)
     closes = [100.0 + index * 0.1 for index in range(len(sessions))]
     prices = directory / "yahoo-ohlcv-320.parquet"
@@ -58,6 +73,8 @@ def prepare_release(directory: Path) -> tuple[Path, list[date], list[float]]:
         connection.close()
     replacement.replace(prices)
     records = {record["file"]: record for record in manifest["release_files"]}
+    records[universe.name] = _file_record(universe, 3)
+    records[master.name] = _file_record(master, 3)
     records[prices.name] = _file_record(prices, len(sessions))
     records["NOTICE.md"]["rows"] = 0
     manifest["release_files"] = list(records.values())
@@ -93,12 +110,18 @@ def write_source_payload(
     sessions: list[date],
     closes: list[float],
     *,
+    ticker: str = "VTI",
+    scale: float = 1.0,
     include_latest: bool = True,
 ) -> None:
     prior_session = sessions[0] - timedelta(days=1)
     source_sessions = [prior_session, *sessions]
-    source_closes = [closes[0] - 0.1, *closes]
-    dividends = {sessions[40]: 0.50, sessions[100]: 0.55, sessions[150]: 0.60}
+    source_closes = [(closes[0] - 0.1) * scale, *[value * scale for value in closes]]
+    dividends = {
+        sessions[40]: 0.50 * scale,
+        sessions[100]: 0.55 * scale,
+        sessions[150]: 0.60 * scale,
+    }
     adjusted = [source_closes[0]]
     for index in range(1, len(source_sessions)):
         cash = dividends.get(source_sessions[index], 0.0)
@@ -127,10 +150,18 @@ def write_source_payload(
                     "error": None,
                     "result": [
                         {
-                            "meta": {"symbol": "VTI", "currency": "USD"},
+                            "meta": {"symbol": ticker, "currency": "USD"},
                             "timestamp": timestamps,
                             "indicators": {
-                                "quote": [{"close": source_closes}],
+                                "quote": [
+                                    {
+                                        "open": [value - 0.1 for value in source_closes],
+                                        "high": [value + 0.2 for value in source_closes],
+                                        "low": [value - 0.2 for value in source_closes],
+                                        "close": source_closes,
+                                        "volume": [1000] * len(source_closes),
+                                    }
+                                ],
                                 "adjclose": [{"adjclose": adjusted}],
                             },
                             "events": {"dividends": events, "splits": {}},
@@ -143,13 +174,31 @@ def write_source_payload(
     )
 
 
-def arguments(release: Path, source: Path) -> SimpleNamespace:
+def write_sources(directory: Path, sessions: list[date], closes: list[float]) -> Path:
+    directory.mkdir()
+    for ticker, scale in (("VTI", 1.0), ("SPY", 2.0), ("BIL", 0.9)):
+        write_source_payload(
+            directory / f"{ticker}.json",
+            sessions,
+            closes,
+            ticker=ticker,
+            scale=scale,
+        )
+    return directory
+
+
+def arguments(release: Path, source_directory: Path) -> SimpleNamespace:
     return SimpleNamespace(
         release_dir=str(release),
-        benchmark_ticker="VTI",
-        source_json=str(source),
-        source_locator="https://query2.finance.yahoo.com/fixture/VTI",
+        identity_universe=None,
+        identity_observed_at="2026-07-24T20:30:00Z",
+        expected_session=None,
+        benchmark_tickers="VTI,SPY,BIL",
+        source_json_dir=str(source_directory),
         retrieved_at="2026-07-24T20:30:00Z",
+        certified_at="2026-07-24T20:30:00Z",
+        idempotency_key="accounting:2026-07-24:fixture",
+        quarantine_out=None,
     )
 
 
@@ -160,8 +209,7 @@ def test_certifies_current_distribution_adjusted_benchmark_lane(
     tmp_path: Path,
 ) -> None:
     release, sessions, closes = prepare_release(tmp_path / "release")
-    source = tmp_path / "vti.json"
-    write_source_payload(source, sessions, closes)
+    source = write_sources(tmp_path / "sources", sessions, closes)
 
     certification = benchmark_builder_module.attach(arguments(release, source))
     verified = json.loads((release / "manifest.json").read_text())
@@ -177,9 +225,10 @@ def test_certifies_current_distribution_adjusted_benchmark_lane(
     capabilities = decision_builder_module.capability_records(groups, release)
 
     assert certification["status"] == "CERTIFIED"
-    assert certification["sessions"] == 160
-    assert certification["weekly_observations"] >= 26
-    assert certification["distributions"] == 3
+    assert certification["coverage"] == {"required": 3, "valid": 3, "ratio": 1.0}
+    assert min(item["sessions"] for item in certification["securities"]) == 160
+    assert min(item["weekly_observations"] for item in certification["securities"]) >= 26
+    assert sum(item["cash_distributions"] for item in certification["securities"]) == 9
     assert groups["total_returns"]["state"] == "READY_NEW"
     assert capabilities["certified_total_returns"]["state"] == "READY"
     assert capabilities["funded_benchmark_inputs"]["state"] == "READY"
@@ -194,9 +243,17 @@ def test_enables_accounting_only_while_benchmark_retrieval_is_fresh(
     if shutil.which("zstd") is None:
         pytest.skip("zstd is required")
     release, sessions, closes = prepare_release(tmp_path / "release")
-    source = tmp_path / "vti.json"
-    write_source_payload(source, sessions, closes)
+    source = write_sources(tmp_path / "sources", sessions, closes)
     benchmark_builder_module.attach(arguments(release, source))
+    source_manifest_path = release / "manifest.json"
+    source_manifest = json.loads(source_manifest_path.read_text())
+    for group in source_manifest["dataset_groups"]:
+        if group["group_id"] in {"identity", "market"}:
+            group["state"] = "STALE_DISABLED"
+            group["freshness"]["state"] = "STALE"
+            if group["group_id"] == "market":
+                group["freshness"]["lag_eligible_sessions"] = 1
+    source_manifest_path.write_text(json.dumps(source_manifest), encoding="utf-8")
 
     fresh_output = tmp_path / "fresh-decision"
     decision_builder_module.build(
@@ -214,6 +271,10 @@ def test_enables_accounting_only_while_benchmark_retrieval_is_fresh(
     )
     assert fresh_accounting["status"] == "READY"
     assert "BENCHMARK_ONLY_SAFE" in fresh_accounting["operating_modes"]
+    sunday = json.loads((fresh_output / "phase-packs/sunday.json").read_text())
+    assert sunday["status"] == "DEGRADED"
+    assert "BENCHMARK_ONLY_SAFE" in sunday["operating_modes"]
+    assert "CHALLENGER_BLOCKED" in sunday["operating_modes"]
     phase_result = decision_verify_module.evaluate_phase_at(
         fresh_output,
         "accounting",
@@ -250,18 +311,18 @@ def test_stale_source_cannot_publish_benchmark_lane(
 ) -> None:
     release, sessions, closes = prepare_release(tmp_path / "release")
     manifest_before = (release / "manifest.json").read_bytes()
-    source = tmp_path / "stale-vti.json"
-    write_source_payload(source, sessions, closes, include_latest=False)
+    source = write_sources(tmp_path / "stale-sources", sessions, closes)
+    write_source_payload(
+        source / "VTI.json", sessions, closes, ticker="VTI", include_latest=False
+    )
 
     assert (
         benchmark_builder_module.main(
             [
                 "--release-dir",
                 str(release),
-                "--source-json",
+                "--source-json-dir",
                 str(source),
-                "--source-locator",
-                "https://query2.finance.yahoo.com/fixture/VTI",
                 "--retrieved-at",
                 "2026-07-24T20:30:00Z",
             ]
@@ -269,7 +330,7 @@ def test_stale_source_cannot_publish_benchmark_lane(
         == 2
     )
     assert (release / "manifest.json").read_bytes() == manifest_before
-    assert not (release / "distributions.parquet").exists()
+    assert not (release / "benchmark-distributions.parquet").exists()
     assert not (release / "benchmark-total-returns.parquet").exists()
 
 
@@ -277,23 +338,65 @@ def test_unreconciled_adjusted_close_cannot_publish_benchmark_lane(
     benchmark_builder_module, tmp_path: Path
 ) -> None:
     release, sessions, closes = prepare_release(tmp_path / "release")
-    source = tmp_path / "unreconciled-vti.json"
-    write_source_payload(source, sessions, closes)
-    payload = json.loads(source.read_text())
+    source = write_sources(tmp_path / "unreconciled-sources", sessions, closes)
+    source_file = source / "VTI.json"
+    payload = json.loads(source_file.read_text())
     payload["chart"]["result"][0]["indicators"]["adjclose"][0]["adjclose"][-1] *= 1.01
-    source.write_text(json.dumps(payload), encoding="utf-8")
+    source_file.write_text(json.dumps(payload), encoding="utf-8")
 
     assert benchmark_builder_module.main(
         [
             "--release-dir",
             str(release),
-            "--source-json",
+            "--source-json-dir",
             str(source),
-            "--source-locator",
-            "https://query2.finance.yahoo.com/fixture/VTI",
             "--retrieved-at",
             "2026-07-24T20:30:00Z",
         ]
     ) == 2
-    assert not (release / "distributions.parquet").exists()
+    assert not (release / "benchmark-distributions.parquet").exists()
     assert not (release / "benchmark-total-returns.parquet").exists()
+
+
+def test_failed_correction_removes_carried_forward_lane_and_records_quarantine(
+    benchmark_builder_module, verify_module, tmp_path: Path
+) -> None:
+    release, sessions, closes = prepare_release(tmp_path / "release")
+    valid = write_sources(tmp_path / "valid-sources", sessions, closes)
+    benchmark_builder_module.attach(arguments(release, valid))
+    stale = write_sources(tmp_path / "stale-sources", sessions, closes)
+    write_source_payload(
+        stale / "SPY.json",
+        sessions,
+        closes,
+        ticker="SPY",
+        scale=2.0,
+        include_latest=False,
+    )
+    quarantine = tmp_path / "benchmark-quarantine.json"
+
+    assert benchmark_builder_module.main(
+        [
+            "--release-dir",
+            str(release),
+            "--source-json-dir",
+            str(stale),
+            "--retrieved-at",
+            "2026-07-24T21:00:00Z",
+            "--quarantine-out",
+            str(quarantine),
+        ]
+    ) == 2
+
+    manifest = json.loads((release / "manifest.json").read_text())
+    groups = {item["group_id"]: item for item in manifest["dataset_groups"]}
+    assert groups["total_returns"]["state"] == "NOT_CONFIGURED"
+    assert manifest["candidate_attempt_failures"][-1]["attempt_state"] == "QUARANTINED"
+    assert json.loads(quarantine.read_text())["state"] == "QUARANTINED"
+    connection = duckdb.connect()
+    try:
+        verify_module.verify_dataset_groups(
+            connection, release, manifest, require_production=True
+        )
+    finally:
+        connection.close()

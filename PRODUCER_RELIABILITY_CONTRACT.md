@@ -44,15 +44,17 @@ copied independently from a different release.
 | `institutional` | `institutional-holdings-13f.parquet`, `institutional-ownership-signals.parquet` | `identity` |
 | `short_interest` | `finra-short-interest.parquet` | `identity` |
 | `analyst_estimates` | `analyst-estimates.parquet`, when licensed | `identity`; optional |
-| `total_returns` | `distributions.parquet`, `benchmark-total-returns.parquet` | `identity`, `market`; optional and all-or-none |
+| `total_returns` | `benchmark-distributions.parquet`, `benchmark-total-returns.parquet`, `benchmark-certification.json` | validated embedded benchmark-identity subset; optional and all-or-none |
 
 `NOTICE.md` is release-level metadata.
 
-The `total_returns` group is `READY_NEW` only when its VTI source response reaches the
-market group's expected completed XNYS session, raw closes reconcile to the canonical
-market bytes, cash distributions reconcile to adjusted-close returns, and coverage is
-at least 140 sessions and 26 weekly observations. Otherwise both optional files are
-omitted and benchmark/accounting capabilities remain blocked.
+The independent `total_returns` group is `READY_NEW` only when VTI, SPY, and BIL all
+reach the expected completed XNYS session, have current validated identities, and
+cash distributions and corporate actions reconcile to their adjusted-close return
+indexes. Every security must provide at least 140 sessions and 26 weekly observations.
+Otherwise all three benchmark assets are omitted, the attempt is quarantined, and
+benchmark/accounting capabilities remain blocked. A stale broad-market group does not
+invalidate a complete certified benchmark subset.
 
 Every referenced `security_id` must exist in the active `security-master`
 contained by the same composite. Historical master rows may be retained to

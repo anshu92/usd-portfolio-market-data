@@ -26,6 +26,14 @@ on:
         description: "Immutable market-data release tag used as the only source"
         required: false
         type: string
+      phase:
+        description: "Phase to validate at the supplied decision cutoff"
+        required: false
+        type: string
+      as_of:
+        description: "RFC3339 decision cutoff for exact phase validation"
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -120,8 +128,9 @@ jobs:
           done
           for asset in \
             analyst-estimates.parquet \
-            distributions.parquet \
-            benchmark-total-returns.parquet
+            benchmark-distributions.parquet \
+            benchmark-total-returns.parquet \
+            benchmark-certification.json
           do
             if jq -e --arg name "$asset" '.assets[] | select(.name == $name)' \
               staging/github-release.json >/dev/null
@@ -146,7 +155,16 @@ jobs:
             --producer-commit "$GITHUB_SHA"
 
       - name: Verify decision-support artifact
-        run: python verify-decision-support.py --dist dist
+        shell: bash
+        run: |
+          python verify-decision-support.py --dist dist
+          if [[ -n "${{ inputs.phase }}" && -n "${{ inputs.as_of }}" ]]; then
+            python verify-decision-support.py \
+              --dist dist \
+              --phase "${{ inputs.phase }}" \
+              --as-of "${{ inputs.as_of }}" \
+              --allow-degraded
+          fi
 
       - name: Enforce compact artifact size limit
         run: python verify-workflow-artifact-size.py dist

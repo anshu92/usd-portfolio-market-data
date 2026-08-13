@@ -70,8 +70,9 @@ REQUIRED_SOURCE_FILES = (
 
 OPTIONAL_SOURCE_FILES = (
     "analyst-estimates.parquet",
-    "distributions.parquet",
+    "benchmark-distributions.parquet",
     "benchmark-total-returns.parquet",
+    "benchmark-certification.json",
 )
 
 EXPECTED_TABLES = (
@@ -136,6 +137,13 @@ class CapabilityContract:
 CAPABILITIES = {
     "identity": CapabilityContract("identity", "identity", 24 * 60 * 60),
     "historical_market": CapabilityContract("historical_market", "market"),
+    "broad_market_current": CapabilityContract("broad_market_current", "market"),
+    "benchmark_identity": CapabilityContract(
+        "benchmark_identity", "total_returns", 24 * 60 * 60
+    ),
+    "benchmark_market_current": CapabilityContract(
+        "benchmark_market_current", "total_returns", 60 * 60
+    ),
     "current_catalysts": CapabilityContract(
         "current_catalysts", "filings_events", 20 * 60
     ),
@@ -180,12 +188,13 @@ PHASES = {
     "sunday": PhaseContract(
         phase_id="sunday",
         required_capabilities=(
-            "identity",
-            "historical_market",
+            "benchmark_identity",
+            "benchmark_market_current",
             "certified_total_returns",
             "funded_benchmark_inputs",
         ),
         optional_capabilities=(
+            "broad_market_current",
             "current_catalysts",
             "point_in_time_expectations",
             "macro_industry",
@@ -198,7 +207,7 @@ PHASES = {
         phase_id="pre_open",
         required_capabilities=(
             "identity",
-            "historical_market",
+            "broad_market_current",
             "current_catalysts",
             "point_in_time_expectations",
             "rapid_event_news",
@@ -211,7 +220,7 @@ PHASES = {
         phase_id="execution_research",
         required_capabilities=(
             "identity",
-            "historical_market",
+            "broad_market_current",
             "current_catalysts",
             "point_in_time_expectations",
             "primary_evidence",
@@ -241,7 +250,7 @@ PHASES = {
         phase_id="terminal_review",
         required_capabilities=(
             "identity",
-            "historical_market",
+            "broad_market_current",
             "current_catalysts",
             "primary_evidence",
         ),
@@ -255,7 +264,8 @@ PHASES = {
     "accounting": PhaseContract(
         phase_id="accounting",
         required_capabilities=(
-            "identity",
+            "benchmark_identity",
+            "benchmark_market_current",
             "certified_total_returns",
             "funded_benchmark_inputs",
         ),

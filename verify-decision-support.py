@@ -12,6 +12,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Mapping
@@ -159,6 +160,7 @@ def verify_private_schema(connection: sqlite3.Connection) -> None:
 
 
 def expected_operating_modes(
+    phase_id: str,
     required: list[Mapping[str, object]],
     optional: list[Mapping[str, object]],
     external: list[Mapping[str, object]],
@@ -171,12 +173,17 @@ def expected_operating_modes(
         value for value in optional if value.get("state") != "READY"
     ]
     modes = ["ARTIFACT_VALID"]
-    if all(
+    if phase_id in {"sunday", "accounting"} and all(
         capabilities[value].get("state") == "READY"
-        for value in ("certified_total_returns", "funded_benchmark_inputs")
+        for value in (
+            "benchmark_identity",
+            "benchmark_market_current",
+            "certified_total_returns",
+            "funded_benchmark_inputs",
+        )
     ):
         modes.append("BENCHMARK_ONLY_SAFE")
-    if not unavailable_required:
+    if phase_id != "accounting" and not unavailable_required and not unavailable_optional:
         modes.append("CHALLENGER_RESEARCH_READY")
     if external:
         modes.append("LIVE_SNAPSHOT_REQUIRED")
@@ -311,7 +318,11 @@ def verify_phase_pack(
             f"Incorrect optional-capability diagnostics for {phase_id}"
         )
     modes = expected_operating_modes(
-        required, optional, pack["external_capabilities"], manifest_capabilities
+        phase_id,
+        required,
+        optional,
+        pack["external_capabilities"],
+        manifest_capabilities,
     )
     if pack.get("operating_modes") != modes or pack.get("decision_mode") != modes[-1]:
         raise DecisionSupportVerificationError(
@@ -346,6 +357,8 @@ def verify_phase_pack(
 
 
 def verify(directory: Path) -> dict[str, object]:
+    verification_started = time.perf_counter()
+    decompression_seconds = 0.0
     root = directory.resolve()
     manifest = load_json(root / MANIFEST_FILENAME, "decision-support manifest")
     if manifest.get("schema_version") != SCHEMA_VERSION:
@@ -516,12 +529,19 @@ def verify(directory: Path) -> dict[str, object]:
             raise DecisionSupportVerificationError(
                 f"Source-watermark state mismatch: {capability_id}"
             )
-    for capability_id in ("certified_total_returns", "funded_benchmark_inputs"):
+    for capability_id in (
+        "benchmark_identity",
+        "benchmark_market_current",
+        "certified_total_returns",
+        "funded_benchmark_inputs",
+    ):
         record = capabilities[capability_id]
         if record.get("state") == "READY" and (
             record.get("sessions", 0) < BENCHMARK_MINIMUM_SESSIONS
             or record.get("weekly_observations", 0)
             < BENCHMARK_MINIMUM_WEEKLY_OBSERVATIONS
+            or record.get("securities") != 3
+            or record.get("coverage") != 1.0
         ):
             raise DecisionSupportVerificationError(
                 f"Certified benchmark history is insufficient: {capability_id}"
@@ -615,8 +635,10 @@ def verify(directory: Path) -> dict[str, object]:
     with tempfile.TemporaryDirectory(prefix="verify-decision-support-") as temp:
         database_path = Path(temp) / "decision-support.sqlite"
         evidence_path = Path(temp) / "evidence-packets.jsonl"
+        decompression_started = time.perf_counter()
         decompress_database(compressed, database_path)
         decompress_database(root / EVIDENCE_PACKETS_FILENAME, evidence_path)
+        decompression_seconds = time.perf_counter() - decompression_started
         packet_ids: list[str] = []
         with evidence_path.open(encoding="utf-8") as handle:
             for line_number, line in enumerate(handle, start=1):
@@ -713,6 +735,11 @@ def verify(directory: Path) -> dict[str, object]:
                             "weekly_observations": row[7],
                             "minimum_sessions": row[8],
                             "minimum_weekly_observations": row[9],
+                            "securities": row[10],
+                            "coverage": row[11],
+                            "expected_coverage": row[12],
+                            "maximum_session": row[13],
+                            "identity_subset_sha256": row[14],
                         }
                         if row[6] is not None
                         else {}
@@ -722,7 +749,9 @@ def verify(directory: Path) -> dict[str, object]:
                     """
                     SELECT capability_id, state, reason, source_group, observed_at,
                            maximum_age_seconds, sessions, weekly_observations,
-                           minimum_sessions, minimum_weekly_observations
+                           minimum_sessions, minimum_weekly_observations,
+                           securities, coverage, expected_coverage,
+                           maximum_session, identity_subset_sha256
                     FROM capability_health
                     """
                 )
@@ -828,7 +857,7 @@ def verify(directory: Path) -> dict[str, object]:
                         WHERE certification_status <> 'CERTIFIED'
                            OR distribution_lineage_sha256 IS NULL
                            OR corporate_action_lineage_sha256 IS NULL
-                           OR known_at_utc IS NULL OR revision IS NULL
+                           OR known_at_utc IS NULL OR source_revision IS NULL
                            OR source_locator IS NULL
                         """
                     ).fetchone()[0]
@@ -953,11 +982,23 @@ def verify(directory: Path) -> dict[str, object]:
         raise DecisionSupportVerificationError(
             "Phase-pack directory contains unexpected files"
         )
+    total_seconds = time.perf_counter() - verification_started
     return {
         "status": "VALID",
         "source_release_tag": tag,
         "database_bytes": compressed.stat().st_size,
+        "database_representation": "COMPRESSED_ZSTANDARD",
+        "decompressed_database_bytes": uncompressed_size,
         "phase_packs": len(PHASES),
+        "latency": {
+            "download_seconds": None,
+            "download_included": False,
+            "decompression_seconds": decompression_seconds,
+            "integrity_schema_validation_seconds_excluding_decompression": max(
+                0.0, total_seconds - decompression_seconds
+            ),
+            "total_post_download_seconds": total_seconds,
+        },
     }
 
 
