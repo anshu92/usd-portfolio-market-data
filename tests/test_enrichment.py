@@ -483,6 +483,10 @@ def test_official_archive_registry_and_workflow_headers() -> None:
     assert "python build-benchmark-total-returns.py" in workflow
     assert "producer_phase_deadline" in workflow
     assert "build-market-coverage-diagnostic.py" in workflow
+    assert "--out dist/diagnostics/market-coverage-diagnostic.json" in workflow
+    assert "--quarantine-out dist/diagnostics/benchmark-quarantine.json" in workflow
+    assert "          path: dist\n" in workflow
+    assert "${{ runner.temp }}/market-coverage-diagnostic.json" not in workflow
     assert "--benchmark-tickers" not in workflow
     assert "continue-on-error: ${{ steps.inputs.outputs.mode == 'full' }}" in workflow
     assert 'candidate="$RUNNER_TEMP/candidate-release"' in workflow

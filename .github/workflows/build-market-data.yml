@@ -401,11 +401,12 @@ jobs:
       - name: Build frozen-denominator market coverage diagnostic
         if: always() && steps.inputs.outputs.mode == 'full'
         run: |
+          mkdir -p dist/diagnostics
           python build-market-coverage-diagnostic.py \
             --manifest dist/manifest.json \
             --universe dist/security-universe.csv \
             --prices dist/yahoo-ohlcv-320.parquet \
-            --out "$RUNNER_TEMP/market-coverage-diagnostic.json"
+            --out dist/diagnostics/market-coverage-diagnostic.json
 
       - name: Download official SEC bulk sources
         if: steps.inputs.outputs.mode == 'full' && steps.inputs.outputs.refresh_enrichment == 'true'
@@ -536,7 +537,7 @@ jobs:
             --release-dir dist \
             --identity-universe "$RUNNER_TEMP/candidate-release/security-universe.csv" \
             --idempotency-key "${{ steps.inputs.outputs.idempotency_key }}" \
-            --quarantine-out "$RUNNER_TEMP/benchmark-quarantine.json"
+            --quarantine-out dist/diagnostics/benchmark-quarantine.json
           )
           if [[ -n "${{ steps.inputs.outputs.expected_session }}" ]]; then
             args+=(--expected-session "${{ steps.inputs.outputs.expected_session }}")
@@ -613,24 +614,14 @@ jobs:
             dist/unmatched-tickers.csv \
             dist/NOTICE.md \
             dist/release-notes.md \
-            ${{ runner.temp }}/market-coverage-diagnostic.json \
-            ${{ runner.temp }}/benchmark-quarantine.json
+            dist/diagnostics/*.json
 
       - name: Upload seven-day diagnostic artifact
         if: always() && steps.diagnostic_artifact_size.outcome == 'success'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ steps.inputs.outputs.artifact_name }}
-          path: |
-            dist/*.parquet
-            dist/*.json
-            dist/security-universe.csv
-            dist/manifest.json
-            dist/unmatched-tickers.csv
-            dist/NOTICE.md
-            dist/release-notes.md
-            ${{ runner.temp }}/market-coverage-diagnostic.json
-            ${{ runner.temp }}/benchmark-quarantine.json
+          path: dist
           if-no-files-found: warn
           retention-days: 7
           compression-level: 9
