@@ -173,3 +173,23 @@ jobs:
           if-no-files-found: error
           retention-days: 90
           compression-level: 9
+
+  request_durable_publication:
+    needs: proof
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Request durable content-addressed publication
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh workflow run publish-durable-readiness-proof.yml \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref main \
+            -f proof_run_id="$GITHUB_RUN_ID" \
+            -f phase="${{ inputs.phase }}" \
+            -f decision_run_id="${{ inputs.decision_run_id }}"

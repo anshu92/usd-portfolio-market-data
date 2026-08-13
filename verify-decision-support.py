@@ -210,7 +210,7 @@ def verify_windows(pack: Mapping[str, object], phase_id: str) -> None:
             window.get("phase_decision_cutoff_utc"), "phase_decision_cutoff_utc"
         )
         expires = parse_utc(window.get("expires_at_utc"), "expires_at_utc")
-        if not not_before <= decision < expires:
+        if not not_before <= decision <= expires:
             raise DecisionSupportVerificationError(
                 f"Invalid phase-window ordering: {phase_id}"
             )
@@ -1022,7 +1022,7 @@ def evaluate_phase_at(
             for window in pack["phase_windows"]
             if parse_utc(window["not_before_utc"], "not_before_utc")
             <= instant
-            < parse_utc(window["expires_at_utc"], "expires_at_utc")
+            <= parse_utc(window["expires_at_utc"], "expires_at_utc")
         ),
         None,
     )
@@ -1057,6 +1057,21 @@ def evaluate_phase_at(
         "status": "USABLE" if usable else "BLOCKED",
         "phase_id": phase_id,
         "as_of_utc": instant.isoformat().replace("+00:00", "Z"),
+        "phase_decision_cutoff_utc": (
+            active_window.get("phase_decision_cutoff_utc")
+            if active_window
+            else pack.get("phase_decision_cutoff_utc")
+        ),
+        "not_before_utc": (
+            active_window.get("not_before_utc")
+            if active_window
+            else pack.get("not_before_utc")
+        ),
+        "expires_at_utc": (
+            active_window.get("expires_at_utc")
+            if active_window
+            else pack.get("expires_at_utc")
+        ),
         "active_window_id": active_window.get("window_id") if active_window else None,
         "decision_mode": pack.get("decision_mode"),
         "rejection_codes": sorted(set(reasons)),
@@ -1071,13 +1086,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--allow-degraded", action="store_true")
     args = parser.parse_args(argv)
     try:
+        if args.phase and not args.as_of:
+            raise DecisionSupportVerificationError(
+                "--phase requires an explicit --as-of decision instant"
+            )
+        if args.as_of and not args.phase:
+            raise DecisionSupportVerificationError("--as-of requires --phase")
         result = verify(Path(args.dist))
         if args.phase:
-            as_of = (
-                parse_utc(args.as_of, "as_of")
-                if args.as_of
-                else datetime.now(timezone.utc)
-            )
+            as_of = parse_utc(args.as_of, "as_of")
             result["phase_evaluation"] = evaluate_phase_at(
                 Path(args.dist), args.phase, as_of, allow_degraded=args.allow_degraded
             )

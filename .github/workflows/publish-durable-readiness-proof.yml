@@ -1,0 +1,278 @@
+name: Publish durable readiness proof
+
+on:
+  workflow_dispatch:
+    inputs:
+      proof_run_id:
+        description: "Successful Publish phase readiness proof run ID"
+        required: true
+        type: string
+      phase:
+        description: "Accepted phase recorded by the proof"
+        required: true
+        type: choice
+        options: [accounting, sunday]
+      decision_run_id:
+        description: "Decision-support workflow run ID recorded by the proof"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: durable-readiness-proof-${{ inputs.phase }}-${{ inputs.decision_run_id }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Resolve exact proof run and artifact
+        id: proof
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PROOF_RUN_ID: ${{ inputs.proof_run_id }}
+          PHASE: ${{ inputs.phase }}
+          DECISION_RUN_ID: ${{ inputs.decision_run_id }}
+        run: |
+          set -euo pipefail
+          [[ "$PROOF_RUN_ID" =~ ^[0-9]+$ && "$DECISION_RUN_ID" =~ ^[0-9]+$ ]] || {
+            echo "Run IDs must be numeric" >&2
+            exit 2
+          }
+          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${PROOF_RUN_ID}" \
+            > "$RUNNER_TEMP/proof-run.json"
+          jq -e --arg repo "$GITHUB_REPOSITORY" '
+            .head_repository.full_name == $repo and
+            .head_branch == "main" and
+            .path == ".github/workflows/publish-readiness-proof.yml" and
+            .event == "workflow_dispatch" and
+            .status == "completed" and
+            .conclusion == "success"
+          ' "$RUNNER_TEMP/proof-run.json" >/dev/null
+          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${PROOF_RUN_ID}/artifacts" \
+            > "$RUNNER_TEMP/proof-artifacts.json"
+          expected_name="readiness-proof-${PHASE}-${DECISION_RUN_ID}"
+          artifact_count="$(jq --arg name "$expected_name" \
+            '[.artifacts[] | select(.name == $name and .expired == false)] | length' \
+            "$RUNNER_TEMP/proof-artifacts.json")"
+          [[ "$artifact_count" == "1" ]] || {
+            echo "Expected one unexpired proof artifact named $expected_name" >&2
+            exit 2
+          }
+          artifact_id="$(jq -r --arg name "$expected_name" \
+            '.artifacts[] | select(.name == $name and .expired == false) | .id' \
+            "$RUNNER_TEMP/proof-artifacts.json")"
+          echo "artifact_id=$artifact_id" >> "$GITHUB_OUTPUT"
+
+      - name: Download exact proof artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ steps.proof.outputs.artifact_id }}
+          path: ${{ runner.temp }}/proof
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.proof_run_id }}
+          github-token: ${{ github.token }}
+          digest-mismatch: error
+
+      - name: Validate proof identity and resolve decision artifact
+        id: decision
+        shell: bash
+        env:
+          PHASE: ${{ inputs.phase }}
+          DECISION_RUN_ID: ${{ inputs.decision_run_id }}
+        run: |
+          set -euo pipefail
+          proof="$RUNNER_TEMP/proof/readiness-proof.json"
+          [[ -f "$proof" && ! -L "$proof" ]] || {
+            echo "Proof artifact does not contain a regular readiness-proof.json" >&2
+            exit 2
+          }
+          jq -e --arg phase "$PHASE" --argjson decision_run "$DECISION_RUN_ID" '
+            .schema_version == "1.0.0" and
+            .status == "PHASE_USABLE_PROOF" and
+            .phase == $phase and
+            (.phase_transition.to == "READY" or .phase_transition.to == "DEGRADED") and
+            .phase_transition.operating_mode == "BENCHMARK_ONLY_SAFE" and
+            .decision_support.workflow_run_id == $decision_run and
+            .exact_validator_result.status == "VALID" and
+            .exact_validator_result.phase_evaluation.status == "USABLE" and
+            .exact_validator_result.phase_evaluation.phase_id == $phase and
+            ([.tests[]] | all(. == "PASS"))
+          ' "$proof" >/dev/null
+          decision_artifact_id="$(jq -r '.decision_support.artifact_id' "$proof")"
+          decision_commit="$(jq -r '.decision_support.producer_commit' "$proof")"
+          [[ "$decision_artifact_id" =~ ^[0-9]+$ ]] || exit 2
+          [[ "$decision_commit" =~ ^[0-9a-f]{40}$ ]] || exit 2
+          echo "artifact_id=$decision_artifact_id" >> "$GITHUB_OUTPUT"
+          echo "commit=$decision_commit" >> "$GITHUB_OUTPUT"
+
+      - name: Check out exact decision producer and validator commit
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ steps.decision.outputs.commit }}
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.13.14"
+          cache: pip
+          cache-dependency-path: requirements-market-data.txt
+
+      - name: Install reviewed dependencies
+        run: python -m pip install --disable-pip-version-check --require-hashes -r requirements-market-data.txt
+
+      - name: Download exact accepted decision artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ steps.decision.outputs.artifact_id }}
+          path: staging/decision
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.decision_run_id }}
+          github-token: ${{ github.token }}
+          digest-mismatch: error
+
+      - name: Revalidate exact proof decision and phase-window terminology
+        id: evidence
+        shell: bash
+        env:
+          PHASE: ${{ inputs.phase }}
+        run: |
+          set -euo pipefail
+          proof="$RUNNER_TEMP/proof/readiness-proof.json"
+          pack="staging/decision/phase-packs/${PHASE}.json"
+          as_of="$(jq -r '.exact_validator_result.phase_evaluation.as_of_utc' "$proof")"
+          validator_args=(
+            python verify-decision-support.py
+            --dist staging/decision
+            --phase "$PHASE"
+            --as-of "$as_of"
+          )
+          if [[ "$PHASE" == "sunday" ]]; then
+            validator_args+=(--allow-degraded)
+          fi
+          "${validator_args[@]}" > "$RUNNER_TEMP/exact-phase-result.json"
+          jq -e '.phase_evaluation.status == "USABLE"' \
+            "$RUNNER_TEMP/exact-phase-result.json" >/dev/null
+          python - "$proof" "$pack" <<'PY'
+          import json
+          import sys
+          from datetime import datetime
+
+          proof = json.load(open(sys.argv[1], encoding="utf-8"))
+          pack = json.load(open(sys.argv[2], encoding="utf-8"))
+          evaluation = proof["exact_validator_result"]["phase_evaluation"]
+          as_of = datetime.fromisoformat(evaluation["as_of_utc"].replace("Z", "+00:00"))
+          not_before = datetime.fromisoformat(pack["not_before_utc"].replace("Z", "+00:00"))
+          expires = datetime.fromisoformat(pack["expires_at_utc"].replace("Z", "+00:00"))
+          if not not_before <= as_of <= expires:
+              raise SystemExit("Proof as_of_utc is outside the inclusive phase window")
+          if evaluation.get("active_window_id") != pack["phase_windows"][0]["window_id"]:
+              raise SystemExit("Proof active window does not match the phase pack")
+          PY
+          echo "as_of=$as_of" >> "$GITHUB_OUTPUT"
+          echo "cutoff=$(jq -r '.phase_decision_cutoff_utc' "$pack")" >> "$GITHUB_OUTPUT"
+          echo "not_before=$(jq -r '.not_before_utc' "$pack")" >> "$GITHUB_OUTPUT"
+          echo "expires=$(jq -r '.expires_at_utc' "$pack")" >> "$GITHUB_OUTPUT"
+
+      - name: Build content-addressed durable bundle
+        id: bundle
+        shell: bash
+        env:
+          PHASE: ${{ inputs.phase }}
+          DECISION_RUN_ID: ${{ inputs.decision_run_id }}
+          PROOF_RUN_ID: ${{ inputs.proof_run_id }}
+          AS_OF_UTC: ${{ steps.evidence.outputs.as_of }}
+          PHASE_DECISION_CUTOFF_UTC: ${{ steps.evidence.outputs.cutoff }}
+          NOT_BEFORE_UTC: ${{ steps.evidence.outputs.not_before }}
+          EXPIRES_AT_UTC: ${{ steps.evidence.outputs.expires }}
+        run: |
+          set -euo pipefail
+          mkdir -p durable
+          cp "$RUNNER_TEMP/proof/readiness-proof.json" durable/readiness-proof.json
+          proof_sha="$(sha256sum durable/readiness-proof.json | awk '{print $1}')"
+          printf '%s  readiness-proof.json\n' "$proof_sha" \
+            > durable/readiness-proof.json.sha256
+          (cd durable && sha256sum -c readiness-proof.json.sha256)
+          tag="readiness-proof-${PHASE}-${DECISION_RUN_ID}"
+          python - "$proof_sha" <<'PY'
+          import os
+          import sys
+          from pathlib import Path
+
+          digest = sys.argv[1]
+          notes = f"""Immutable phase-readiness audit proof.
+
+          - Phase: `{os.environ['PHASE']}`
+          - Proof SHA-256: `{digest}`
+          - Proof workflow run: `{os.environ['PROOF_RUN_ID']}`
+          - Decision workflow run: `{os.environ['DECISION_RUN_ID']}`
+          - Validation `as_of_utc`: `{os.environ['AS_OF_UTC']}`
+          - `phase_decision_cutoff_utc`: `{os.environ['PHASE_DECISION_CUTOFF_UTC']}`
+          - Inclusive phase window: `{os.environ['NOT_BEFORE_UTC']}` through `{os.environ['EXPIRES_AT_UTC']}`
+
+          The decision artifact recorded by this proof is retained for audit/replay only.
+          Routine consumers must resolve the current discovery pointer and validate its captured
+          artifact at their actual as-of time.
+          """
+          Path("durable/release-notes.md").write_text(notes, encoding="utf-8")
+          PY
+          echo "proof_sha=$proof_sha" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Publish or reverify immutable non-latest release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.bundle.outputs.tag }}
+          PROOF_SHA: ${{ steps.bundle.outputs.proof_sha }}
+          DECISION_COMMIT: ${{ steps.decision.outputs.commit }}
+        run: |
+          set -euo pipefail
+          if gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" \
+            > "$RUNNER_TEMP/durable-release.json" 2>/dev/null
+          then
+            mkdir -p "$RUNNER_TEMP/existing-release"
+            gh release download "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --dir "$RUNNER_TEMP/existing-release"
+            cmp durable/readiness-proof.json \
+              "$RUNNER_TEMP/existing-release/readiness-proof.json"
+            cmp durable/readiness-proof.json.sha256 \
+              "$RUNNER_TEMP/existing-release/readiness-proof.json.sha256"
+          else
+            gh release create "$TAG" \
+              durable/readiness-proof.json \
+              durable/readiness-proof.json.sha256 \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$DECISION_COMMIT" \
+              --title "Durable ${TAG}" \
+              --notes-file durable/release-notes.md \
+              --latest=false
+            gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" \
+              > "$RUNNER_TEMP/durable-release.json"
+          fi
+          jq -e --arg tag "$TAG" --arg proof_digest "sha256:${PROOF_SHA}" '
+            .tag_name == $tag and
+            .draft == false and
+            .prerelease == false and
+            .immutable == true and
+            ([.assets[].name] | sort) == [
+              "readiness-proof.json",
+              "readiness-proof.json.sha256"
+            ] and
+            (.assets[] | select(.name == "readiness-proof.json") | .digest) == $proof_digest
+          ' "$RUNNER_TEMP/durable-release.json" >/dev/null
+          latest_tag="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq '.tag_name')"
+          [[ "$latest_tag" =~ ^market-data-[0-9]{8}T[0-9]{6}Z$ ]] || {
+            echo "Durable proof displaced the canonical latest release" >&2
+            exit 2
+          }
+          echo "Durable proof release: https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}"

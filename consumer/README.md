@@ -80,9 +80,12 @@ valuation, or other ready inputs.
 
 ## Routine decision-support import
 
-Routine V5 work should resolve `latest-decision-support-artifact.json`, verify its
-Actions run/artifact and immutable source-release identity with
-`verify-decision-support-pointer.py`, and then run:
+Routine V5 work should read `latest-decision-support-artifact.json` exactly once at the
+start of an attempted promotion. Keep those captured bytes for the entire attempt;
+never re-resolve the pointer between download and validation. Verify its repository,
+workflow ID/path/branch/event, producer commit, validator contract/set, immutable
+source tag and manifest, artifact ID/name/digest/size/expiry, decision-manifest digest,
+and promotion key with `verify-decision-support-pointer.py`, and then run:
 
 ```bash
 python verify-decision-support.py --dist staging/decision-support
@@ -90,7 +93,8 @@ zstd -d staging/decision-support/decision-support.sqlite.zst \
   -o staging/decision-support/decision-support.sqlite
 ```
 
-Download by the pointer's numeric `artifact_id`, not by artifact name. Stage the
+Download by the captured pointer's numeric `artifact_id`, not by artifact name and not
+by an ID copied from a report. Stage the
 validated bytes under the collision-safe promotion key
 `${source_release_tag}/${artifact_id}`. Never overwrite a prior build from the same
 source tag.
@@ -98,18 +102,23 @@ source tag.
 Before a phase is used, enforce its active UTC window and status programmatically:
 
 ```bash
+actual_as_of="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 python verify-decision-support.py \
   --dist staging/decision-support \
-  --phase pre_open \
-  --as-of "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  --phase accounting \
+  --as-of "$actual_as_of"
 ```
 
 This command checks all bytes first, then requires `as-of` to be in one of the pack's
-`[not_before_utc, expires_at_utc)` windows. It fails for `BLOCKED`; `DEGRADED` also
+inclusive `[not_before_utc, expires_at_utc]` windows. It fails for `BLOCKED`; `DEGRADED` also
 fails unless the caller explicitly supplies `--allow-degraded`. It also recomputes
 every required capability's age from `observed_at` and `maximum_age_seconds`, so a
 statically `READY` pack fails if an input was not yet known or has expired at the
-decision instant. Independently compare
+decision instant. A phase pack marked `READY` therefore does not mean that phase is
+currently usable. The CLI requires an explicit `--as-of` with `--phase`; consumers
+must never bypass `--phase accounting --as-of "$actual_as_of"`. `as_of_utc` is the
+actual validation instant, whereas `phase_decision_cutoff_utc` is the scheduled
+decision reference stored in the pack. Independently compare
 the task session to `valid_for_session` and treat `data_cutoff_utc` and each source
 watermark as the maximum facts known—not as build time.
 
@@ -139,6 +148,11 @@ research, `LIVE_SNAPSHOT_REQUIRED` still gates execution, and `CHALLENGER_BLOCKE
 requires candidate-specific rejection. Empty `candidate-funnel.parquet` and empty
 security actionability are intentional while the selector capability is
 `NOT_CONFIGURED`.
+
+`BENCHMARK_ONLY_SAFE` enables only the producer's public benchmark leg. It is not
+complete portfolio accounting. The consumer must separately validate its private
+positions, cash, lots, transactions, confirmations, and arithmetic state before any
+accounting result is accepted.
 
 Quote, halt/LULD, and broker integrations must emit the provider-neutral live-snapshot
 schema and pass `python verify-live-snapshot.py --snapshot live-snapshot.json`. The
@@ -187,6 +201,12 @@ Do not accept a proof bundle that synthesizes an unavailable lane, substitutes O
 for execution or certified total returns, or weakens a capability gate. Missing
 challenger data must result in candidate-specific rejection or
 `BENCHMARK_ONLY_SAFE`; unusable benchmark/accounting data remains blocked.
+Preserve each accepted proof byte-for-byte with its SHA-256 in an immutable durable
+location; a 90-day Actions artifact is only a transport copy. A historical proof's
+artifact ID is for replay/audit and must never replace pointer discovery for routine
+consumption. Sunday requires its own proof during the actual Sunday window using the
+then-current captured pointer and actual `as_of_utc`; accounting acceptance does not
+imply Sunday acceptance.
 
 The compact stream is not a replacement for the canonical release. Saturday replay,
 audit, raw SEC facts, detailed 13F holdings, and history beyond the recent hot window

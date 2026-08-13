@@ -18,6 +18,9 @@ consumer export workflow; it is not documentation-only.
 A production release contains:
 
 - `NOTICE.md`
+- `benchmark-certification.json` when the all-or-none benchmark lane certifies
+- `benchmark-distributions.parquet` when the all-or-none benchmark lane certifies
+- `benchmark-total-returns.parquet` when the all-or-none benchmark lane certifies
 - `corporate-events.parquet`
 - `earnings-and-guidance-events.parquet`
 - `finra-short-interest.parquet`
@@ -85,6 +88,11 @@ watermarks, deterministic rejection codes, and both the Toronto task timezone an
 York exchange timezone. The producer workflow runs after certified releases and on
 timezone-aware cadence backstops; consumers still enforce timestamps because GitHub
 cron is not an execution-time SLO.
+A pack whose static status is `READY` is not necessarily usable now. The consumer must
+capture an actual `as_of_utc` and pass the phase gate, which requires
+`not_before_utc <= as_of_utc <= expires_at_utc`. `as_of_utc` is a validation instant;
+`phase_decision_cutoff_utc` is the scheduled decision reference and is not renamed or
+replaced by a later validation time.
 
 See [DECISION_SUPPORT_CONTRACT.md](DECISION_SUPPORT_CONTRACT.md) for the exact source
 identity, phase-state, validation, live-snapshot, and failure contract.
@@ -92,6 +100,31 @@ identity, phase-state, validation, live-snapshot, and failure contract.
 `publish-decision-support-pointer.yml` validates the completed Actions artifact and
 commits `consumer/latest-decision-support-artifact.json`. The full historical release
 and its existing pointer remain unchanged for replay and audit consumers.
+Routine consumers resolve this pointer once per attempted promotion, download its
+numeric `artifact_id`, verify every pinned identity, and validate the requested phase
+at the actual as-of time. They never hard-code an artifact ID or re-resolve the pointer
+during the same validation attempt.
+
+### Accepted accounting benchmark audit record
+
+The first accounting benchmark proof used validation `as_of_utc`
+`2026-08-13T02:45:00Z`; that value was not the phase cutoff. Its accounting pack
+recorded `phase_decision_cutoff_utc` `2026-08-12T20:45:00Z` and an inclusive validity
+window ending at `2026-08-13T11:45:00Z`, which has expired. The proof's decision
+artifact `9165995215` is therefore an audit/replay identity only and must not be used
+as a routine download target.
+
+The discovery pointer subsequently advanced. The artifact selected by the pointer at
+the time of this correction reported `broad_market_current=READY`, so the older 88.65%
+broad-market result belongs only to audit artifact `9165995215`. Challenger processing
+nevertheless remains blocked because current catalysts and primary evidence are stale,
+while licensed news, point-in-time expectations, and candidate-funnel output are not
+configured. Sunday has not been accepted; it requires a separate proof during the
+actual Sunday window, using the then-current pointer and actual as-of time.
+
+This acceptance enables only the public VTI/SPY/BIL benchmark leg. Complete portfolio
+accounting remains consumer-owned and must validate positions, cash, lots,
+transactions, confirmations, and arithmetic state.
 
 The manifest reports each enrichment domain independently. Analyst estimates remain
 absent until a licensed provider is configured and are explicitly reported as
@@ -274,6 +307,11 @@ run `Publish phase readiness proof` with the decision and pointer workflow run I
 That workflow reruns holiday, early-close, stale-source, reconciliation, quarantine,
 and rollback tests; measures discovery, download, decompression, and validation
 separately; and publishes `readiness-proof.json` as a 90-day artifact.
+After acceptance, the proof workflow requests `Publish durable readiness proof` for
+that exact proof run. The durable workflow revalidates the proof and original decision
+artifact, attaches the unchanged proof plus its SHA-256 sidecar to an immutable
+non-latest release, and verifies that the canonical `market-data-*` release remains
+latest. The Actions proof artifact is temporary and is not the permanent audit record.
 
 Before enabling scheduled publication, run one manual `full` workflow with
 `refresh_enrichment=true`, validate its artifact, and publish it as the immutable

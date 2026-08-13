@@ -281,6 +281,27 @@ def test_enables_accounting_only_while_benchmark_retrieval_is_fresh(
         datetime(2026, 7, 24, 20, 45, tzinfo=timezone.utc),
     )
     assert phase_result["status"] == "USABLE"
+    assert phase_result["as_of_utc"] == "2026-07-24T20:45:00Z"
+    assert phase_result["phase_decision_cutoff_utc"] == "2026-07-24T20:45:00Z"
+    assert phase_result["not_before_utc"] == "2026-07-24T20:40:00Z"
+    assert phase_result["expires_at_utc"] == "2026-07-27T11:45:00Z"
+    expires_at = datetime.fromisoformat(
+        fresh_accounting["expires_at_utc"].replace("Z", "+00:00")
+    )
+    at_expiry = decision_verify_module.evaluate_phase_at(
+        fresh_output,
+        "accounting",
+        expires_at,
+    )
+    assert at_expiry["active_window_id"] == "ACCOUNTING"
+    assert "PHASE_WINDOW_NOT_ACTIVE" not in at_expiry["rejection_codes"]
+    after_expiry = decision_verify_module.evaluate_phase_at(
+        fresh_output,
+        "accounting",
+        expires_at + timedelta(microseconds=1),
+    )
+    assert after_expiry["active_window_id"] is None
+    assert "PHASE_WINDOW_NOT_ACTIVE" in after_expiry["rejection_codes"]
     expired_result = decision_verify_module.evaluate_phase_at(
         fresh_output,
         "accounting",
@@ -290,6 +311,9 @@ def test_enables_accounting_only_while_benchmark_retrieval_is_fresh(
     assert "CAPABILITY_CERTIFIED_TOTAL_RETURNS_STALE_AT_AS_OF" in expired_result[
         "rejection_codes"
     ]
+    assert decision_verify_module.main(
+        ["--dist", str(fresh_output), "--phase", "accounting"]
+    ) == 2
 
     groups = {
         record["group_id"]: record

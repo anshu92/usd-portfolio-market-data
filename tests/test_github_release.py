@@ -218,6 +218,31 @@ def test_decision_support_workflows_are_pinned_and_least_privilege():
             assert re_full_sha_reference(reference), reference
 
 
+def test_durable_readiness_proof_is_immutable_content_addressed_and_non_latest():
+    workflows = Path(__file__).resolve().parents[1] / ".github/workflows"
+    workflow = (
+        workflows / "publish-durable-readiness-proof.yml"
+    ).read_text(encoding="utf-8")
+    proof_workflow = (workflows / "publish-readiness-proof.yml").read_text(
+        encoding="utf-8"
+    )
+    assert "actions: read\n      contents: write" in workflow
+    assert '.path == ".github/workflows/publish-readiness-proof.yml"' in workflow
+    assert "digest-mismatch: error" in workflow
+    assert "readiness-proof.json.sha256" in workflow
+    assert "sha256sum -c readiness-proof.json.sha256" in workflow
+    assert "--latest=false" in workflow
+    assert ".immutable == true" in workflow
+    assert "Routine consumers must resolve the current discovery pointer" in workflow
+    assert "request_durable_publication:" in proof_workflow
+    assert "gh workflow run publish-durable-readiness-proof.yml" in proof_workflow
+    assert "actions: write" in proof_workflow
+    for line in (workflow + proof_workflow).splitlines():
+        if "uses:" in line:
+            reference = line.split("uses:", 1)[1].split("#", 1)[0].strip()
+            assert re_full_sha_reference(reference), reference
+
+
 def test_producer_workflow_artifacts_are_bounded_and_compressed():
     workflows = Path(__file__).resolve().parents[1] / ".github/workflows"
     combined = "\n".join(

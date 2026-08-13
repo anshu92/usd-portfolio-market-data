@@ -54,6 +54,13 @@ A phase is `BLOCKED` when any producer-required capability is not `READY`, `DEGR
 when only optional capabilities are unavailable, and `READY` otherwise. External
 consumer requirements do not make a producer pack structurally invalid, but the
 consumer cannot complete that phase until it validates the named external snapshot.
+Phase-pack status describes the capabilities captured when the pack was built; it is
+not a statement that the phase is usable at the consumer's current time. Usability is
+established only by the validator when
+`not_before_utc <= as_of_utc <= expires_at_utc`, every required capability was known
+at `as_of_utc`, and none exceeds its maximum age. `as_of_utc` is the consumer's actual
+validation instant. It is distinct from `phase_decision_cutoff_utc`, the scheduled
+decision reference time recorded in the pack.
 
 The status is supplemented by ordered operating modes: `ARTIFACT_VALID`,
 `BENCHMARK_ONLY_SAFE`, `CHALLENGER_RESEARCH_READY`, `LIVE_SNAPSHOT_REQUIRED`, and
@@ -106,6 +113,11 @@ commit. Its pointer binds repository, workflow ID/path, branch, event, commit,
 validator identity, artifact identity, and the collision-safe promotion key
 `${SOURCE_TAG}/${ARTIFACT_ID}`. Pointer publication is monotonic by source tag and then
 artifact ID; an older or identical completed run cannot replace the current pointer.
+Consumers resolve the pointer exactly once per attempted promotion and download the
+numeric `artifact_id` in that captured pointer. They must not hard-code an artifact ID
+or re-resolve the pointer midway through validation. The captured repository,
+workflow, commit, validator, source-release, manifest, artifact, digest, size, expiry,
+and promotion identities must all match before use.
 
 ## Operational-readiness reporting
 
@@ -123,6 +135,9 @@ when `verify-decision-support.py` performs it, but excludes discovery and downlo
 The `--phase`/`--as-of` gate also recomputes required-capability age from `observed_at`
 and `maximum_age_seconds`; a statically `READY` pack becomes unusable when an input is
 future-dated at the decision instant or has expired.
+The CLI requires an explicit `--as-of` whenever `--phase` is supplied. Consumers must
+never bypass `--phase accounting --as-of <actual-time>` merely because the accounting
+pack says `READY`.
 
 Contract v1.1 is structurally production-grade but operationally integration-only
 while every phase is `BLOCKED`. The first operational acceptance milestone is a
@@ -134,11 +149,12 @@ Data-availability work proceeds in this order:
 1. automated publication with market data current through the expected XNYS session;
 2. certified distribution-adjusted benchmark returns with at least 140 sessions and
    26 weekly observations;
-3. rapid SEC filings, current catalysts, and licensed news;
-4. point-in-time expectations and revision history;
-5. populated deterministic candidate, actionability, primary-document, and evidence
+3. current primary evidence, rapid SEC filings, and current catalysts;
+4. rapid licensed news;
+5. point-in-time expectations and revision history;
+6. populated deterministic candidate, actionability, primary-document, and evidence
    packet lanes; and
-6. effective-dated universe membership, delistings, and survivorship-aware replay.
+7. effective-dated universe membership, delistings, and survivorship-aware replay.
 
 For every phase that changes from unavailable to usable, the producer publishes a
 proof bundle containing the producer run ID, artifact ID and promotion key, source
@@ -146,14 +162,20 @@ watermarks, old and new phase states, the exact `--phase`/`--as-of` result, cove
 counts, end-to-end consumer latency with scope, and rollback plus failure-injection
 results. Holiday and XNYS early-close cases are mandatory before production-readiness
 is declared.
+An expiring Actions artifact is not durable audit storage. Every accepted proof must
+also be published byte-for-byte with a SHA-256 sidecar to a content-addressed,
+immutable release or equivalently durable signed-attestation store. The durable audit
+copy never becomes the routine discovery pointer.
 
 ## Private-state boundary
 
 Portfolio holdings, positions, cash, tax lots, account identifiers, orders,
-confirmations, and arbitration are forbidden in public producer schemas. Funded
-benchmark results remain consumer-owned because they require private cash flows. The
-producer may eventually supply only certified public benchmark total-return and
-distribution inputs.
+transactions, confirmations, and arbitration are forbidden in public producer
+schemas. A public accounting pack enables only the benchmark leg. Complete portfolio
+accounting still requires consumer-owned validation of positions, cash, lots,
+transactions, confirmations, and arithmetic state. Funded benchmark results remain
+consumer-owned because they require private cash flows. The producer may supply only
+certified public benchmark total-return and distribution inputs.
 
 ## Failure behavior
 
