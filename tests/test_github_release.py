@@ -33,6 +33,11 @@ def release_metadata(github_release_module, directory: Path) -> dict[str, object
 def test_validates_immutable_release_and_downloads(
     github_release_module, tmp_path: Path
 ):
+    assert {
+        "benchmark-certification.json",
+        "benchmark-distributions.parquet",
+        "benchmark-total-returns.parquet",
+    }.issubset(github_release_module.EXPECTED_ASSETS)
     metadata = release_metadata(github_release_module, tmp_path)
     tag, assets = github_release_module.validate_metadata(metadata)
     assert tag == "market-data-20260717T032654Z"

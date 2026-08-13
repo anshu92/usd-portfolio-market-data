@@ -16,6 +16,9 @@ from enrichment_contract import CONTRACTS
 EXPECTED_ASSETS = tuple(sorted({
     "manifest.json",
     "NOTICE.md",
+    "benchmark-certification.json",
+    "benchmark-distributions.parquet",
+    "benchmark-total-returns.parquet",
     "security-universe.csv",
     "unmatched-tickers.csv",
     "yahoo-ohlcv-320.parquet",
