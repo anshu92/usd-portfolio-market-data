@@ -234,6 +234,57 @@ def test_certifies_current_distribution_adjusted_benchmark_lane(
     assert capabilities["funded_benchmark_inputs"]["state"] == "READY"
 
 
+def test_hot_lane_overlay_preserves_canonical_manifest_identity(
+    benchmark_builder_module,
+    decision_builder_module,
+    decision_verify_module,
+    tmp_path: Path,
+) -> None:
+    if shutil.which("zstd") is None:
+        pytest.skip("zstd is required")
+    release, sessions, closes = prepare_release(tmp_path / "release")
+    source = write_sources(tmp_path / "sources", sessions, closes)
+    manifest_before = (release / "manifest.json").read_bytes()
+    args = arguments(release, source)
+    args.overlay_manifest_out = str(release / "benchmark-overlay.json")
+
+    benchmark_builder_module.attach(args)
+
+    assert (release / "manifest.json").read_bytes() == manifest_before
+    overlay = json.loads((release / "benchmark-overlay.json").read_text())
+    assert overlay["canonical_manifest_sha256"] == hashlib.sha256(
+        manifest_before
+    ).hexdigest()
+    assert overlay["dataset_group"]["group_id"] == "total_returns"
+
+    output = tmp_path / "decision"
+    manifest = decision_builder_module.build(
+        SimpleNamespace(
+            release_dir=str(release),
+            source_tag="market-data-20260724T203000Z",
+            out_dir=str(output),
+            generated_at="2026-07-24T20:35:00Z",
+            decision_cutoff=None,
+            producer_commit="LOCAL_TEST",
+        )
+    )
+    decision_verify_module.verify(output)
+
+    assert manifest["source_release"]["manifest_sha256"] == hashlib.sha256(
+        manifest_before
+    ).hexdigest()
+    assert manifest["hot_lane_overlays"][0]["lane_id"] == "certified_benchmark"
+    assert {
+        record["file"]
+        for record in manifest["source_files"]
+        if record.get("origin") == "HOT_LANE_OVERLAY"
+    } == {
+        "benchmark-certification.json",
+        "benchmark-distributions.parquet",
+        "benchmark-total-returns.parquet",
+    }
+
+
 def test_enables_accounting_only_while_benchmark_retrieval_is_fresh(
     benchmark_builder_module,
     decision_builder_module,

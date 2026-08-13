@@ -1,24 +1,24 @@
 name: Build decision-support artifact
 
 on:
+  repository_dispatch:
+    types: [decision_phase_deadline]
   schedule:
-    - cron: "5 8 * * 1-5"
+    - cron: "55 7 * * 1-5"
       timezone: "America/Toronto"
-    - cron: "30 9 * * 1-5"
+    - cron: "23 9 * * 1-5"
       timezone: "America/Toronto"
-    - cron: "50 9 * * 1-5"
+    - cron: "40 9 * * 1-5"
       timezone: "America/Toronto"
-    - cron: "20 15 * * 1-5"
+    - cron: "10 15 * * 1-5"
       timezone: "America/Toronto"
     - cron: "15 17 * * 0"
       timezone: "America/Toronto"
-    - cron: "5 15 * * 5"
-      timezone: "America/Toronto"
-    - cron: "15 16 * * 1-5"
+    - cron: "5 16 * * 1-5"
       timezone: "America/Toronto"
     - cron: "40 16 * * 1-5"
       timezone: "America/Toronto"
-    - cron: "30 7 * * 6"
+    - cron: "15 8 * * 6"
       timezone: "America/Toronto"
   workflow_dispatch:
     inputs:
@@ -34,18 +34,40 @@ on:
         description: "RFC3339 decision cutoff for exact phase validation"
         required: false
         type: string
+      window_id:
+        description: "Target phase-window ID for a deadline-bound publication"
+        required: false
+        type: string
+      reference_session:
+        description: "XNYS reference session used to derive the target window"
+        required: false
+        type: string
+      scheduled_time:
+        description: "RFC3339 external-scheduler trigger time"
+        required: false
+        type: string
+      artifact_deadline:
+        description: "RFC3339 deadline; must equal the phase cutoff"
+        required: false
+        type: string
+      idempotency_key:
+        description: "Stable external-scheduler publication identity"
+        required: false
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: decision-support-${{ inputs.source_tag || 'scheduled' }}
+  group: decision-support-${{ github.event.client_payload.idempotency_key || inputs.idempotency_key || inputs.source_tag || github.event.schedule || github.run_id }}
   cancel-in-progress: false
 
 jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    outputs:
+      targeted: ${{ steps.target.outputs.targeted }}
     steps:
       - name: Check out producer
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -146,23 +168,170 @@ jobs:
             --dist staging/source \
             --allow-subset
 
-      - name: Build compact read model and phase packs
+      - name: Resolve and validate phase publication target
+        id: target
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_SCHEDULE: ${{ github.event.schedule }}
+          DISPATCH_PHASE: ${{ github.event.client_payload.phase }}
+          DISPATCH_WINDOW: ${{ github.event.client_payload.window_id }}
+          DISPATCH_REFERENCE_SESSION: ${{ github.event.client_payload.expected_session }}
+          DISPATCH_SCHEDULED_TIME: ${{ github.event.client_payload.scheduled_time }}
+          DISPATCH_DEADLINE: ${{ github.event.client_payload.artifact_deadline }}
+          DISPATCH_CUTOFF: ${{ github.event.client_payload.decision_cutoff }}
+          DISPATCH_IDEMPOTENCY_KEY: ${{ github.event.client_payload.idempotency_key }}
+          INPUT_PHASE: ${{ inputs.phase }}
+          INPUT_WINDOW: ${{ inputs.window_id }}
+          INPUT_REFERENCE_SESSION: ${{ inputs.reference_session }}
+          INPUT_SCHEDULED_TIME: ${{ inputs.scheduled_time }}
+          INPUT_DEADLINE: ${{ inputs.artifact_deadline }}
+          INPUT_IDEMPOTENCY_KEY: ${{ inputs.idempotency_key }}
+          INPUT_AS_OF: ${{ inputs.as_of }}
         run: |
-          python build-decision-support.py \
+          set -euo pipefail
+          targeted=false
+          phase="${DISPATCH_PHASE:-${INPUT_PHASE:-}}"
+          window="${DISPATCH_WINDOW:-${INPUT_WINDOW:-}}"
+          reference_session="${DISPATCH_REFERENCE_SESSION:-${INPUT_REFERENCE_SESSION:-}}"
+          scheduled_time="${DISPATCH_SCHEDULED_TIME:-${INPUT_SCHEDULED_TIME:-}}"
+          deadline="${DISPATCH_DEADLINE:-${INPUT_DEADLINE:-}}"
+          cutoff="${DISPATCH_CUTOFF:-$deadline}"
+          idempotency_key="${DISPATCH_IDEMPOTENCY_KEY:-${INPUT_IDEMPOTENCY_KEY:-}}"
+          legacy_as_of="${INPUT_AS_OF:-}"
+
+          if [[ "$EVENT_NAME" == "schedule" ]]; then
+            case "$EVENT_SCHEDULE" in
+              "55 7 * * 1-5") phase=pre_open; window=PRE_OPEN ;;
+              "23 9 * * 1-5") phase=execution_research; window=EXECUTION_RESEARCH ;;
+              "40 9 * * 1-5") phase=exception_monitoring; window=OPEN_EXCEPTION ;;
+              "10 15 * * 1-5") phase=exception_monitoring; window=CLOSE_EXCEPTION ;;
+              "5 16 * * 1-5") phase=terminal_review; window=TERMINAL_REVIEW ;;
+              "40 16 * * 1-5") phase=accounting; window=ACCOUNTING ;;
+              "15 8 * * 6") phase=saturday_replay; window=SATURDAY_REPLAY ;;
+              "15 17 * * 0") phase=sunday; window=SUNDAY ;;
+              *) echo "Unknown decision-support backstop schedule" >&2; exit 2 ;;
+            esac
+            if [[ "$phase" == "terminal_review" || "$phase" == "accounting" ]]; then
+              reference_session="$(TZ=America/New_York date +%F)"
+            else
+              reference_session="$(jq -r '.aggregate.max_date' staging/source/manifest.json)"
+            fi
+            idempotency_key="backstop:${phase}:${reference_session}:${window,,}"
+            targeted=true
+          elif [[ "$EVENT_NAME" == "repository_dispatch" ]]; then
+            targeted=true
+          elif [[ -n "$window" || -n "$reference_session" || -n "$deadline" || -n "$idempotency_key" ]]; then
+            targeted=true
+          fi
+
+          if [[ "$targeted" == "true" ]]; then
+            [[ -n "$phase" && -n "$window" && -n "$reference_session" && -n "$idempotency_key" ]] || {
+              echo "Targeted publication lacks phase/window/session/idempotency metadata" >&2
+              exit 2
+            }
+            python dispatch-producer-phase.py plan \
+              --session "$reference_session" \
+              --phase "$phase" \
+              --attempt "$window" > "$RUNNER_TEMP/planned-target.json"
+            planned="$(jq -c '.events[0]' "$RUNNER_TEMP/planned-target.json")"
+            planned_scheduled="$(jq -r '.scheduled_time' <<<"$planned")"
+            planned_deadline="$(jq -r '.artifact_deadline' <<<"$planned")"
+            planned_cutoff="$(jq -r '.decision_cutoff' <<<"$planned")"
+            if [[ "$EVENT_NAME" == "repository_dispatch" || -n "$deadline" ]]; then
+              [[ "$scheduled_time" == "$planned_scheduled" && "$deadline" == "$planned_deadline" && "$cutoff" == "$planned_cutoff" ]] || {
+                echo "Supplied phase deadline does not match the XNYS plan" >&2
+                exit 2
+              }
+            else
+              scheduled_time="$planned_scheduled"
+              deadline="$planned_deadline"
+              cutoff="$planned_cutoff"
+            fi
+          fi
+
+          echo "targeted=$targeted" >> "$GITHUB_OUTPUT"
+          echo "phase=$phase" >> "$GITHUB_OUTPUT"
+          echo "window=$window" >> "$GITHUB_OUTPUT"
+          echo "reference_session=$reference_session" >> "$GITHUB_OUTPUT"
+          echo "scheduled_time=$scheduled_time" >> "$GITHUB_OUTPUT"
+          echo "deadline=$deadline" >> "$GITHUB_OUTPUT"
+          echo "idempotency_key=$idempotency_key" >> "$GITHUB_OUTPUT"
+          echo "legacy_as_of=$legacy_as_of" >> "$GITHUB_OUTPUT"
+
+      - name: Refresh certified benchmark hot lane in benchmark phases
+        id: benchmark_hot_lane
+        if: steps.target.outputs.targeted == 'true' && (steps.target.outputs.phase == 'accounting' || steps.target.outputs.phase == 'sunday')
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp -a staging/source staging/benchmark-candidate
+          retrieved_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          identity_observed_at="$(jq -r '.dataset_groups[] | select(.group_id == "identity") | .freshness.observed // empty' staging/source/manifest.json)"
+          python build-benchmark-total-returns.py \
+            --release-dir staging/benchmark-candidate \
+            --identity-universe staging/source/security-universe.csv \
+            --identity-observed-at "$identity_observed_at" \
+            --expected-session "${{ steps.target.outputs.reference_session }}" \
+            --retrieved-at "$retrieved_at" \
+            --certified-at "$retrieved_at" \
+            --idempotency-key "${{ steps.target.outputs.idempotency_key }}" \
+            --overlay-manifest-out staging/benchmark-candidate/benchmark-overlay.json \
+            --quarantine-out staging/benchmark-candidate/benchmark-quarantine.json
+          cp staging/benchmark-candidate/benchmark-distributions.parquet staging/source/
+          cp staging/benchmark-candidate/benchmark-total-returns.parquet staging/source/
+          cp staging/benchmark-candidate/benchmark-certification.json staging/source/
+          cp staging/benchmark-candidate/benchmark-overlay.json staging/source/
+
+      - name: Build compact read model and phase packs
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=(python build-decision-support.py \
             --release-dir staging/source \
             --source-tag "${{ steps.source.outputs.tag }}" \
             --out-dir dist \
-            --producer-commit "$GITHUB_SHA"
+            --producer-commit "$GITHUB_SHA")
+          if [[ "${{ steps.target.outputs.targeted }}" == "true" ]]; then
+            args+=(
+              --target-phase "${{ steps.target.outputs.phase }}"
+              --target-window "${{ steps.target.outputs.window }}"
+              --reference-session "${{ steps.target.outputs.reference_session }}"
+              --scheduled-time "${{ steps.target.outputs.scheduled_time }}"
+              --artifact-deadline "${{ steps.target.outputs.deadline }}"
+              --idempotency-key "${{ steps.target.outputs.idempotency_key }}"
+            )
+          fi
+          "${args[@]}"
 
       - name: Verify decision-support artifact
         shell: bash
         run: |
+          set -euo pipefail
           python verify-decision-support.py --dist dist
-          if [[ -n "${{ inputs.phase }}" && -n "${{ inputs.as_of }}" ]]; then
+          if [[ "${{ steps.target.outputs.targeted }}" == "true" ]]; then
+            actual_as_of="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
             python verify-decision-support.py \
               --dist dist \
-              --phase "${{ inputs.phase }}" \
-              --as-of "${{ inputs.as_of }}" \
+              --phase "${{ steps.target.outputs.phase }}" \
+              --as-of "$actual_as_of" \
+              --allow-degraded \
+              --report-blocked | tee phase-validation.json
+            jq -e --arg window "${{ steps.target.outputs.window }}" '
+              .phase_evaluation.active_window_id == $window or
+              (
+                .phase_evaluation.active_window_id == null and
+                (.phase_evaluation.rejection_codes | index("PHASE_WINDOW_NOT_ACTIVE")) != null
+              )
+            ' phase-validation.json >/dev/null
+            python -c 'import sys; from datetime import datetime, timezone; deadline = datetime.fromisoformat(sys.argv[1].replace("Z", "+00:00")); sys.exit("artifact integrity validation completed after its phase deadline") if datetime.now(timezone.utc) > deadline else None' \
+              "${{ steps.target.outputs.deadline }}"
+          elif [[ -n "${{ steps.target.outputs.phase }}" && -n "${{ steps.target.outputs.legacy_as_of }}" ]]; then
+            python verify-decision-support.py \
+              --dist dist \
+              --phase "${{ steps.target.outputs.phase }}" \
+              --as-of "${{ steps.target.outputs.legacy_as_of }}" \
               --allow-degraded
           fi
 
@@ -180,6 +349,7 @@ jobs:
 
   request_pointer_publication:
     needs: build
+    if: needs.build.outputs.targeted == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:

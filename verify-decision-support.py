@@ -13,11 +13,14 @@ import subprocess
 import sys
 import tempfile
 import time
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Mapping
 
 import duckdb
+import exchange_calendars as xcals
+
+from live_snapshot_contract import LiveSnapshotError, validate_snapshot
 
 from decision_support_contract import (
     ACTIONABILITY_MATRIX_FILENAME,
@@ -75,6 +78,23 @@ def parse_utc(value: object, label: str) -> datetime:
     if parsed.tzinfo is None:
         raise DecisionSupportVerificationError(f"{label} has no timezone")
     return parsed.astimezone(timezone.utc)
+
+
+def expected_phase_session(phase_id: str, reference_session: date) -> str:
+    calendar = xcals.get_calendar("XNYS")
+    try:
+        session = calendar.date_to_session(reference_session, direction="none")
+    except ValueError as exc:
+        raise DecisionSupportVerificationError(
+            "Publication reference date is not an XNYS session"
+        ) from exc
+    if phase_id in {"pre_open", "execution_research", "exception_monitoring"}:
+        return calendar.next_session(session).date().isoformat()
+    if phase_id == "sunday":
+        days_to_sunday = (6 - reference_session.weekday()) % 7
+        sunday = reference_session + timedelta(days=days_to_sunday or 7)
+        return calendar.date_to_session(sunday, direction="next").date().isoformat()
+    return reference_session.isoformat()
 
 
 def expected_validator_identity() -> tuple[list[dict[str, str]], str]:
@@ -481,6 +501,74 @@ def verify(directory: Path) -> dict[str, object]:
     if source_manifest_record["sha256"] != source_digest:
         raise DecisionSupportVerificationError(
             "Source manifest identity is inconsistent"
+        )
+    overlays = manifest.get("hot_lane_overlays")
+    if not isinstance(overlays, list) or len(overlays) > 1:
+        raise DecisionSupportVerificationError("Invalid hot-lane overlay set")
+    overlay_source_files = {
+        str(record["file"]): record
+        for record in source_files
+        if record.get("origin") == "HOT_LANE_OVERLAY"
+    }
+    if overlays:
+        overlay = overlays[0]
+        raw_publication_target = manifest.get("publication_target")
+        expected_overlay_session = (
+            raw_publication_target.get("reference_session")
+            if isinstance(raw_publication_target, dict)
+            else manifest.get("data_session")
+        )
+        if (
+            not isinstance(overlay, dict)
+            or overlay.get("lane_id") != "certified_benchmark"
+            or overlay.get("canonical_manifest_sha256") != source_digest
+            or overlay.get("expected_session") != expected_overlay_session
+        ):
+            raise DecisionSupportVerificationError(
+                "Benchmark hot-lane overlay identity mismatch"
+            )
+        overlay_manifest = overlay.get("manifest")
+        if (
+            not isinstance(overlay_manifest, dict)
+            or overlay_manifest.get("path") != "benchmark-overlay.json"
+            or not isinstance(overlay_manifest.get("bytes"), int)
+            or not isinstance(overlay_manifest.get("sha256"), str)
+            or SHA256_PATTERN.fullmatch(str(overlay_manifest["sha256"])) is None
+        ):
+            raise DecisionSupportVerificationError(
+                "Benchmark hot-lane manifest identity is invalid"
+            )
+        overlay_records = overlay.get("release_files")
+        if not isinstance(overlay_records, list) or {
+            str(record.get("file"))
+            for record in overlay_records
+            if isinstance(record, dict)
+        } != {
+            "benchmark-certification.json",
+            "benchmark-distributions.parquet",
+            "benchmark-total-returns.parquet",
+        }:
+            raise DecisionSupportVerificationError(
+                "Benchmark hot-lane file set is incomplete"
+            )
+        if {
+            str(record["file"]): {
+                "bytes": record.get("bytes"), "sha256": record.get("sha256")
+            }
+            for record in overlay_records
+            if isinstance(record, dict) and isinstance(record.get("file"), str)
+        } != {
+            filename: {
+                "bytes": record.get("bytes"), "sha256": record.get("sha256")
+            }
+            for filename, record in overlay_source_files.items()
+        }:
+            raise DecisionSupportVerificationError(
+                "Benchmark hot-lane files do not match embedded source identities"
+            )
+    elif overlay_source_files:
+        raise DecisionSupportVerificationError(
+            "Hot-lane source files lack an overlay manifest"
         )
 
     capability_records = manifest.get("capabilities")
@@ -954,6 +1042,64 @@ def verify(directory: Path) -> dict[str, object]:
         actual_status_counts[status] = actual_status_counts.get(status, 0) + 1
     if manifest.get("phase_status_counts") != actual_status_counts:
         raise DecisionSupportVerificationError("Phase status counts are inconsistent")
+    publication_target = manifest.get("publication_target")
+    if publication_target is not None:
+        if not isinstance(publication_target, dict):
+            raise DecisionSupportVerificationError("Invalid publication target")
+        phase_id = str(publication_target.get("phase_id") or "")
+        window_id = str(publication_target.get("window_id") or "")
+        if phase_id not in PHASES or not window_id:
+            raise DecisionSupportVerificationError(
+                "Publication target phase/window is invalid"
+            )
+        if not str(publication_target.get("idempotency_key") or ""):
+            raise DecisionSupportVerificationError(
+                "Publication target lacks an idempotency key"
+            )
+        target_pack = load_json(
+            root / str(by_phase[phase_id]["path"]), f"phase pack {phase_id}"
+        )
+        target_window = next(
+            (
+                window
+                for window in target_pack["phase_windows"]
+                if window.get("window_id") == window_id
+            ),
+            None,
+        )
+        if target_window is None:
+            raise DecisionSupportVerificationError(
+                "Publication target window is absent from its phase pack"
+            )
+        deadline = parse_utc(
+            publication_target.get("artifact_deadline_utc"),
+            "artifact_deadline_utc",
+        )
+        scheduled_time = parse_utc(
+            publication_target.get("scheduled_time_utc"),
+            "scheduled_time_utc",
+        )
+        if deadline != parse_utc(
+            target_window.get("phase_decision_cutoff_utc"),
+            "phase_decision_cutoff_utc",
+        ) or built_at > deadline or built_at < scheduled_time or scheduled_time > deadline:
+            raise DecisionSupportVerificationError(
+                "Publication target was built after its phase cutoff"
+            )
+        try:
+            reference_session = date.fromisoformat(
+                str(publication_target.get("reference_session") or "")
+            )
+        except ValueError as exc:
+            raise DecisionSupportVerificationError(
+                "Publication reference session is invalid"
+            ) from exc
+        if target_pack.get("valid_for_session") != expected_phase_session(
+            phase_id, reference_session
+        ):
+            raise DecisionSupportVerificationError(
+                "Publication target session does not match its phase pack"
+            )
     expected_artifact_modes: set[str] = set()
     for phase_id, record in by_phase.items():
         pack = load_json(root / str(record["path"]), f"phase pack {phase_id}")
@@ -1008,6 +1154,7 @@ def evaluate_phase_at(
     as_of: datetime,
     *,
     allow_degraded: bool = False,
+    live_snapshot_ready: bool = False,
 ) -> dict[str, object]:
     if phase_id not in PHASES:
         raise DecisionSupportVerificationError(f"Unknown phase: {phase_id}")
@@ -1032,6 +1179,11 @@ def evaluate_phase_at(
         reasons.append("PHASE_WINDOW_NOT_ACTIVE")
     if pack.get("status") == "DEGRADED" and not allow_degraded:
         reasons.append("DEGRADED_NOT_ALLOWED")
+    live_snapshot_missing = bool(
+        pack.get("consumer_live_snapshot_required") and not live_snapshot_ready
+    )
+    if live_snapshot_missing:
+        reasons.append("CONSUMER_LIVE_SNAPSHOT_REQUIRED")
     for capability in pack.get("required_capabilities") or []:
         if not isinstance(capability, dict) or capability.get("state") != "READY":
             continue
@@ -1052,7 +1204,7 @@ def evaluate_phase_at(
     usable = active_window is not None and (
         pack.get("status") == "READY"
         or (pack.get("status") == "DEGRADED" and allow_degraded)
-    ) and not freshness_reasons
+    ) and not freshness_reasons and not live_snapshot_missing
     return {
         "status": "USABLE" if usable else "BLOCKED",
         "phase_id": phase_id,
@@ -1084,6 +1236,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--phase", choices=sorted(PHASES))
     parser.add_argument("--as-of")
     parser.add_argument("--allow-degraded", action="store_true")
+    parser.add_argument("--live-snapshot")
+    parser.add_argument(
+        "--report-blocked",
+        action="store_true",
+        help="Report a blocked phase without treating the expected fail-closed state as an integrity error",
+    )
     args = parser.parse_args(argv)
     try:
         if args.phase and not args.as_of:
@@ -1092,13 +1250,44 @@ def main(argv: list[str] | None = None) -> int:
             )
         if args.as_of and not args.phase:
             raise DecisionSupportVerificationError("--as-of requires --phase")
+        if args.live_snapshot and (not args.phase or not args.as_of):
+            raise DecisionSupportVerificationError(
+                "--live-snapshot requires --phase and --as-of"
+            )
         result = verify(Path(args.dist))
         if args.phase:
             as_of = parse_utc(args.as_of, "as_of")
+            live_snapshot_ready = False
+            if args.live_snapshot:
+                try:
+                    snapshot = load_json(
+                        Path(args.live_snapshot), "consumer live snapshot"
+                    )
+                    snapshot_result = validate_snapshot(snapshot)
+                except LiveSnapshotError as exc:
+                    raise DecisionSupportVerificationError(
+                        f"Consumer live snapshot is invalid: {exc}"
+                    ) from exc
+                if parse_utc(
+                    snapshot.get("actual_cutoff_utc"),
+                    "live snapshot actual_cutoff_utc",
+                ) != as_of:
+                    raise DecisionSupportVerificationError(
+                        "Consumer live snapshot cutoff does not match --as-of"
+                    )
+                live_snapshot_ready = snapshot_result.get("snapshot_status") == "READY"
+                result["live_snapshot_evaluation"] = snapshot_result
             result["phase_evaluation"] = evaluate_phase_at(
-                Path(args.dist), args.phase, as_of, allow_degraded=args.allow_degraded
+                Path(args.dist),
+                args.phase,
+                as_of,
+                allow_degraded=args.allow_degraded,
+                live_snapshot_ready=live_snapshot_ready,
             )
-            if result["phase_evaluation"]["status"] != "USABLE":
+            if (
+                result["phase_evaluation"]["status"] != "USABLE"
+                and not args.report_blocked
+            ):
                 raise DecisionSupportVerificationError(
                     "Phase is not usable at the requested decision instant: "
                     + ",".join(result["phase_evaluation"]["rejection_codes"])

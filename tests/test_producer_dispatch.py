@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import duckdb
@@ -13,13 +12,51 @@ def test_dispatch_plan_uses_early_close_and_retry_deadlines(
     events = producer_dispatch_module.accounting_plan("2026-11-27")
 
     assert [event["attempt"] for event in events] == [
-        "CLOSE_PLUS_45",
-        "CLOSE_PLUS_75",
-        "CLOSE_PLUS_120",
+        "SOURCE_CLOSE_PLUS_45",
+        "SOURCE_CLOSE_PLUS_75",
+        "SOURCE_CLOSE_PLUS_120",
     ]
     assert events[0]["scheduled_time"] == "2026-11-27T18:45:00Z"
     assert all(event["early_close"] is True for event in events)
     assert len({event["idempotency_key"] for event in events}) == 3
+
+
+def test_dispatch_plan_has_distinct_pre_cutoff_exception_artifacts(
+    producer_dispatch_module,
+) -> None:
+    events = [
+        event
+        for event in producer_dispatch_module.decision_phase_plan("2026-08-12")
+        if event["phase"] == "exception_monitoring"
+    ]
+
+    assert [event["window_id"] for event in events] == [
+        "OPEN_EXCEPTION",
+        "CLOSE_EXCEPTION",
+    ]
+    assert [event["scheduled_time"] for event in events] == [
+        "2026-08-13T13:40:00Z",
+        "2026-08-13T19:10:00Z",
+    ]
+    assert [event["artifact_deadline"] for event in events] == [
+        "2026-08-13T13:55:00Z",
+        "2026-08-13T19:25:00Z",
+    ]
+    assert len({event["idempotency_key"] for event in events}) == 2
+
+
+def test_accounting_decision_refresh_starts_inside_early_close_window(
+    producer_dispatch_module,
+) -> None:
+    event = next(
+        event
+        for event in producer_dispatch_module.decision_phase_plan("2026-11-27")
+        if event["phase"] == "accounting"
+    )
+
+    assert event["scheduled_time"] == "2026-11-27T18:40:00Z"
+    assert event["artifact_deadline"] == "2026-11-27T18:45:00Z"
+    assert event["early_close"] is True
 
 
 def test_dispatch_rejects_xnys_holiday(producer_dispatch_module) -> None:

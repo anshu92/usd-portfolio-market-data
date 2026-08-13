@@ -284,18 +284,30 @@ rows remain referentially valid.
 
 Run `dispatch-producer-phase.py` from an external scheduler. It derives deadlines from
 the XNYS calendar (including holidays and early closes), emits stable idempotency keys,
-and sends the `producer_phase_deadline` repository event. Plan accounting attempts with:
+and sends either a deadline-bound `decision_phase_deadline` event or a canonical-source
+correction event. Plan all phase publications for a completed reference session with:
 
 ```bash
-python dispatch-producer-phase.py plan --phase accounting --session 2026-08-12
+python dispatch-producer-phase.py plan --phase all --session 2026-08-12
 ```
 
 At each planned time, invoke `dispatch` with exactly one `--attempt` and a token in
-`GITHUB_TOKEN`. Correction attempts skip themselves when the latest immutable release
-already contains a complete certification for that session. Workflow concurrency is
-scoped to phase and expected session, preventing overlapping attempts. GitHub cron at
-close +45, +75, and +120 is retained only as a backstop; its observed start time is
-never treated as an action-time SLO.
+`GITHUB_TOKEN`. The plan produces independent `OPEN_EXCEPTION` and `CLOSE_EXCEPTION`
+artifacts for the 09:55 and 15:25 targets. Each decision artifact embeds its phase,
+window, reference session, scheduled time, cutoff deadline, and idempotency key;
+generation or integrity validation after the cutoff is rejected. Accounting and
+Sunday build a fresh certified VTI/SPY/BIL hot-lane overlay without changing the
+immutable canonical release manifest identity. Source-correction attempts skip
+themselves when the latest immutable release already contains a complete certification
+for that session. GitHub cron remains only a backstop; its observed start time is never
+treated as an action-time SLO.
+
+The dispatcher and workflow do not manufacture unavailable inputs. Current catalysts,
+primary evidence, licensed news, point-in-time expectations, the deterministic
+candidate funnel, and survivorship-aware replay remain blocked until authoritative
+adapters are configured and their source-backed records pass freshness and provenance
+validation. A fresh artifact can therefore be successfully published with explicit
+rejection codes while its phase remains unusable.
 
 Every full attempt publishes `market-coverage-diagnostic.json` in its seven-day
 workflow artifact. The diagnostic freezes the eligible denominator before evaluation,

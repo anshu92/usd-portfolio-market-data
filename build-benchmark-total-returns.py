@@ -552,6 +552,7 @@ def group_overrides(manifest: Mapping[str, object]) -> dict[str, dict[str, objec
 def attach(args: argparse.Namespace) -> dict[str, object]:
     release_dir = Path(args.release_dir).resolve()
     manifest_path = release_dir / "manifest.json"
+    canonical_manifest_sha256 = sha256_file(manifest_path)
     manifest = load_manifest(manifest_path)
     records = release_records(manifest)
     expected_text = str(
@@ -743,12 +744,47 @@ def attach(args: argparse.Namespace) -> dict[str, object]:
         candidate_group_failures=manifest.get("candidate_group_failures", []),
         candidate_attempt_failures=manifest.get("candidate_attempt_failures", []),
     )
-    temporary_manifest = manifest_path.with_suffix(".json.benchmark.tmp")
-    temporary_manifest.write_text(
-        json.dumps(manifest, indent=2, sort_keys=True, default=str) + "\n",
-        encoding="utf-8",
-    )
-    os.replace(temporary_manifest, manifest_path)
+    overlay_manifest_out = getattr(args, "overlay_manifest_out", None)
+    if overlay_manifest_out:
+        total_returns_group = next(
+            (
+                record
+                for record in manifest.get("dataset_groups", [])
+                if isinstance(record, dict) and record.get("group_id") == "total_returns"
+            ),
+            None,
+        )
+        if total_returns_group is None:
+            raise BenchmarkBuildError("Benchmark overlay has no total_returns group")
+        overlay_path = Path(overlay_manifest_out).resolve()
+        overlay_path.parent.mkdir(parents=True, exist_ok=True)
+        overlay = {
+            "schema_version": "1.0.0",
+            "lane_id": "certified_benchmark",
+            "canonical_manifest_sha256": canonical_manifest_sha256,
+            "expected_session": expected_session.isoformat(),
+            "generated_at_utc": certified_at,
+            "idempotency_key": str(args.idempotency_key or ""),
+            "release_files": [
+                records[name]
+                for name in (
+                    DISTRIBUTION_FILENAME,
+                    RETURN_FILENAME,
+                    CERTIFICATION_FILENAME,
+                )
+            ],
+            "dataset_group": total_returns_group,
+        }
+        temporary_overlay = overlay_path.with_suffix(overlay_path.suffix + ".tmp")
+        temporary_overlay.write_bytes(canonical_json(overlay))
+        os.replace(temporary_overlay, overlay_path)
+    else:
+        temporary_manifest = manifest_path.with_suffix(".json.benchmark.tmp")
+        temporary_manifest.write_text(
+            json.dumps(manifest, indent=2, sort_keys=True, default=str) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary_manifest, manifest_path)
     return certification
 
 
@@ -837,6 +873,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--certified-at")
     parser.add_argument("--idempotency-key")
     parser.add_argument("--quarantine-out")
+    parser.add_argument(
+        "--overlay-manifest-out",
+        help="Write a benchmark hot-lane overlay without changing the canonical manifest",
+    )
     args = parser.parse_args(argv)
     if args.identity_observed_at is None:
         args.identity_observed_at = args.retrieved_at

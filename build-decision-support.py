@@ -161,9 +161,12 @@ def release_records(manifest: Mapping[str, object]) -> dict[str, Mapping[str, ob
 
 
 def validate_source_files(
-    release_dir: Path, manifest: Mapping[str, object]
+    release_dir: Path,
+    manifest: Mapping[str, object],
+    overlay_records: Mapping[str, Mapping[str, object]] | None = None,
 ) -> list[dict[str, object]]:
     records = release_records(manifest)
+    overlays = overlay_records or {}
     used: list[dict[str, object]] = []
     for filename in REQUIRED_SOURCE_FILES:
         path = release_dir / filename
@@ -178,7 +181,7 @@ def validate_source_files(
                 }
             )
             continue
-        record = records.get(filename)
+        record = overlays.get(filename) or records.get(filename)
         if record is None:
             raise DecisionSupportBuildError(
                 f"Source manifest does not declare required file: {filename}"
@@ -195,13 +198,14 @@ def validate_source_files(
                 "file": filename,
                 "bytes": path.stat().st_size,
                 "sha256": actual_sha,
+                "origin": "HOT_LANE_OVERLAY" if filename in overlays else "CANONICAL_RELEASE",
             }
         )
     for filename in OPTIONAL_SOURCE_FILES:
         path = release_dir / filename
         if not path.exists():
             continue
-        record = records.get(filename)
+        record = overlays.get(filename) or records.get(filename)
         if record is None:
             raise DecisionSupportBuildError(
                 f"Optional source file is not declared by its manifest: {filename}"
@@ -220,9 +224,68 @@ def validate_source_files(
                 "file": filename,
                 "bytes": path.stat().st_size,
                 "sha256": actual_sha,
+                "origin": "HOT_LANE_OVERLAY" if filename in overlays else "CANONICAL_RELEASE",
             }
         )
     return sorted(used, key=lambda item: str(item["file"]))
+
+
+def load_benchmark_overlay(
+    release_dir: Path, canonical_manifest_sha256: str
+) -> tuple[
+    dict[str, Mapping[str, object]],
+    Mapping[str, object] | None,
+    dict[str, object] | None,
+]:
+    path = release_dir / "benchmark-overlay.json"
+    if not path.exists():
+        return {}, None, None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise DecisionSupportBuildError(f"Cannot read benchmark overlay: {exc}") from exc
+    if (
+        not isinstance(value, dict)
+        or value.get("schema_version") != SCHEMA_VERSION
+        or value.get("lane_id") != "certified_benchmark"
+        or value.get("canonical_manifest_sha256") != canonical_manifest_sha256
+    ):
+        raise DecisionSupportBuildError("Benchmark overlay identity is invalid")
+    raw_records = value.get("release_files")
+    expected = {
+        "benchmark-distributions.parquet",
+        "benchmark-total-returns.parquet",
+        "benchmark-certification.json",
+    }
+    if not isinstance(raw_records, list):
+        raise DecisionSupportBuildError("Benchmark overlay lacks release-file identities")
+    records: dict[str, Mapping[str, object]] = {}
+    for record in raw_records:
+        if not isinstance(record, dict) or not isinstance(record.get("file"), str):
+            raise DecisionSupportBuildError("Benchmark overlay release-file identity is invalid")
+        filename = str(record["file"])
+        if filename in records:
+            raise DecisionSupportBuildError(f"Duplicate benchmark overlay file: {filename}")
+        records[filename] = record
+    if set(records) != expected:
+        raise DecisionSupportBuildError("Benchmark overlay file set is incomplete")
+    group = value.get("dataset_group")
+    if not isinstance(group, dict) or group.get("group_id") != "total_returns":
+        raise DecisionSupportBuildError("Benchmark overlay lacks total_returns group")
+    overlay_record = {
+        "lane_id": "certified_benchmark",
+        "manifest": {
+            "path": path.name,
+            "bytes": path.stat().st_size,
+            "sha256": sha256_file(path),
+        },
+        "canonical_manifest_sha256": canonical_manifest_sha256,
+        "expected_session": value.get("expected_session"),
+        "generated_at_utc": value.get("generated_at_utc"),
+        "idempotency_key": value.get("idempotency_key"),
+        "release_files": [dict(records[name]) for name in sorted(records)],
+    }
+    return records, group, overlay_record
 
 
 def quoted(identifier: str) -> str:
@@ -905,6 +968,64 @@ def capability_records(
                 }
             )
     return output
+
+
+def apply_target_session_gates(
+    capabilities: dict[str, dict[str, object]],
+    phase_id: str,
+    reference_session: date,
+    canonical_session: date,
+    release_dir: Path,
+) -> None:
+    required = set(PHASES[phase_id].required_capabilities)
+    if "broad_market_current" in required and reference_session != canonical_session:
+        capabilities["broad_market_current"].update(
+            {
+                "state": "STALE",
+                "reason": (
+                    "Broad market does not cover the targeted XNYS session: "
+                    f"observed={canonical_session.isoformat()}, "
+                    f"required={reference_session.isoformat()}"
+                ),
+            }
+        )
+    if phase_id in {"accounting", "sunday"}:
+        certification_path = release_dir / "benchmark-certification.json"
+        try:
+            certification = json.loads(certification_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            certification = {}
+        observed = (
+            certification.get("observed_latest_xnys_session")
+            if isinstance(certification, dict)
+            else None
+        )
+        if observed != reference_session.isoformat():
+            for capability_id in (
+                "benchmark_market_current",
+                "certified_total_returns",
+                "funded_benchmark_inputs",
+            ):
+                capabilities[capability_id].update(
+                    {
+                        "state": "STALE",
+                        "reason": (
+                            "Benchmark lane does not cover the targeted XNYS session: "
+                            f"observed={observed}, required={reference_session.isoformat()}"
+                        ),
+                    }
+                )
+    if phase_id == "saturday_replay" and reference_session != canonical_session:
+        capabilities["canonical_replay"].update(
+            {
+                "state": "STALE",
+                "reason": (
+                    "Replay history does not cover its targeted reference session: "
+                    f"observed={canonical_session.isoformat()}, "
+                    f"required={reference_session.isoformat()}"
+                ),
+            }
+        )
 
 
 def build_phase_pack(
@@ -1758,6 +1879,65 @@ def build(args: argparse.Namespace) -> dict[str, object]:
         else datetime.now(timezone.utc)
     )
     generated_at = format_utc(generated)
+    target_phase = str(getattr(args, "target_phase", None) or "")
+    target_window = str(getattr(args, "target_window", None) or "")
+    reference_session_text = str(getattr(args, "reference_session", None) or "")
+    scheduled_time_text = str(getattr(args, "scheduled_time", None) or "")
+    artifact_deadline_text = str(getattr(args, "artifact_deadline", None) or "")
+    idempotency_key = str(getattr(args, "idempotency_key", None) or "")
+    publication_target: dict[str, object] | None = None
+    if any((target_phase, target_window, reference_session_text, artifact_deadline_text)):
+        if (
+            target_phase not in PHASES
+            or not target_window
+            or not reference_session_text
+            or not scheduled_time_text
+            or not artifact_deadline_text
+            or not idempotency_key
+        ):
+            raise DecisionSupportBuildError(
+                "Targeted publication requires phase, window, reference session, "
+                "artifact deadline, and idempotency key"
+            )
+        try:
+            reference_session = date.fromisoformat(reference_session_text)
+        except ValueError as exc:
+            raise DecisionSupportBuildError(
+                "Publication reference session is invalid"
+            ) from exc
+        target_windows = phase_windows(target_phase, reference_session)
+        matching_window = next(
+            (window for window in target_windows if window.get("window_id") == target_window),
+            None,
+        )
+        if matching_window is None:
+            raise DecisionSupportBuildError(
+                "Publication window does not match the phase/reference session"
+            )
+        artifact_deadline = parse_utc(artifact_deadline_text)
+        scheduled_time = parse_utc(scheduled_time_text)
+        if artifact_deadline != parse_utc(
+            str(matching_window["phase_decision_cutoff_utc"])
+        ):
+            raise DecisionSupportBuildError(
+                "Artifact deadline must equal the phase decision cutoff"
+            )
+        if generated > artifact_deadline:
+            raise DecisionSupportBuildError(
+                "Artifact generation started after its phase deadline"
+            )
+        if generated < scheduled_time or scheduled_time > artifact_deadline:
+            raise DecisionSupportBuildError(
+                "Artifact generation time is inconsistent with its scheduled time"
+            )
+        publication_target = {
+            "phase_id": target_phase,
+            "window_id": target_window,
+            "reference_session": reference_session.isoformat(),
+            "scheduled_time_utc": format_utc(scheduled_time),
+            "artifact_deadline_utc": format_utc(artifact_deadline),
+            "idempotency_key": idempotency_key,
+        }
     producer_commit = str(getattr(args, "producer_commit", None) or "LOCAL_TEST")
     if (
         producer_commit != "LOCAL_TEST"
@@ -1769,10 +1949,25 @@ def build(args: argparse.Namespace) -> dict[str, object]:
     source_manifest_path = release_dir / "manifest.json"
     source_manifest = load_manifest(source_manifest_path)
     source_manifest_sha256 = sha256_file(source_manifest_path)
-    source_files = validate_source_files(release_dir, source_manifest)
+    overlay_files, benchmark_group, benchmark_overlay = load_benchmark_overlay(
+        release_dir, source_manifest_sha256
+    )
+    source_files = validate_source_files(
+        release_dir, source_manifest, overlay_records=overlay_files
+    )
     groups = group_records(source_manifest)
+    if benchmark_group is not None:
+        groups["total_returns"] = benchmark_group
     capabilities = capability_records(groups, release_dir, as_of=generated)
     valid_session_date = source_session(source_manifest)
+    if publication_target is not None:
+        apply_target_session_gates(
+            capabilities,
+            target_phase,
+            reference_session,
+            valid_session_date,
+            release_dir,
+        )
     valid_session = valid_session_date.isoformat()
     calendar = xcals.get_calendar("XNYS")
     market_session = calendar.date_to_session(valid_session_date, direction="none")
@@ -1811,6 +2006,11 @@ def build(args: argparse.Namespace) -> dict[str, object]:
     phase_records: list[dict[str, object]] = []
     phase_status_counts: dict[str, int] = {}
     for phase_id in sorted(PHASES):
+        pack_reference_session = (
+            reference_session
+            if publication_target is not None and phase_id == target_phase
+            else valid_session_date
+        )
         pack = build_phase_pack(
             phase_id,
             capabilities,
@@ -1819,9 +2019,9 @@ def build(args: argparse.Namespace) -> dict[str, object]:
             database_sha256,
             generated_at,
             data_cutoff,
-            phase_valid_session(phase_id, valid_session_date),
+            phase_valid_session(phase_id, pack_reference_session),
             watermarks,
-            phase_windows(phase_id, valid_session_date),
+            phase_windows(phase_id, pack_reference_session),
             auxiliary_assets,
         )
         path = phase_dir / f"{phase_id}.json"
@@ -1861,6 +2061,10 @@ def build(args: argparse.Namespace) -> dict[str, object]:
             "status": source_manifest.get("status"),
         },
         "source_files": source_files,
+        "hot_lane_overlays": (
+            [benchmark_overlay] if benchmark_overlay is not None else []
+        ),
+        "publication_target": publication_target,
         "database": {
             **file_record(compressed, out_dir),
             "uncompressed_bytes": uncompressed_bytes,
@@ -1918,6 +2122,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--generated-at")
     parser.add_argument("--decision-cutoff")
     parser.add_argument("--producer-commit")
+    parser.add_argument("--target-phase", choices=sorted(PHASES))
+    parser.add_argument("--target-window")
+    parser.add_argument("--reference-session")
+    parser.add_argument("--scheduled-time")
+    parser.add_argument("--artifact-deadline")
+    parser.add_argument("--idempotency-key")
     args = parser.parse_args(argv)
     try:
         manifest = build(args)

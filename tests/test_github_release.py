@@ -207,7 +207,9 @@ def test_decision_support_workflows_are_pinned_and_least_privilege():
     assert "sec-company-facts.parquet" not in build
     assert "institutional-holdings-13f.parquet" not in build
     assert "verify-decision-support.py --dist dist" in build
-    assert "workflow_run:" in pointer
+    assert "workflow_run:" not in pointer
+    assert "workflow_dispatch:" in pointer
+    assert ".publication_target.phase_id" in pointer
     assert '.path == ".github/workflows/build-decision-support.yml"' in pointer
     assert "actions: read\n      contents: write" in pointer
     assert "verify-decision-support-pointer.py" in pointer

@@ -142,12 +142,35 @@ means at least one producer-required capability is unavailable or too stale;
 `CONSUMER_REQUIRED` capability, such as `execution_snapshot`, must be fetched at the
 actual cutoff and is never satisfied by the historical OHLCV tables.
 
+For execution research and either exception window, pass the validated consumer-owned
+snapshot into the phase gate itself:
+
+```bash
+actual_as_of="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+python verify-decision-support.py \
+  --dist staging/decision-support \
+  --phase exception_monitoring \
+  --as-of "$actual_as_of" \
+  --live-snapshot live-snapshot.json
+```
+
+Without `--live-snapshot`, those phases return
+`CONSUMER_LIVE_SNAPSHOT_REQUIRED` and remain blocked even if all public producer lanes
+are ready. The snapshot's `actual_cutoff_utc` must equal `--as-of`.
+
 Use `operating_modes` rather than one aggregate boolean: `BENCHMARK_ONLY_SAFE` permits
 only the certified benchmark path, `CHALLENGER_RESEARCH_READY` permits challenger
 research, `LIVE_SNAPSHOT_REQUIRED` still gates execution, and `CHALLENGER_BLOCKED`
 requires candidate-specific rejection. Empty `candidate-funnel.parquet` and empty
 security actionability are intentional while the selector capability is
 `NOT_CONFIGURED`.
+
+Until current catalysts, primary evidence, licensed rapid news, point-in-time
+expectations, and the deterministic candidate funnel pass in the active phase window,
+the consumer may analyze its reconciled portfolio but must not issue
+producer-dependent actionable recommendations. Saturday replay likewise remains
+blocked until effective-dated membership, delistings, and survivorship-aware history
+are source-backed and validated.
 
 `BENCHMARK_ONLY_SAFE` enables only the producer's public benchmark leg. It is not
 complete portfolio accounting. The consumer must separately validate its private

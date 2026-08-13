@@ -93,6 +93,16 @@ def test_builds_and_verifies_compact_read_model(
     assert packs["pre_open"]["not_before_utc"] < packs["pre_open"]["expires_at_utc"]
     assert packs["pre_open"]["valid_for_session"] == "2026-07-27"
     assert len(packs["exception_monitoring"]["phase_windows"]) == 2
+    execution_evaluation = decision_verify_module.evaluate_phase_at(
+        output,
+        "execution_research",
+        datetime(2026, 7, 27, 13, 38, tzinfo=timezone.utc),
+        allow_degraded=True,
+    )
+    assert execution_evaluation["status"] == "BLOCKED"
+    assert "CONSUMER_LIVE_SNAPSHOT_REQUIRED" in execution_evaluation[
+        "rejection_codes"
+    ]
 
     database = tmp_path / "read-model.sqlite"
     decision_verify_module.decompress_database(output / DATABASE_FILENAME, database)
@@ -128,6 +138,101 @@ def test_build_is_deterministic_for_identical_inputs(
     assert (first / MANIFEST_FILENAME).read_bytes() == (
         second / MANIFEST_FILENAME
     ).read_bytes()
+
+
+def test_targeted_artifact_is_bound_to_one_pre_cutoff_window(
+    decision_builder_module, decision_verify_module, tmp_path: Path
+):
+    release = source_release(tmp_path)
+    output = tmp_path / "targeted"
+
+    manifest = decision_builder_module.build(
+        SimpleNamespace(
+            release_dir=str(release),
+            source_tag="market-data-20260725T000000Z",
+            out_dir=str(output),
+            generated_at="2026-07-27T11:56:00Z",
+            decision_cutoff=None,
+            producer_commit="LOCAL_TEST",
+            target_phase="pre_open",
+            target_window="PRE_OPEN",
+            reference_session="2026-07-24",
+            scheduled_time="2026-07-27T11:55:00Z",
+            artifact_deadline="2026-07-27T12:10:00Z",
+            idempotency_key="decision:pre_open:2026-07-24:pre_open",
+        )
+    )
+
+    decision_verify_module.verify(output)
+    assert manifest["publication_target"] == {
+        "phase_id": "pre_open",
+        "window_id": "PRE_OPEN",
+        "reference_session": "2026-07-24",
+        "scheduled_time_utc": "2026-07-27T11:55:00Z",
+        "artifact_deadline_utc": "2026-07-27T12:10:00Z",
+        "idempotency_key": "decision:pre_open:2026-07-24:pre_open",
+    }
+
+
+def test_targeted_artifact_rejects_generation_after_deadline(
+    decision_builder_module, tmp_path: Path
+):
+    release = source_release(tmp_path)
+
+    with pytest.raises(
+        decision_builder_module.DecisionSupportBuildError,
+        match="after its phase deadline",
+    ):
+        decision_builder_module.build(
+            SimpleNamespace(
+                release_dir=str(release),
+                source_tag="market-data-20260725T000000Z",
+                out_dir=str(tmp_path / "late"),
+                generated_at="2026-07-27T12:10:01Z",
+                decision_cutoff=None,
+                producer_commit="LOCAL_TEST",
+                target_phase="pre_open",
+                target_window="PRE_OPEN",
+                reference_session="2026-07-24",
+                scheduled_time="2026-07-27T11:55:00Z",
+                artifact_deadline="2026-07-27T12:10:00Z",
+                idempotency_key="decision:pre_open:2026-07-24:pre_open",
+            )
+        )
+
+
+def test_terminal_target_cannot_treat_prior_session_market_as_current(
+    decision_builder_module, tmp_path: Path
+):
+    release = source_release(tmp_path)
+    output = tmp_path / "terminal"
+
+    decision_builder_module.build(
+        SimpleNamespace(
+            release_dir=str(release),
+            source_tag="market-data-20260725T000000Z",
+            out_dir=str(output),
+            generated_at="2026-07-27T20:06:00Z",
+            decision_cutoff=None,
+            producer_commit="LOCAL_TEST",
+            target_phase="terminal_review",
+            target_window="TERMINAL_REVIEW",
+            reference_session="2026-07-27",
+            scheduled_time="2026-07-27T20:05:00Z",
+            artifact_deadline="2026-07-27T20:20:00Z",
+            idempotency_key="decision:terminal_review:2026-07-27:terminal_review",
+        )
+    )
+
+    pack = json.loads((output / "phase-packs/terminal_review.json").read_text())
+    broad_market = next(
+        record
+        for record in pack["required_capabilities"]
+        if record["capability_id"] == "broad_market_current"
+    )
+    assert pack["status"] == "BLOCKED"
+    assert broad_market["state"] == "STALE"
+    assert "required=2026-07-27" in broad_market["reason"]
 
 
 def test_evidence_index_keeps_latest_revision_for_duplicate_event_ids(

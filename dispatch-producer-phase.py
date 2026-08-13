@@ -41,57 +41,155 @@ def session_label(value: str):
         raise DispatchError(f"{value} is not an XNYS session") from exc
 
 
-def accounting_plan(session: str) -> list[dict[str, object]]:
+def decision_event(
+    *,
+    phase: str,
+    expected_session: date,
+    window_id: str,
+    scheduled: datetime,
+    cutoff: datetime,
+    early_close: bool,
+) -> dict[str, object]:
+    return {
+        "event_type": "decision_phase_deadline",
+        "phase": phase,
+        "expected_session": expected_session.isoformat(),
+        "window_id": window_id,
+        "scheduled_time": format_utc(scheduled),
+        "decision_cutoff": format_utc(cutoff),
+        "artifact_deadline": format_utc(cutoff),
+        "attempt": window_id,
+        "idempotency_key": f"decision:{phase}:{expected_session.isoformat()}:{window_id.lower()}",
+        "early_close": early_close,
+    }
+
+
+def accounting_source_plan(session: str) -> list[dict[str, object]]:
     calendar = xcals.get_calendar("XNYS")
     label = session_label(session)
     close = calendar.session_close(label).to_pydatetime().astimezone(timezone.utc)
-    decision_cutoff = close + timedelta(minutes=75)
     return [
         {
+            "event_type": "producer_phase_deadline",
             "phase": "accounting",
             "expected_session": label.date().isoformat(),
             "scheduled_time": format_utc(close + timedelta(minutes=offset)),
-            "decision_cutoff": format_utc(
-                decision_cutoff if offset <= 75 else close + timedelta(minutes=135)
-            ),
-            "attempt": f"CLOSE_PLUS_{offset}",
-            "idempotency_key": f"accounting:{label.date().isoformat()}:close-plus-{offset}",
+            "decision_cutoff": format_utc(close + timedelta(minutes=45)),
+            "artifact_deadline": format_utc(close + timedelta(minutes=45)),
+            "attempt": f"SOURCE_CLOSE_PLUS_{offset}",
+            "idempotency_key": f"source:accounting:{label.date().isoformat()}:close-plus-{offset}",
             "early_close": close.hour < 20,
         }
         for offset in (45, 75, 120)
     ]
 
 
-def sunday_plan(session: str) -> list[dict[str, object]]:
+def decision_phase_plan(session: str) -> list[dict[str, object]]:
+    calendar = xcals.get_calendar("XNYS")
     label = session_label(session)
     session_day = label.date()
+    close = calendar.session_close(label).to_pydatetime().astimezone(timezone.utc)
+    early_close = close.hour < 20
+    next_session = calendar.next_session(label).date()
+    task_zone = ZoneInfo("America/Toronto")
+
+    def local(day: date, hour: int, minute: int) -> datetime:
+        return datetime(day.year, day.month, day.day, hour, minute, tzinfo=task_zone)
+
+    events = [
+        decision_event(
+            phase="pre_open",
+            expected_session=session_day,
+            window_id="PRE_OPEN",
+            scheduled=local(next_session, 7, 55),
+            cutoff=local(next_session, 8, 10),
+            early_close=early_close,
+        ),
+        decision_event(
+            phase="execution_research",
+            expected_session=session_day,
+            window_id="EXECUTION_RESEARCH",
+            scheduled=local(next_session, 9, 23),
+            cutoff=local(next_session, 9, 38),
+            early_close=early_close,
+        ),
+        decision_event(
+            phase="exception_monitoring",
+            expected_session=session_day,
+            window_id="OPEN_EXCEPTION",
+            scheduled=local(next_session, 9, 40),
+            cutoff=local(next_session, 9, 55),
+            early_close=early_close,
+        ),
+        decision_event(
+            phase="exception_monitoring",
+            expected_session=session_day,
+            window_id="CLOSE_EXCEPTION",
+            scheduled=local(next_session, 15, 10),
+            cutoff=local(next_session, 15, 25),
+            early_close=early_close,
+        ),
+        decision_event(
+            phase="terminal_review",
+            expected_session=session_day,
+            window_id="TERMINAL_REVIEW",
+            scheduled=close + timedelta(minutes=5),
+            cutoff=close + timedelta(minutes=20),
+            early_close=early_close,
+        ),
+        decision_event(
+            phase="accounting",
+            expected_session=session_day,
+            window_id="ACCOUNTING",
+            scheduled=close + timedelta(minutes=40),
+            cutoff=close + timedelta(minutes=45),
+            early_close=early_close,
+        ),
+    ]
+    days_to_saturday = (5 - session_day.weekday()) % 7 or 7
+    saturday = session_day + timedelta(days=days_to_saturday)
+    events.append(
+        decision_event(
+            phase="saturday_replay",
+            expected_session=session_day,
+            window_id="SATURDAY_REPLAY",
+            scheduled=local(saturday, 8, 15),
+            cutoff=local(saturday, 8, 30),
+            early_close=early_close,
+        )
+    )
     days = (6 - session_day.weekday()) % 7 or 7
     sunday = session_day + timedelta(days=days)
-    scheduled = datetime(
-        sunday.year,
-        sunday.month,
-        sunday.day,
-        17,
-        15,
-        tzinfo=ZoneInfo("America/Toronto"),
-    ).astimezone(timezone.utc)
-    cutoff = scheduled + timedelta(minutes=15)
-    return [
-        {
-            "phase": "sunday",
-            "expected_session": session_day.isoformat(),
-            "scheduled_time": format_utc(scheduled),
-            "decision_cutoff": format_utc(cutoff),
-            "attempt": "SUNDAY_PREP",
-            "idempotency_key": f"sunday:{session_day.isoformat()}:prep",
-            "early_close": False,
-        }
-    ]
+    events.append(
+        decision_event(
+            phase="sunday",
+            expected_session=session_day,
+            window_id="SUNDAY",
+            scheduled=local(sunday, 17, 15),
+            cutoff=local(sunday, 17, 30),
+            early_close=early_close,
+        )
+    )
+    return events
+
+
+def accounting_plan(session: str) -> list[dict[str, object]]:
+    """Compatibility wrapper for source-refresh correction attempts."""
+    return accounting_source_plan(session)
+
+
+def sunday_plan(session: str) -> list[dict[str, object]]:
+    """Compatibility wrapper for the Sunday decision artifact target."""
+    return [event for event in decision_phase_plan(session) if event["phase"] == "sunday"]
 
 
 def dispatch(repository: str, token: str, payload: dict[str, object]) -> None:
+    event_type = str(payload.get("event_type") or "")
+    if event_type not in {"producer_phase_deadline", "decision_phase_deadline"}:
+        raise DispatchError(f"Unsupported repository event type: {event_type}")
+    client_payload = {key: value for key, value in payload.items() if key != "event_type"}
     body = json.dumps(
-        {"event_type": "producer_phase_deadline", "client_payload": payload},
+        {"event_type": event_type, "client_payload": client_payload},
         sort_keys=True,
     ).encode("utf-8")
     request = urllib.request.Request(
@@ -148,17 +246,35 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("plan", "dispatch"))
     parser.add_argument("--session", required=True)
-    parser.add_argument("--phase", choices=("accounting", "sunday", "all"), default="all")
+    parser.add_argument(
+        "--phase",
+        choices=(
+            "pre_open",
+            "execution_research",
+            "exception_monitoring",
+            "terminal_review",
+            "accounting",
+            "saturday_replay",
+            "sunday",
+            "source_accounting",
+            "all",
+        ),
+        default="all",
+    )
     parser.add_argument("--attempt", help="Dispatch only the matching attempt label")
     parser.add_argument("--repository", default=os.environ.get("GITHUB_REPOSITORY", ""))
     parser.add_argument("--token-env", default="GITHUB_TOKEN")
     args = parser.parse_args(argv)
     try:
         events: list[dict[str, object]] = []
-        if args.phase in {"accounting", "all"}:
-            events.extend(accounting_plan(args.session))
-        if args.phase in {"sunday", "all"}:
-            events.extend(sunday_plan(args.session))
+        decision_events = decision_phase_plan(args.session)
+        if args.phase == "all":
+            events.extend(decision_events)
+            events.extend(accounting_source_plan(args.session))
+        elif args.phase == "source_accounting":
+            events.extend(accounting_source_plan(args.session))
+        else:
+            events.extend(event for event in decision_events if event["phase"] == args.phase)
         if args.attempt:
             events = [event for event in events if event["attempt"] == args.attempt]
         if not events:
@@ -170,7 +286,7 @@ def main(argv: list[str] | None = None) -> int:
             if not args.repository or not token:
                 raise DispatchError("Dispatch requires --repository and a token")
             for event in events:
-                if event["phase"] == "accounting" and already_certified(
+                if event["event_type"] == "producer_phase_deadline" and already_certified(
                     args.repository, token, str(event["expected_session"])
                 ):
                     event["dispatch_result"] = "SKIPPED_ALREADY_CERTIFIED"

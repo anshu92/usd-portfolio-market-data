@@ -26,7 +26,7 @@ EXPECTED_REPOSITORY = "anshu92/usd-portfolio-market-data"
 EXPECTED_WORKFLOW_PATH = ".github/workflows/build-decision-support.yml"
 EXPECTED_WORKFLOW_ID = 332931733
 EXPECTED_BRANCH = "main"
-EXPECTED_EVENTS = ("workflow_dispatch", "schedule")
+EXPECTED_EVENTS = ("repository_dispatch", "workflow_dispatch", "schedule")
 
 OPERATING_MODES = (
     "ARTIFACT_VALID",

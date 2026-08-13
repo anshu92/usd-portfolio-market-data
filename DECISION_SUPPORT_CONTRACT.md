@@ -85,13 +85,24 @@ is not evidence that a target was met. Consumers must enforce `built_at_utc`,
 `data_cutoff_utc`, `valid_for_session`, `phase_decision_cutoff_utc`, `not_before_utc`,
 `expires_at_utc`, and every source watermark.
 
+The external dispatcher emits one `decision_phase_deadline` event and one stable
+idempotency key for every target. `OPEN_EXCEPTION` and `CLOSE_EXCEPTION` are separate
+publications. A targeted manifest binds `phase_id`, `window_id`, XNYS reference
+session, scheduled time, artifact deadline, and idempotency key in
+`publication_target`; generation or integrity validation after the cutoff fails.
+Publishing a fresh artifact with a blocked phase is valid fail-closed reporting, not a
+readiness claim. GitHub cron is only a backstop and late starts cannot satisfy the
+deadline contract.
+
 ## Live execution snapshot
 
 The producer publishes schema `1.0.0`, contract `1.1.0` for provider-neutral live
 snapshots and
 validator. Provider and broker adapters run in the consumer environment with
 consumer-owned credentials. A snapshot binds quotes, halt/LULD state, and broker
-eligibility to one actual cutoff.
+eligibility to one actual cutoff. `verify-decision-support.py` keeps execution and
+exception phases blocked unless the same invocation receives a validated READY
+snapshot through `--live-snapshot`; a producer artifact can never satisfy that gate.
 
 The strict allowlist binds canonical symbol, exchange, currency, provider/feed,
 entitlement, request/response IDs, quote type, spread policy, and independent quote,
@@ -103,9 +114,15 @@ producer OHLCV.
 
 ## Publication and promotion
 
-The compact workflow is dispatched after each certified source release and has
-timezone-aware cadence backstops for weekday 08:05, Sunday 17:15, Friday 15:05, and
-Saturday 07:30 in `America/Toronto`. Scheduled triggers are not action-time SLOs.
+The compact workflow accepts externally calculated `decision_phase_deadline` events
+and retains timezone-aware GitHub schedules only as connectivity backstops. Each run
+builds a separate artifact for its named phase window. Scheduled triggers are not
+action-time SLOs.
+
+Accounting and Sunday attempts refresh VTI/SPY/BIL directly into a certified hot-lane
+overlay. The overlay records retrieval/certification time and asset hashes while
+retaining the immutable canonical release manifest digest. Failed refreshes do not
+mutate that canonical identity and leave benchmark capabilities blocked.
 
 Artifacts are named `decision-support-${SOURCE_TAG}-${RUN_ID}` and downloaded by
 artifact ID. The publisher checks out and runs validators from the exact source-run
@@ -143,6 +160,13 @@ Contract v1.1 is structurally production-grade but operationally integration-onl
 while every phase is `BLOCKED`. The first operational acceptance milestone is a
 scheduled phase that passes its actual `--phase`/`--as-of` gate using current,
 source-backed inputs.
+
+Current catalysts, primary evidence, licensed rapid news, point-in-time expectations,
+the deterministic candidate funnel, and survivorship-aware history remain
+`NOT_CONFIGURED` or `STALE` until an authoritative adapter supplies validated records.
+The producer must not infer, forward-fill, or synthesize any of those lanes. Until the
+corresponding phase passes during its active window, a consumer may analyze its
+reconciled portfolio but may not issue producer-dependent actionable recommendations.
 
 Data-availability work proceeds in this order:
 
