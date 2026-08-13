@@ -219,7 +219,7 @@ def test_producer_workflow_artifacts_are_bounded_and_compressed():
         path.read_text(encoding="utf-8") for path in sorted(workflows.glob("*.yml"))
     )
     upload_count = combined.count("actions/upload-artifact@")
-    assert upload_count == 5
+    assert upload_count == 6
     assert combined.count("compression-level: 9") == upload_count
     assert "compression-level: 0" not in combined
     assert combined.count("verify-workflow-artifact-size.py") == upload_count

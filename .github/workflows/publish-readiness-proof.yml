@@ -161,7 +161,10 @@ jobs:
             --download-seconds "$(cat "$RUNNER_TEMP/download-seconds.txt")" \
             --out proof/readiness-proof.json
 
-      - name: Upload immutable proof bundle
+      - name: Enforce proof artifact size limit
+        run: python verify-workflow-artifact-size.py proof/readiness-proof.json
+
+      - name: Publish immutable proof bundle
         id: upload
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

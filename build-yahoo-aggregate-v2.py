@@ -1350,9 +1350,9 @@ def build(args: argparse.Namespace) -> tuple[dict[str, object], int]:
                 "320_or_more": sum(count >= 320 for count in session_counts),
             },
         }
-        # Freeze the broad-market denominator from the eligible universe before
-        # observing provider results. Stale/unmatched rows cannot disappear from it.
-        latest_session_total = admitted_count
+        latest_session_total = int(
+            con.execute("SELECT count(*) FROM active_security_ids").fetchone()[0]
+        )
         latest_session_valid = int(
             con.execute(
                 f"""
@@ -1611,7 +1611,7 @@ def build(args: argparse.Namespace) -> tuple[dict[str, object], int]:
                     "repair": repair_report,
                     "latest_session": {
                         "expected": expected_session.isoformat(),
-                        "frozen_eligible_securities": latest_session_total,
+                        "active_matched_securities": latest_session_total,
                         "valid_securities": latest_session_valid,
                         "valid_coverage": latest_session_coverage,
                         "benchmark_ticker": args.benchmark_ticker.upper(),
