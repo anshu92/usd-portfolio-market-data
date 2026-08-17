@@ -1,15 +1,15 @@
 {
   "schema_version": "1.0.0",
   "repository": "anshu92/usd-portfolio-market-data",
-  "release_tag": "market-data-20260817T210138Z",
-  "workflow_run_id": 32071430559,
-  "artifact_id": 9301897566,
-  "artifact_name": "validated-market-data-market-data-20260817T210138Z",
-  "artifact_sha256": "bc7c1ef4a6e9f5b6c4bec7273d3c677df3749174888b850039b4e370a07b2720",
-  "artifact_size_bytes": 533469119,
-  "artifact_expires_at": "2026-09-16T21:31:26Z",
-  "producer_commit": "527ff365d70a1150215d6557db3ac7ec6799e599",
-  "manifest_sha256": "fcd441f3023afd9f9367062312cddabaeeb14352c45fbe227adec6056659e8e3",
+  "release_tag": "market-data-20260817T214334Z",
+  "workflow_run_id": 32074790036,
+  "artifact_id": 9303049249,
+  "artifact_name": "validated-market-data-market-data-20260817T214334Z",
+  "artifact_sha256": "d2697cfeaf33f095f55874c5c004b7b66ac18387a1c458ace9b7d732764b7637",
+  "artifact_size_bytes": 533466572,
+  "artifact_expires_at": "2026-09-16T22:11:55Z",
+  "producer_commit": "642617a2f8b31cefd29786b9245970c866d67eb0",
+  "manifest_sha256": "1b3ec2ba2238a18208af3c0db36b5ae8ad570107202e98a71c000517e8657382",
   "release_immutable": true,
-  "generated_at_utc": "2026-08-17T21:32:43Z"
+  "generated_at_utc": "2026-08-17T22:12:59Z"
 }
